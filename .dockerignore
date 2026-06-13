@@ -1,0 +1,43 @@
+# Keep the build context small and reproducible. The Dockerfile only needs
+# pyproject.toml, README.md and the mnemozine/ package.
+.git
+.gitignore
+.venv
+venv
+env
+ENV
+**/__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.eggs
+wheels
+
+# caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+
+# editors / tooling
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# local secrets & data — never bake into the image
+.env
+.env.*
+!.env.example
+data
+archive
+*.log
+
+# tests are not needed at runtime
+tests
+
+# deploy artifacts (avoid recursive context)
+deploy

@@ -1,0 +1,141 @@
+{{- if .Values.ollama.enabled }}
+{{- $name := include "mnemozine.ollama.fullname" . -}}
+{{- $component := "ollama" -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.ollama.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.ollama.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+{{- if .Values.ollama.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-models
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.ollama.persistence.accessModes | nindent 4 }}
+  {{- if .Values.ollama.persistence.storageClass }}
+  storageClassName: {{ .Values.ollama.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.ollama.persistence.size }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.ollama.pullModelOnStart .Values.ollama.persistence.enabled }}
+      initContainers:
+        # Pull the embedding model into the persistent volume so the endpoint is
+        # usable on first start (PRD: must run on local models). Idempotent.
+        - name: pull-model
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              set -e
+              ( ollama serve & )
+              echo "waiting for ollama to come up..."
+              for i in $(seq 1 60); do
+                if ollama list >/dev/null 2>&1; then break; fi
+                sleep 2
+              done
+              ollama pull {{ .Values.ollama.model | quote }}
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      {{- end }}
+      containers:
+        - name: ollama
+          image: "{{ .Values.ollama.image.repository }}:{{ .Values.ollama.image.tag }}"
+          imagePullPolicy: {{ .Values.ollama.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          {{- if .Values.ollama.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.ollama.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.ollama.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.ollama.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.ollama.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.ollama.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.ollama.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.ollama.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.ollama.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.ollama.readinessProbe.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.ollama.resources | nindent 12 }}
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      {{- with .Values.ollama.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ollama.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ollama.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: models
+          {{- if .Values.ollama.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $name }}-models
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}

@@ -1,0 +1,69 @@
+{{/*
+Shared ConfigMap: every MNEMOZINE_* setting that is not secret. Maps 1:1 to
+mnemozine/config.py (Settings) using the env_prefix MNEMOZINE_ and the nested
+`__` delimiter. The §6.6 tuning parameters come from .Values.tuning.
+Mounted into every mnemozine workload via envFrom.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mnemozine.configMapName" . }}
+  labels:
+    {{- include "mnemozine.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  # --- FalkorDB (graph + vectors, FR-STO-2) ---
+  MNEMOZINE_FALKORDB__URL: {{ include "mnemozine.falkordbUrl" . | quote }}
+  MNEMOZINE_FALKORDB__GRAPH_NAME: {{ .Values.falkordb.graphName | quote }}
+
+  # --- Extraction LLM (OpenAI-format gateway, §5.5) ---
+  MNEMOZINE_EXTRACTION__BASE_URL: {{ include "mnemozine.extractionBaseUrl" . | quote }}
+  MNEMOZINE_EXTRACTION__MODEL: {{ .Values.tuning.extraction.model | quote }}
+
+  # --- Embeddings (bge-m3 via Ollama, OQ3) ---
+  MNEMOZINE_EMBEDDING__BASE_URL: {{ include "mnemozine.ollamaBaseUrl" . | quote }}
+  MNEMOZINE_EMBEDDING__MODEL: {{ .Values.tuning.embedding.model | quote }}
+  MNEMOZINE_EMBEDDING__DIMENSIONS: {{ .Values.tuning.embedding.dimensions | quote }}
+
+  # --- Injection budget (FR-RET-3/5, §6.6) ---
+  MNEMOZINE_INJECT__TOKEN_BUDGET: {{ .Values.tuning.inject.tokenBudget | quote }}
+  MNEMOZINE_INJECT__MAX_PREFERENCE_SNIPPETS: {{ .Values.tuning.inject.maxPreferenceSnippets | quote }}
+
+  # --- Cross-reference engine (FR-RET-6, §6.6) ---
+  MNEMOZINE_CROSSREF__RELEVANCE_THRESHOLD: {{ .Values.tuning.crossref.relevanceThreshold | quote }}
+  MNEMOZINE_CROSSREF__MAX_SUGGESTIONS: {{ .Values.tuning.crossref.maxSuggestions | quote }}
+  MNEMOZINE_CROSSREF__VECTOR_FALLBACK_THRESHOLD: {{ .Values.tuning.crossref.vectorFallbackThreshold | quote }}
+
+  # --- Maintenance / dedup / decay (FR-MNT-*, §6.6) ---
+  MNEMOZINE_MAINTENANCE__DEDUP_EQUIVALENCE_THRESHOLD: {{ .Values.tuning.maintenance.dedupEquivalenceThreshold | quote }}
+  MNEMOZINE_MAINTENANCE__EDGE_WEIGHT_FLOOR: {{ .Values.tuning.maintenance.edgeWeightFloor | quote }}
+  MNEMOZINE_MAINTENANCE__MAX_NODE_DEGREE: {{ .Values.tuning.maintenance.maxNodeDegree | quote }}
+  MNEMOZINE_MAINTENANCE__CONTRADICTION_CANDIDATE_CAP: {{ .Values.tuning.maintenance.contradictionCandidateCap | quote }}
+  MNEMOZINE_MAINTENANCE__DECAY_HALF_LIFE_DAYS: {{ .Values.tuning.maintenance.decayHalfLifeDays | quote }}
+  MNEMOZINE_MAINTENANCE__DECAY_ARCHIVE_AFTER_DAYS: {{ .Values.tuning.maintenance.decayArchiveAfterDays | quote }}
+  MNEMOZINE_MAINTENANCE__CRON: {{ .Values.tuning.maintenance.cron | quote }}
+
+  # --- Ingestion / chunking (FR-ING-*, §6.6) ---
+  MNEMOZINE_INGEST__CHUNK_MAX_CHARS: {{ .Values.tuning.ingest.chunkMaxChars | quote }}
+  MNEMOZINE_INGEST__CHUNK_MAX_MESSAGES: {{ .Values.tuning.ingest.chunkMaxMessages | quote }}
+  MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR: {{ .Values.tuning.ingest.claudeConfigDir | quote }}
+  MNEMOZINE_INGEST__CLEANUP_PERIOD_DAYS: {{ .Values.tuning.ingest.cleanupPeriodDays | quote }}
+  MNEMOZINE_INGEST__STRIP_TOOL_CALLS: {{ .Values.tuning.ingest.stripToolCalls | quote }}
+
+  # --- Retrieval (FR-RET-2, §6.6) ---
+  MNEMOZINE_RETRIEVAL__P95_LATENCY_TARGET_MS: {{ .Values.tuning.retrieval.p95LatencyTargetMs | quote }}
+  MNEMOZINE_RETRIEVAL__TOP_K: {{ .Values.tuning.retrieval.topK | quote }}
+  MNEMOZINE_RETRIEVAL__NEIGHBORHOOD_HOPS: {{ .Values.tuning.retrieval.neighborhoodHops | quote }}
+
+  # --- MCP server (FR-RET-1) ---
+  MNEMOZINE_MCP_HOST: {{ .Values.mcp.host | quote }}
+  MNEMOZINE_MCP_PORT: {{ .Values.mcp.port | quote }}
+
+  # --- Misc ---
+  MNEMOZINE_LOG_LEVEL: {{ .Values.tuning.logLevel | quote }}
+  {{- range $k, $v := .Values.extraConfig }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

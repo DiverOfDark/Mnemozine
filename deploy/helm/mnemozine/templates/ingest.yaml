@@ -1,0 +1,95 @@
+{{- if .Values.ingest.enabled }}
+{{- $name := include "mnemozine.ingest.fullname" . -}}
+{{- $component := "ingest" -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  # Ingestion holds a stateful directory watcher / chunk buffer; keep a single
+  # replica and Recreate so two watchers never double-ingest (idempotent anyway
+  # via FR-ING-5, but avoids wasted LLM calls).
+  replicas: {{ .Values.ingest.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "mnemozine.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: ingest
+          image: "{{ include "mnemozine.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toJson .Values.ingest.command }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "mnemozine.configMapName" . }}
+            - secretRef:
+                name: {{ include "mnemozine.secretName" . }}
+          env:
+            {{- if .Values.ingest.claudeTranscripts.enabled }}
+            - name: MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR
+              value: {{ .Values.ingest.claudeTranscripts.mountPath | quote }}
+            {{- end }}
+            {{- with .Values.ingest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.ingest.livenessProbe.enabled }}
+          livenessProbe:
+            {{- omit .Values.ingest.livenessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.ingest.resources | nindent 12 }}
+          {{- if .Values.ingest.claudeTranscripts.enabled }}
+          volumeMounts:
+            - name: claude-transcripts
+              mountPath: {{ .Values.ingest.claudeTranscripts.mountPath }}
+              readOnly: true
+          {{- end }}
+      {{- if .Values.ingest.claudeTranscripts.enabled }}
+      volumes:
+        - name: claude-transcripts
+          {{- if .Values.ingest.claudeTranscripts.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.ingest.claudeTranscripts.existingClaim }}
+            readOnly: true
+          {{- else if .Values.ingest.claudeTranscripts.hostPath }}
+          hostPath:
+            path: {{ .Values.ingest.claudeTranscripts.hostPath }}
+            type: Directory
+          {{- else }}
+          {{- fail "ingest.claudeTranscripts.enabled=true requires either hostPath or existingClaim" }}
+          {{- end }}
+      {{- end }}
+      {{- with .Values.ingest.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingest.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingest.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

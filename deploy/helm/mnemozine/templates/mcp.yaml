@@ -1,0 +1,99 @@
+{{- if .Values.mcp.enabled }}
+{{- $name := include "mnemozine.mcp.fullname" . -}}
+{{- $component := "mcp" -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+  {{- with (merge (deepCopy (default (dict) .Values.mcp.service.annotations)) (default (dict) .Values.commonAnnotations)) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.mcp.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.mcp.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ .Values.mcp.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 8 }}
+      annotations:
+        # Roll mnemozine pods when the shared config/secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "mnemozine.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mcp
+          image: "{{ include "mnemozine.image" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toJson .Values.mcp.command }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "mnemozine.configMapName" . }}
+            - secretRef:
+                name: {{ include "mnemozine.secretName" . }}
+          env:
+            # Per-service overrides (MCP must bind 0.0.0.0 inside the pod).
+            - name: MNEMOZINE_MCP_HOST
+              value: {{ .Values.mcp.host | quote }}
+            - name: MNEMOZINE_MCP_PORT
+              value: {{ .Values.mcp.port | quote }}
+            {{- with .Values.mcp.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.mcp.port }}
+              protocol: TCP
+          {{- if .Values.mcp.livenessProbe.enabled }}
+          livenessProbe:
+            {{- omit .Values.mcp.livenessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+          {{- if .Values.mcp.readinessProbe.enabled }}
+          readinessProbe:
+            {{- omit .Values.mcp.readinessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+      {{- with .Values.mcp.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcp.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.mcp.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

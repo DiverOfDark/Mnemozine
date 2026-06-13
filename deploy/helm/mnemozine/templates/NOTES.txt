@@ -1,0 +1,34 @@
+Mnemozine has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components rendered:
+{{- if .Values.falkordb.enabled }}
+  - FalkorDB (StatefulSet)        Service: {{ include "mnemozine.falkordb.fullname" . }}:{{ .Values.falkordb.service.port }}  (graph + vectors){{ end }}
+{{- if .Values.ollama.enabled }}
+  - Ollama (Deployment)           Service: {{ include "mnemozine.ollama.fullname" . }}:{{ .Values.ollama.service.port }}  (embeddings: {{ .Values.ollama.model }}){{ end }}
+{{- if .Values.qwen.enabled }}
+  - Qwen extraction LLM           Service: {{ include "mnemozine.qwen.fullname" . }}:{{ .Values.qwen.service.port }}{{ end }}
+{{- if .Values.litellm.enabled }}
+  - LiteLLM gateway               Service: {{ include "mnemozine.litellm.fullname" . }}:{{ .Values.litellm.service.port }}{{ end }}
+{{- if .Values.mcp.enabled }}
+  - MCP server                    Service: {{ include "mnemozine.mcp.fullname" . }}:{{ .Values.mcp.service.port }}{{ end }}
+{{- if .Values.ingest.enabled }}
+  - Ingestion daemon (FR-ING-*){{ end }}
+{{- if .Values.maintenance.enabled }}
+  - Maintenance scheduler ({{ if .Values.maintenance.asCronJob }}CronJob{{ else }}Deployment{{ end }}, cron "{{ .Values.maintenance.cronSchedule | default .Values.tuning.maintenance.cron }}"){{ end }}
+
+Resolved endpoints (wired into the shared ConfigMap):
+  FalkorDB     {{ include "mnemozine.falkordbUrl" . }}
+  Embeddings   {{ include "mnemozine.ollamaBaseUrl" . }}
+  Extraction   {{ include "mnemozine.extractionBaseUrl" . }}
+
+Reach the MCP server from inside the cluster:
+{{- if .Values.mcp.enabled }}
+  http://{{ include "mnemozine.mcp.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.mcp.service.port }}
+
+Port-forward it locally:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "mnemozine.mcp.fullname" . }} {{ .Values.mcp.service.port }}:{{ .Values.mcp.service.port }}
+{{- end }}
+
+Tuning (PRD §6.6) is parameterized under `.Values.tuning` and rendered into the
+ConfigMap as MNEMOZINE_* env. Override with -f my-values.yaml or --set, e.g.:
+  --set tuning.crossref.relevanceThreshold=0.85 --set tuning.inject.tokenBudget=400

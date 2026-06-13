@@ -1,0 +1,27 @@
+apiVersion: v2
+name: mnemozine
+description: |
+  Self-hosted unified conversational memory layer — a Graphiti temporal knowledge
+  graph over agent conversations (FalkorDB single store), served to every agent
+  through one MCP server (PRD Deliverable #1). Bundles FalkorDB (StatefulSet),
+  Ollama (bge-m3 embeddings), an optional local Qwen extraction LLM, the LiteLLM
+  OpenAI-format gateway, and the mnemozine MCP server / ingestion daemon /
+  maintenance scheduler.
+type: application
+
+# Chart version is the chart's own SemVer; bump on chart changes.
+version: 0.1.0
+
+# The default application version this chart deploys (the mnemozine image tag).
+appVersion: "0.0.1"
+
+home: https://github.com/diverofdark/Mnemozine
+keywords:
+  - memory
+  - knowledge-graph
+  - mcp
+  - graphiti
+  - falkordb
+  - llm
+maintainers:
+  - name: Mnemozine

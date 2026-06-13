@@ -1,0 +1,134 @@
+{{- if .Values.falkordb.enabled }}
+{{- $name := include "mnemozine.falkordb.fullname" . -}}
+{{- $component := "falkordb" -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.falkordb.service.type }}
+  # Headless not required, but stable DNS for the StatefulSet pods is.
+  ports:
+    - name: redis
+      port: {{ .Values.falkordb.service.port }}
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: falkordb
+          image: "{{ .Values.falkordb.image.repository }}:{{ .Values.falkordb.image.tag }}"
+          imagePullPolicy: {{ .Values.falkordb.image.pullPolicy }}
+          args:
+            - "redis-server"
+            - "--loadmodule"
+            - "/var/lib/falkordb/bin/falkordb.so"
+            - "--dir"
+            - "/data"
+            {{- if .Values.falkordb.password }}
+            - "--requirepass"
+            - "$(FALKORDB_PASSWORD)"
+            {{- end }}
+          {{- if .Values.falkordb.password }}
+          env:
+            - name: FALKORDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mnemozine.secretName" . }}
+                  key: MNEMOZINE_FALKORDB__PASSWORD
+          {{- end }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          {{- if .Values.falkordb.livenessProbe.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: {{ .Values.falkordb.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.falkordb.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.falkordb.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.falkordb.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.falkordb.readinessProbe.enabled }}
+          readinessProbe:
+            exec:
+              command:
+                - "sh"
+                - "-c"
+                - "redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG"
+            initialDelaySeconds: {{ .Values.falkordb.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.falkordb.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.falkordb.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.falkordb.readinessProbe.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.falkordb.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.falkordb.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.falkordb.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.falkordb.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.falkordb.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.falkordb.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.falkordb.persistence.accessModes | nindent 10 }}
+        {{- if .Values.falkordb.persistence.storageClass }}
+        storageClassName: {{ .Values.falkordb.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.falkordb.persistence.size }}
+  {{- end }}
+{{- end }}

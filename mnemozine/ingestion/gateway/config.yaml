@@ -1,0 +1,68 @@
+# LiteLLM proxy config for the Mnemozine OpenAI-format ingestion gateway.
+# (FR-ING-3 / PRD §5.5: "LiteLLM proxy + a custom logging callback that emits
+#  common-schema events. Fronts the operator's repointable agents.")
+#
+# Start the proxy with:
+#     litellm --config mnemozine/ingestion/gateway/config.yaml
+#
+# Point any operator-controlled OpenAI-format agent at this proxy by setting its
+# OpenAI base_url to http://<proxy-host>:4000/v1 (and any api_key the proxy
+# expects). Every completion the agent makes is then captured by the registered
+# GatewayCallback and emitted as common-schema IngestEvents (source=openai).
+#
+# Explicit non-capability (FR-ING-3): third-party apps that cannot be repointed
+# at this base_url (ChatGPT desktop, Cursor, ...) are NOT captured by this path.
+
+model_list:
+  # ---- Local Qwen (default / dev target, PRD §5.5) ----------------------
+  # An OpenAI-compatible local server (vLLM / llama.cpp / Ollama's /v1, etc.)
+  # serving Qwen. This is the no-cloud-dependency default.
+  - model_name: qwen
+    litellm_params:
+      model: openai/qwen2.5
+      # Repointable base_url: the whole cloud-vs-local swap is this one line.
+      api_base: os.environ/MNEMOZINE_GATEWAY_QWEN_BASE_URL   # e.g. http://localhost:8000/v1
+      api_key: os.environ/MNEMOZINE_GATEWAY_QWEN_API_KEY     # local servers usually ignore it
+
+  # ---- Optional cloud backend (drop-in via base_url, PRD §3 exception) --
+  # Uncomment to allow routing a model name to a cloud provider through the SAME
+  # gateway, so those completions are captured too. Chosen later on cost (OQ5).
+  # - model_name: cloud-gpt
+  #   litellm_params:
+  #     model: openai/gpt-4o-mini
+  #     api_base: os.environ/MNEMOZINE_GATEWAY_CLOUD_BASE_URL   # https://api.openai.com/v1
+  #     api_key: os.environ/MNEMOZINE_GATEWAY_CLOUD_API_KEY
+
+litellm_settings:
+  # Register the Mnemozine capture callback. The value is a dotted path to the
+  # module-level GatewayCallback instance defined in litellm_register.py. On
+  # every successful completion LiteLLM invokes its log_success_event hook, which
+  # maps the turn to common-schema events (source=openai) and strips tool_calls
+  # (FR-ING-7).
+  callbacks: mnemozine.ingestion.gateway.litellm_register.gateway_callback
+
+  # Determinism for any extraction routed through this proxy; not required for
+  # capture itself.
+  drop_params: true
+
+general_settings:
+  # Bind host/port for the proxy. Homelab-local only (PRD §3: no external egress).
+  # The proxy listens on :4000 by default; override with --port.
+  # master_key: os.environ/MNEMOZINE_GATEWAY_MASTER_KEY   # optional auth
+
+# ---------------------------------------------------------------------------
+# Hermes variant (FR-ING-4): to FRONT Hermes' OpenAI-compatible endpoint through
+# a LiteLLM proxy instead of instrumenting the VM directly, run a SECOND proxy
+# (or add a model entry) whose backend api_base is the Hermes endpoint and whose
+# callbacks reference `hermes_gateway_callback` (source=hermes). Prefer direct
+# instrumentation via mnemozine.ingestion.hermes.HermesAdapter when practical.
+#
+#   model_list:
+#     - model_name: hermes
+#       litellm_params:
+#         model: openai/hermes
+#         api_base: https://hermes-agent.nousresearch.com/v1
+#         api_key: os.environ/MNEMOZINE_HERMES_API_KEY
+#   litellm_settings:
+#     callbacks: mnemozine.ingestion.gateway.litellm_register.hermes_gateway_callback
+# ---------------------------------------------------------------------------

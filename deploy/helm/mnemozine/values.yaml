@@ -1,0 +1,401 @@
+# Default values for the mnemozine chart.
+# Every operationally-relevant knob — images, endpoints, and the PRD §6.6 tuning
+# parameters — is parameterized here. Override with -f my-values.yaml or --set.
+
+# -----------------------------------------------------------------------------
+# Global naming / labels
+# -----------------------------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels applied to every object the chart renders.
+commonLabels: {}
+# Extra annotations applied to every object the chart renders.
+commonAnnotations: {}
+
+imagePullSecrets: []
+
+# =============================================================================
+# Mnemozine application image (shared by mcp / ingest / maintenance).
+# The only difference between the three workloads is the console_script run.
+# =============================================================================
+image:
+  repository: mnemozine
+  tag: ""          # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod-level security context applied to mnemozine workloads (image runs as
+# the non-root uid 10001 baked into the Dockerfile).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+# =============================================================================
+# Endpoints — how mnemozine reaches its backends.
+#
+# When a bundled dependency (falkordb/ollama/qwen/litellm) is `enabled`, the
+# chart wires the in-cluster Service DNS automatically and these explicit URLs
+# are IGNORED for that backend. Set `enabled: false` and fill the matching
+# `external.*` value to point at something you run elsewhere.
+# =============================================================================
+endpoints:
+  external:
+    falkordbUrl: ""        # e.g. redis://my-falkordb:6379  (used when falkordb.enabled=false)
+    ollamaBaseUrl: ""      # e.g. http://my-ollama:11434    (used when ollama.enabled=false)
+    # Extraction LLM, OpenAI-format. Normally the in-cluster LiteLLM gateway.
+    extractionBaseUrl: ""  # e.g. https://api.openai.com/v1 (used when litellm.enabled=false)
+
+# =============================================================================
+# MCP server (FR-RET-1)
+# =============================================================================
+mcp:
+  enabled: true
+  replicaCount: 1
+  command: ["mnemozine-mcp"]
+  host: "0.0.0.0"
+  port: 8765
+  service:
+    type: ClusterIP
+    port: 8765
+    annotations: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  livenessProbe:
+    enabled: true
+    tcpSocket:
+      port: 8765
+    initialDelaySeconds: 20
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    tcpSocket:
+      port: 8765
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# =============================================================================
+# Ingestion daemon (FR-ING-*) — Claude Code watcher + LiteLLM callback drain.
+# =============================================================================
+ingest:
+  enabled: true
+  replicaCount: 1
+  command: ["mnemozine-ingest"]
+  # Mount Claude Code JSONL transcripts (FR-ING-2). In k8s this is typically a
+  # hostPath on the node that runs Claude Code, or a shared PVC populated by a
+  # sidecar/sync. Disabled by default since cluster nodes usually don't host them.
+  claudeTranscripts:
+    enabled: false
+    mountPath: /claude
+    # One of hostPath / existingClaim must be set when enabled.
+    hostPath: ""           # e.g. /home/operator/.claude
+    existingClaim: ""      # e.g. claude-transcripts-pvc (ReadOnlyMany)
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+  livenessProbe:
+    enabled: true
+    exec:
+      command: ["sh", "-c", "pgrep -f mnemozine-ingest >/dev/null"]
+    initialDelaySeconds: 20
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# =============================================================================
+# Maintenance scheduler (FR-MNT-*) — consolidate/resolve/decay/audit on a cron.
+# Runs as a long-lived Deployment hosting APScheduler (cron set via
+# tuning.maintenance.cron). Set asCronJob=true to instead run as a k8s CronJob.
+# =============================================================================
+maintenance:
+  enabled: true
+  replicaCount: 1
+  command: ["mnemozine-maintenance"]
+  # If true, render a Kubernetes CronJob instead of a long-lived Deployment.
+  asCronJob: false
+  # k8s CronJob schedule (used only when asCronJob=true). Defaults to the same
+  # cadence as tuning.maintenance.cron.
+  cronSchedule: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+  livenessProbe:
+    enabled: true
+    exec:
+      command: ["sh", "-c", "pgrep -f mnemozine-maintenance >/dev/null"]
+    initialDelaySeconds: 20
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 6
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+
+# =============================================================================
+# FalkorDB — single graph + vector store (FR-STO-2). StatefulSet + PVC.
+# =============================================================================
+falkordb:
+  enabled: true
+  image:
+    repository: falkordb/falkordb
+    tag: v4.2.2
+    pullPolicy: IfNotPresent
+  port: 6379
+  graphName: mnemozine
+  # Password is stored in the chart Secret when set; leave empty for no-auth
+  # (acceptable in a secured, fully-local homelab per PRD §5.5).
+  password: ""
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""        # "" = cluster default
+    accessModes: ["ReadWriteOnce"]
+  service:
+    type: ClusterIP
+    port: 6379
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Ollama — bge-m3 embeddings (PRD §5.5 / OQ3). Deployment + PVC for models.
+# =============================================================================
+ollama:
+  enabled: true
+  image:
+    repository: ollama/ollama
+    tag: 0.6.8
+    pullPolicy: IfNotPresent
+  port: 11434
+  # Model is pulled by an init container into the persistent model volume so the
+  # embedding endpoint is usable on first start (PRD: must run on local models).
+  model: bge-m3
+  pullModelOnStart: true
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+  service:
+    type: ClusterIP
+    port: 11434
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  # GPU scheduling: set e.g. {"nvidia.com/gpu": 1} under resources.limits via
+  # extraResources if you have a GPU node; CPU-only works for bge-m3.
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 8
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 8
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Qwen — local OpenAI-format extraction LLM (PRD §5.5 / OQ5).
+#
+# Enabled by default so the bundled stack runs end-to-end on local models with
+# no cloud dependency (PRD §3 exception). The default image is a llama.cpp
+# OpenAI-compatible server; provide a GGUF model at `modelPath` (mounted into the
+# models PVC) before first use. To use a cloud / externally-managed extraction
+# endpoint instead, set qwen.enabled=false and litellm.upstream.apiBase.
+# =============================================================================
+qwen:
+  enabled: true
+  image:
+    repository: ghcr.io/ggml-org/llama.cpp
+    tag: server
+    pullPolicy: IfNotPresent
+  port: 8000
+  # Model file inside the mounted models volume / alias served.
+  modelPath: /models/qwen2.5-7b-instruct-q4_k_m.gguf
+  alias: qwen2.5
+  contextSize: 8192
+  persistence:
+    enabled: true
+    size: 30Gi
+    storageClass: ""
+    accessModes: ["ReadWriteOnce"]
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      cpu: "8"
+      memory: 16Gi
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 20
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# LiteLLM — OpenAI-format gateway + logging callback (FR-ING-3).
+# =============================================================================
+litellm:
+  enabled: true
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: main-stable
+    pullPolicy: IfNotPresent
+  port: 4000
+  # Model id mnemozine extraction requests through the gateway.
+  modelName: qwen2.5
+  masterKey: sk-mnemozine-local
+  upstream:
+    # Upstream the gateway proxies to. Defaults to the in-cluster qwen Service
+    # when qwen.enabled; otherwise set this to your external Qwen / cloud base.
+    apiBase: ""            # e.g. http://my-qwen:8000/v1 or https://api.openai.com/v1
+    apiKey: not-needed
+  service:
+    type: ClusterIP
+    port: 4000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 10
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 10
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Tuning parameters — PRD §6.6 (config, NOT constants). These render into the
+# ConfigMap as MNEMOZINE_* env so every mnemozine workload picks them up.
+# Initial values match config.py defaults / the PRD's initial guesses.
+# =============================================================================
+tuning:
+  inject:
+    tokenBudget: 500              # §6.6 inject.token_budget
+    maxPreferenceSnippets: 5
+  crossref:
+    relevanceThreshold: 0.8       # §6.6 crossref.relevance_threshold (precision-first)
+    maxSuggestions: 2             # §6.6 crossref.max_suggestions (1-2)
+    vectorFallbackThreshold: 0.75 # FR-RET-6 vector fallback gate
+  maintenance:
+    dedupEquivalenceThreshold: 0.9  # §6.6 dedup.equivalence_threshold
+    edgeWeightFloor: 0.1            # §6.6 maintenance.edge_weight_floor
+    maxNodeDegree: 64               # §6.6 maintenance.max_node_degree
+    contradictionCandidateCap: 5    # FR-MNT-1 supersede LLM candidate cap
+    decayHalfLifeDays: 30           # §6.6 decay.half_life
+    decayArchiveAfterDays: 90       # §6.6 decay.archive_after
+    cron: "0 3 * * *"               # FR-MNT-5 scheduled maintenance cadence
+  ingest:
+    chunkMaxChars: 8000             # §6.6 chunk.max_size (chars)
+    chunkMaxMessages: 40            # §6.6 chunk.max_size (messages)
+    claudeConfigDir: /claude        # FR-ING-2 transcript root (in-container path)
+    cleanupPeriodDays: 30           # FR-ING-2 / R4
+    stripToolCalls: true            # FR-ING-7
+  retrieval:
+    p95LatencyTargetMs: 500         # §6.6 retrieval.p95_latency_target
+    topK: 10
+    neighborhoodHops: 1             # FR-RET-2 entity-neighborhood depth
+  embedding:
+    model: bge-m3                   # OQ3 embedding model
+    dimensions: 1024
+  extraction:
+    model: openai/qwen2.5           # §5.5 LiteLLM provider/model id
+
+  logLevel: INFO
+
+# Extra arbitrary MNEMOZINE_* (or any) env vars merged into the ConfigMap.
+extraConfig: {}
+
+# Extra secret values (rendered into the chart Secret) — e.g. a cloud API key.
+# Provide MNEMOZINE_* keys; they take precedence over the ConfigMap.
+extraSecrets: {}

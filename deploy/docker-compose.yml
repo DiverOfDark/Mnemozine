@@ -1,0 +1,261 @@
+# Mnemozine — local dev / eval-harness stack (PRD Deliverable #1, §5.5 "docker-compose").
+#
+# Brings up the full self-hosted memory layer without a cluster:
+#   falkordb     — single graph + vector store (FR-STO-2)
+#   ollama       — bge-m3 embeddings, self-hosted (PRD §5.5 / OQ3)
+#   ollama-init  — one-shot: pulls the bge-m3 model into the ollama volume
+#   qwen         — local OpenAI-format extraction LLM (Qwen2.5) (PRD §5.5 / OQ5)
+#   litellm      — OpenAI-format gateway + logging callback (FR-ING-3)
+#   mnemozine-mcp         — the single MCP server (FR-RET-1)
+#   mnemozine-ingest      — ingestion daemon: Claude Code watcher + hooks (FR-ING-*)
+#   mnemozine-maintenance — scheduled maintenance: consolidate/resolve/decay/audit (FR-MNT-*)
+#
+# Usage (from the repo root):
+#   cp .env.example .env        # then edit endpoints/keys
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# The mnemozine image is built once and shared by all three mnemozine-* services;
+# each only differs in the console_script it runs (pyproject [project.scripts]).
+#
+# NOTE: env_file paths are resolved relative to this compose file's directory,
+# so `../.env` points at the repo-root .env. The build context is the repo root
+# (`..`) because the Dockerfile installs from pyproject.toml + mnemozine/.
+
+x-mnemozine-image: &mnemozine-image
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: ${MNEMOZINE_IMAGE:-mnemozine:local}
+
+# Shared env for every mnemozine-* service. The repo-root .env supplies all
+# MNEMOZINE_* settings (config.py). The keys below are set under `environment:`,
+# which in Compose ALWAYS overrides env_file — so the in-cluster service
+# hostnames win over the localhost defaults baked into .env / .env.example, and
+# the containers reach each other by compose service name.
+#
+# These use compose-specific interpolation vars (MZ_COMPOSE_*) for the override
+# default so they are NOT shadowed by the MNEMOZINE_* localhost values that live
+# in .env (Compose interpolates ${...} from .env/host before applying defaults).
+# The inter-service connection env, as a reusable YAML MAP anchor. Services
+# merge it INTO their own `environment:` map with `<<: *mnemozine-conn-env` so
+# per-service keys and these shared keys coexist (a top-level `<<` on the service
+# would make a second `environment:` block REPLACE this one — YAML does not deep
+# -merge maps, hence the in-map merge here).
+#
+# These keys are set under `environment:`, which in Compose ALWAYS overrides
+# env_file — so the in-cluster service hostnames win over the localhost defaults
+# baked into .env / .env.example, and containers reach each other by service name.
+# The MZ_COMPOSE_* interpolation vars (NOT present in .env) let an operator
+# override without being shadowed by the MNEMOZINE_* localhost values in .env.
+x-mnemozine-conn-env: &mnemozine-conn-env
+  MNEMOZINE_FALKORDB__URL: ${MZ_COMPOSE_FALKORDB_URL:-redis://falkordb:6379}
+  MNEMOZINE_EMBEDDING__BASE_URL: ${MZ_COMPOSE_OLLAMA_URL:-http://ollama:11434}
+  # Extraction goes through the LiteLLM gateway so every turn is captured (FR-ING-3).
+  MNEMOZINE_EXTRACTION__BASE_URL: ${MZ_COMPOSE_EXTRACTION_URL:-http://litellm:4000/v1}
+  MNEMOZINE_EXTRACTION__MODEL: ${MZ_COMPOSE_EXTRACTION_MODEL:-openai/qwen2.5}
+  MNEMOZINE_EXTRACTION__API_KEY: ${MZ_COMPOSE_EXTRACTION_API_KEY:-not-needed}
+  MNEMOZINE_LOG_LEVEL: ${MZ_COMPOSE_LOG_LEVEL:-INFO}
+
+x-mnemozine-env: &mnemozine-env
+  env_file:
+    - ../.env
+  environment:
+    <<: *mnemozine-conn-env
+
+services:
+  # -------------------------------------------------------------------------
+  # FalkorDB — single graph + vector store (FR-STO-2). Redis-protocol on 6379.
+  # -------------------------------------------------------------------------
+  falkordb:
+    image: ${FALKORDB_IMAGE:-falkordb/falkordb:v4.2.2}
+    restart: unless-stopped
+    ports:
+      - "${FALKORDB_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --loadmodule /var/lib/falkordb/bin/falkordb.so
+      --dir /data
+      ${FALKORDB_PASSWORD_ARG:-}
+    volumes:
+      - falkordb-data:/data
+    healthcheck:
+      # PING is enough to assert the Redis/FalkorDB endpoint is serving.
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-p", "6379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Ollama — serves bge-m3 embeddings (PRD §5.5 / OQ3).
+  # -------------------------------------------------------------------------
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.6.8}
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      # Ollama exposes a bare 200 on / once the HTTP server is up.
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # One-shot pull of the embedding model into the shared ollama volume so the
+  # stack is usable end-to-end on first `up` (PRD: must run against local models).
+  ollama-init:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:0.6.8}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'ollama pull ${MNEMOZINE_EMBEDDING__MODEL:-bge-m3}'
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Qwen — local OpenAI-format extraction LLM (PRD §5.5 / OQ5).
+  #
+  # Default image is a llama.cpp OpenAI-compatible server; supply a GGUF model
+  # via QWEN_MODEL / a mounted model dir, or swap QWEN_IMAGE for vLLM/Ollama.
+  # If you prefer a cloud extraction endpoint, set
+  #   MNEMOZINE_EXTRACTION__BASE_URL / __MODEL / __API_KEY in .env and point the
+  # litellm model at it instead (see deploy/litellm.config.yaml) — this service
+  # then becomes optional and can be removed from `up`.
+  # -------------------------------------------------------------------------
+  qwen:
+    image: ${QWEN_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    restart: unless-stopped
+    ports:
+      - "${QWEN_PORT:-8000}:8000"
+    volumes:
+      - qwen-models:/models
+    command: >
+      -m /models/${QWEN_MODEL:-qwen2.5-7b-instruct-q4_k_m.gguf}
+      --host 0.0.0.0
+      --port 8000
+      --alias qwen2.5
+      -c ${QWEN_CONTEXT:-8192}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  # -------------------------------------------------------------------------
+  # LiteLLM — OpenAI-format gateway + logging callback (FR-ING-3).
+  # Fronts the local Qwen (and optionally a cloud model); the custom callback
+  # emits common-schema events into the ingestion path.
+  # -------------------------------------------------------------------------
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
+    restart: unless-stopped
+    depends_on:
+      qwen:
+        condition: service_healthy
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-mnemozine-local}
+      # Upstream Qwen endpoint the gateway proxies to.
+      QWEN_API_BASE: ${QWEN_API_BASE:-http://qwen:8000/v1}
+      QWEN_API_KEY: ${QWEN_API_KEY:-not-needed}
+    volumes:
+      - ./litellm.config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/health/liveliness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # MCP server — the single memory interface for all agents (FR-RET-1).
+  # -------------------------------------------------------------------------
+  mnemozine-mcp:
+    <<: [*mnemozine-image, *mnemozine-env]
+    restart: unless-stopped
+    command: ["mnemozine-mcp"]
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      # Merge the shared inter-service connection env, then add MCP-specific keys.
+      <<: *mnemozine-conn-env
+      # Bind to all interfaces inside the container so the published port works.
+      MNEMOZINE_MCP_HOST: 0.0.0.0
+      MNEMOZINE_MCP_PORT: ${MNEMOZINE_MCP_PORT:-8765}
+    ports:
+      - "${MNEMOZINE_MCP_PORT:-8765}:8765"
+    healthcheck:
+      # The MCP server speaks HTTP on its bind port; a TCP/HTTP probe via curl
+      # confirms it is accepting connections. (--http returns 404/200; -o suppresses body.)
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8765/ || curl -fsS -o /dev/null http://127.0.0.1:8765/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # Ingestion daemon — Claude Code watcher + hooks, LiteLLM callback drain (FR-ING-*).
+  # Mounts the host Claude Code config dir read-only so the watcher can tail
+  # JSONL transcripts (FR-ING-2). Override CLAUDE_CONFIG_DIR on the host via
+  # HOST_CLAUDE_CONFIG_DIR.
+  # -------------------------------------------------------------------------
+  mnemozine-ingest:
+    <<: [*mnemozine-image, *mnemozine-env]
+    restart: unless-stopped
+    command: ["mnemozine-ingest"]
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      # Merge the shared inter-service connection env, then add ingest-specific keys.
+      <<: *mnemozine-conn-env
+      # Inside the container the transcripts live at /claude (mounted below).
+      MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR: /claude
+    volumes:
+      - ${HOST_CLAUDE_CONFIG_DIR:-${HOME}/.claude}:/claude:ro
+    healthcheck:
+      # No HTTP surface; liveness = the watcher process is still running.
+      test: ["CMD-SHELL", "pgrep -f mnemozine-ingest >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Maintenance scheduler — consolidate/resolve/decay/audit on a cron (FR-MNT-*).
+  # -------------------------------------------------------------------------
+  mnemozine-maintenance:
+    <<: [*mnemozine-image, *mnemozine-env]
+    restart: unless-stopped
+    command: ["mnemozine-maintenance"]
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      # No HTTP surface; liveness = the APScheduler process is still running.
+      test: ["CMD-SHELL", "pgrep -f mnemozine-maintenance >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  falkordb-data:   # FalkorDB persistence (graph + vectors) — survives restarts.
+  ollama-data:     # pulled models (bge-m3 + any others).
+  qwen-models:     # local GGUF / model weights for the extraction LLM.

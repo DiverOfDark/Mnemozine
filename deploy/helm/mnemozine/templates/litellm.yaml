@@ -1,0 +1,130 @@
+{{- if .Values.litellm.enabled }}
+{{- $name := include "mnemozine.litellm.fullname" . -}}
+{{- $component := "litellm" -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+data:
+  config.yaml: |
+    # LiteLLM gateway config (FR-ING-3). Fronts the operator's repointable agents
+    # behind one OpenAI-format base_url and proxies to the extraction LLM upstream.
+    model_list:
+      - model_name: {{ .Values.litellm.modelName }}
+        litellm_params:
+          model: openai/{{ .Values.litellm.modelName }}
+          api_base: os.environ/QWEN_API_BASE
+          api_key: os.environ/QWEN_API_KEY
+    litellm_settings:
+      drop_params: true
+      # Attach mnemozine's logging callback in the ingestion process (FR-ING-3):
+      #   callbacks: ["mnemozine.ingest.litellm_callback.MnemozineLogger"]
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.litellm.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.litellm.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 8 }}
+      annotations:
+        # Roll the deployment when the gateway config changes.
+        checksum/config: {{ tpl (toYaml .Values.litellm) $ | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: litellm
+          image: "{{ .Values.litellm.image.repository }}:{{ .Values.litellm.image.tag }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
+          args: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+          env:
+            - name: LITELLM_MASTER_KEY
+              value: {{ .Values.litellm.masterKey | quote }}
+            - name: QWEN_API_BASE
+              value: {{ include "mnemozine.litellmUpstreamApiBase" . | quote }}
+            - name: QWEN_API_KEY
+              value: {{ .Values.litellm.upstream.apiKey | default "not-needed" | quote }}
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+          {{- if .Values.litellm.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            initialDelaySeconds: {{ .Values.litellm.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.litellm.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.litellm.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.litellm.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.litellm.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            initialDelaySeconds: {{ .Values.litellm.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.litellm.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.litellm.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.litellm.readinessProbe.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.litellm.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+      {{- with .Values.litellm.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.litellm.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.litellm.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+{{- end }}

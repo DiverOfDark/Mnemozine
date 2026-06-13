@@ -1,0 +1,298 @@
+"""Parse Claude Code JSONL transcripts into normalized events (FR-ING-2/7).
+
+Claude Code writes one JSON object per line to
+``$CLAUDE_CONFIG_DIR/projects/<project>/<session-id>.jsonl``. Lines come in many
+``type``s — ``user``, ``assistant``, plus bookkeeping records
+(``file-history-snapshot``, ``permission-mode``, ``ai-title``, ``attachment``,
+``last-prompt``, ...). Only the conversational ``user`` / ``assistant`` turns
+carry durable memory value, so the parser:
+
+1. keeps only conversational turns and drops bookkeeping lines (returns ``None``);
+2. derives the ``project`` field from the transcript path / the record's ``cwd``
+   (FR-ING-2);
+3. flattens the Anthropic message ``content`` (a string or a list of typed
+   blocks) into plain text, dropping ``thinking`` blocks and — per FR-ING-7 —
+   ``tool_use`` / ``tool_result`` blocks (the highest-density source of raw
+   credentials, file dumps, and command output);
+4. returns ``None`` for a turn whose only content was tool traffic, so a chunk is
+   not padded with empty events.
+
+The parser is intentionally tolerant: a malformed or unrecognized line yields
+``None`` rather than raising, so a single bad line never stalls the watcher.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from mnemozine.schema.events import IngestEvent, Role, Source
+
+# Claude Code transcript line ``type`` values that carry a conversational turn.
+_CONVERSATIONAL_TYPES = frozenset({"user", "assistant"})
+
+# Anthropic content-block ``type`` values stripped on normalize per FR-ING-7
+# (tool traffic) and as non-durable noise (``thinking``).
+_TOOL_BLOCK_TYPES = frozenset({"tool_use", "tool_result", "server_tool_use"})
+_DROPPED_BLOCK_TYPES = _TOOL_BLOCK_TYPES | frozenset({"thinking", "redacted_thinking"})
+
+# The directory under CLAUDE_CONFIG_DIR that holds per-project transcript dirs.
+PROJECTS_DIRNAME = "projects"
+
+
+def session_id_from_path(path: str | Path) -> str:
+    """Derive the session id from a transcript path (the filename stem).
+
+    Claude Code names each transcript ``<session-id>.jsonl``; the stem is the
+    session id (FR-ING-2). Used as a fallback when a line omits ``sessionId``.
+    """
+
+    return Path(path).stem
+
+
+def derive_project(path: str | Path, *, cwd: str | None = None) -> str:
+    """Derive the ``project`` field for an event (FR-ING-2).
+
+    Claude Code encodes the working directory into the per-project transcript
+    directory name (e.g. ``-var-home-op-Projects-rust-cli``). The most reliable
+    project label is the basename of the record's ``cwd`` when present; otherwise
+    fall back to the basename of the encoded transcript-directory name.
+
+    Parameters
+    ----------
+    path:
+        The transcript file path (``.../projects/<encoded-dir>/<session>.jsonl``).
+    cwd:
+        The ``cwd`` field from the transcript line, if available — preferred
+        because it is the literal working directory, not the path-encoded form.
+    """
+
+    if cwd:
+        name = Path(cwd).name
+        if name:
+            return name
+
+    p = Path(path)
+    # The parent directory is the path-encoded project dir; its trailing segment
+    # is the best available project label when no cwd is present.
+    encoded = p.parent.name
+    if not encoded:
+        return p.stem
+    # Claude Code replaces path separators with '-'; the final segment after the
+    # last separator is the leaf working-directory name.
+    leaf = encoded.rstrip("-").rsplit("-", 1)[-1]
+    return leaf or encoded
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    """Parse an ISO-8601 timestamp, tolerating a trailing ``Z`` and naive input."""
+
+    if isinstance(value, str) and value:
+        text = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return datetime.now(UTC)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    return datetime.now(UTC)
+
+
+def _role_from(value: Any) -> Role | None:
+    """Map an Anthropic message role to a :class:`Role`, or ``None`` if unknown."""
+
+    if value == "user":
+        return Role.USER
+    if value == "assistant":
+        return Role.ASSISTANT
+    if value == "tool":
+        return Role.TOOL
+    return None
+
+
+def _extract_text(content: Any, *, strip_tool_calls: bool) -> tuple[str, list[dict[str, Any]]]:
+    """Flatten Anthropic message ``content`` into ``(text, tool_calls)``.
+
+    ``content`` may be a plain string or a list of typed blocks. ``thinking`` and
+    tool blocks are dropped from the text. When ``strip_tool_calls`` is ``False``
+    the raw ``tool_use`` blocks are returned separately so the caller can attach
+    them to ``IngestEvent.tool_calls`` (still never inlined into ``content``);
+    when ``True`` they are discarded entirely (FR-ING-7).
+    """
+
+    if isinstance(content, str):
+        return content.strip(), []
+
+    if not isinstance(content, list):
+        return "", []
+
+    parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            # A bare string inside a content list is occasionally seen.
+            if isinstance(block, str) and block.strip():
+                parts.append(block.strip())
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        elif btype == "tool_use" or btype == "server_tool_use":
+            if not strip_tool_calls:
+                tool_calls.append(block)
+        elif btype in _DROPPED_BLOCK_TYPES:
+            # tool_result / tool_use / thinking — always stripped from text.
+            continue
+        # Unknown block types contribute nothing to durable memory.
+    return "\n".join(parts).strip(), tool_calls
+
+
+def parse_transcript_line(
+    raw: str | dict[str, Any],
+    *,
+    path: str | Path,
+    strip_tool_calls: bool = True,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> IngestEvent | None:
+    """Parse one Claude Code JSONL line into an :class:`IngestEvent`.
+
+    Returns ``None`` for non-conversational lines (bookkeeping records), malformed
+    JSON, an unparseable role, or a turn whose only content was tool traffic that
+    got stripped (so chunks are not padded with empty events).
+
+    Parameters
+    ----------
+    raw:
+        A JSON line (``str``) or an already-decoded record (``dict``).
+    path:
+        The transcript path, used to derive ``project``/``session_id`` defaults
+        and to record the raw path in metadata (FR-ING-2).
+    strip_tool_calls:
+        Honor ``IngestSettings.strip_tool_calls`` (FR-ING-7). When ``True`` the
+        emitted event carries ``tool_calls=None``; when ``False`` raw
+        ``tool_use`` blocks are attached to ``tool_calls`` (never to ``content``).
+    project / session_id:
+        Optional overrides; when omitted they are derived from the line/path.
+    """
+
+    if isinstance(raw, str):
+        line = raw.strip()
+        if not line:
+            return None
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    else:
+        record = raw
+
+    if not isinstance(record, dict):
+        return None
+
+    if record.get("type") not in _CONVERSATIONAL_TYPES:
+        return None
+
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    role = _role_from(message.get("role"))
+    if role is None:
+        return None
+
+    text, tool_calls = _extract_text(
+        message.get("content"), strip_tool_calls=strip_tool_calls
+    )
+    if not text:
+        # The turn was entirely tool traffic / thinking — nothing durable left.
+        return None
+
+    resolved_session = session_id or record.get("sessionId") or session_id_from_path(path)
+    cwd = record.get("cwd")
+    resolved_project = project or derive_project(path, cwd=cwd if isinstance(cwd, str) else None)
+
+    metadata: dict[str, Any] = {"raw_path": str(path)}
+    if isinstance(cwd, str) and cwd:
+        metadata["cwd"] = cwd
+    git_branch = record.get("gitBranch")
+    if isinstance(git_branch, str) and git_branch:
+        metadata["git_branch"] = git_branch
+    model = message.get("model")
+    if isinstance(model, str) and model:
+        metadata["model"] = model
+    version = record.get("version")
+    if isinstance(version, str) and version:
+        metadata["cc_version"] = version
+
+    return IngestEvent(
+        source=Source.CLAUDE_CODE,
+        project=str(resolved_project),
+        session_id=str(resolved_session),
+        timestamp=_parse_timestamp(record.get("timestamp")),
+        role=role,
+        content=text,
+        tool_calls=tool_calls or None,
+        metadata=metadata,
+    )
+
+
+def parse_transcript_lines(
+    lines: Iterable[str | dict[str, Any]],
+    *,
+    path: str | Path,
+    strip_tool_calls: bool = True,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> Iterator[IngestEvent]:
+    """Parse many transcript lines, skipping the ones that yield ``None``.
+
+    A convenience over :func:`parse_transcript_line` for a whole transcript:
+    bookkeeping lines, malformed JSON, and tool-only turns are silently dropped,
+    so the result is exactly the conversational events in file order.
+    """
+
+    for raw in lines:
+        event = parse_transcript_line(
+            raw,
+            path=path,
+            strip_tool_calls=strip_tool_calls,
+            project=project,
+            session_id=session_id,
+        )
+        if event is not None:
+            yield event
+
+
+def read_transcript(
+    path: str | Path,
+    *,
+    strip_tool_calls: bool = True,
+    project: str | None = None,
+) -> list[IngestEvent]:
+    """Read and parse a whole transcript file into ordered events (FR-ING-2/6).
+
+    Reads the JSONL file at ``path`` and returns its conversational events. Missing
+    files yield an empty list (a transcript may be deleted mid-tail by the 30-day
+    cleanup, R4); the caller decides whether that is an error.
+    """
+
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError):
+        return []
+    return list(
+        parse_transcript_lines(
+            text.splitlines(),
+            path=p,
+            strip_tool_calls=strip_tool_calls,
+            project=project,
+        )
+    )

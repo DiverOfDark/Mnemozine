@@ -1,0 +1,3 @@
+{"parentUuid":null,"type":"user","sessionId":"sess-rewind","cwd":"/home/op/Projects/rust-cli","version":"2.0.0","timestamp":"2026-06-13T11:00:00.000Z","message":{"role":"user","content":"First question about async runtimes."}}
+{"parentUuid":"r1","type":"assistant","sessionId":"sess-rewind","cwd":"/home/op/Projects/rust-cli","version":"2.0.0","timestamp":"2026-06-13T11:00:01.000Z","message":{"model":"claude-opus","role":"assistant","content":[{"type":"text","text":"Tokio is the common choice."}]}}
+{"parentUuid":"r2","type":"user","sessionId":"sess-rewind","cwd":"/home/op/Projects/rust-cli","version":"2.0.0","timestamp":"2026-06-13T11:00:02.000Z","message":{"role":"user","content":"Second question about cli parsing."}}

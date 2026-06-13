@@ -1,0 +1,40 @@
+# LiteLLM gateway config (FR-ING-3).
+#
+# The gateway fronts the operator's repointable agents behind one OpenAI-format
+# base_url and proxies to the local Qwen extraction LLM (PRD §5.5). A custom
+# logging callback (mnemozine's ingestion layer) captures each turn and emits
+# common-schema events into the ingestion path — that callback is registered at
+# runtime by the ingestion service / app wiring, not here.
+#
+# To use a CLOUD extraction model instead of local Qwen, replace the
+# `api_base`/`api_key`/`model` below (or add another model entry) and repoint
+# MNEMOZINE_EXTRACTION__MODEL at it. The system still runs end-to-end on local
+# models with no cloud dependency (PRD §3 exception).
+
+model_list:
+  # The model id agents (and mnemozine extraction) request: "qwen2.5".
+  - model_name: qwen2.5
+    litellm_params:
+      # `openai/<name>` tells LiteLLM to speak the OpenAI Chat Completions API
+      # to the upstream defined by api_base (the local Qwen server).
+      model: openai/qwen2.5
+      api_base: os.environ/QWEN_API_BASE
+      api_key: os.environ/QWEN_API_KEY
+
+  # Embeddings can also be routed through the gateway if desired; mnemozine
+  # talks to Ollama directly by default, so this is optional/illustrative.
+  - model_name: bge-m3
+    litellm_params:
+      model: ollama/bge-m3
+      api_base: os.environ/OLLAMA_API_BASE
+
+litellm_settings:
+  # Drop unsupported params rather than erroring when a local model lacks them.
+  drop_params: true
+  # Register mnemozine's logging callback here once wired, e.g.:
+  #   callbacks: ["mnemozine.ingest.litellm_callback.MnemozineLogger"]
+  # Left commented so the gateway boots standalone; the ingestion service
+  # attaches the callback in its own process (FR-ING-3).
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

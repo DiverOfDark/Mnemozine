@@ -1,0 +1,157 @@
+{
+  "name": "mnemozine-gold-fixture",
+  "description": "Small committed gold set so the EVAL harness (PRD §9) runs offline against the conftest fakes. Covers every metric: injection precision@k, changed-preference correctness, cross-reference precision, classifier accuracy, retrieval p95 latency, and the no-leak check. NOT the operator's real eval set (built via mnemozine-eval bootstrap, ~40 cases); this is the synthetic, dependency-free stand-in.",
+  "memories": [
+    {
+      "gold_id": "pref-rust-errors-current",
+      "type": "preference",
+      "content": "Prefers thiserror over anyhow for Rust error handling.",
+      "scope": "global",
+      "entities": ["rust", "error-handling", "thiserror"],
+      "confidence": 0.95,
+      "age_days": 5
+    },
+    {
+      "gold_id": "pref-rust-errors-stale",
+      "type": "preference",
+      "content": "Prefers anyhow over thiserror for Rust error handling.",
+      "scope": "global",
+      "entities": ["rust", "error-handling", "anyhow"],
+      "confidence": 0.8,
+      "age_days": 90,
+      "superseded": true
+    },
+    {
+      "gold_id": "pref-python-fmt",
+      "type": "preference",
+      "content": "Prefers ruff for Python formatting and linting.",
+      "scope": "global",
+      "entities": ["python", "formatting", "ruff"],
+      "confidence": 0.9,
+      "age_days": 10
+    },
+    {
+      "gold_id": "fact-rustcli-tokio",
+      "type": "project_fact",
+      "content": "The rust-cli project pins tokio 1.38.",
+      "scope": "project:rust-cli",
+      "entities": ["tokio", "async", "rust-cli"],
+      "confidence": 0.9,
+      "age_days": 3
+    },
+    {
+      "gold_id": "fact-webapp-postgres",
+      "type": "project_fact",
+      "content": "The webapp project uses postgres 16 as its primary datastore.",
+      "scope": "project:webapp",
+      "entities": ["postgres", "database", "webapp"],
+      "confidence": 0.9,
+      "age_days": 7
+    },
+    {
+      "gold_id": "idea-async-cli-tool",
+      "type": "idea_seed",
+      "content": "Idea: an async CLI tool that streams logs with a tokio runtime and clap parsing.",
+      "scope": "global",
+      "entities": ["async", "cli", "tokio", "rust"],
+      "confidence": 0.7,
+      "age_days": 30
+    },
+    {
+      "gold_id": "idea-recipe-app",
+      "type": "idea_seed",
+      "content": "Idea: a recipe app with a shared grocery list and meal planning.",
+      "scope": "global",
+      "entities": ["cooking", "mobile", "recipes"],
+      "confidence": 0.6,
+      "age_days": 45
+    }
+  ],
+  "injection_cases": [
+    {
+      "case_id": "inj-rust-errors",
+      "query": "rust error handling",
+      "project": "rust-cli",
+      "scopes": ["global", "project:rust-cli"],
+      "entities": ["rust", "error-handling"],
+      "should_surface": ["pref-rust-errors-current"],
+      "should_not_surface": ["pref-rust-errors-stale", "pref-python-fmt", "fact-webapp-postgres"],
+      "top_k": 3
+    },
+    {
+      "case_id": "inj-python-fmt",
+      "query": "python formatting ruff",
+      "project": "py-svc",
+      "scopes": ["global"],
+      "entities": ["python", "formatting"],
+      "should_surface": ["pref-python-fmt"],
+      "should_not_surface": ["pref-rust-errors-current", "pref-rust-errors-stale"],
+      "top_k": 3
+    }
+  ],
+  "preference_cases": [
+    {
+      "case_id": "chg-rust-errors",
+      "query": "rust error handling thiserror anyhow",
+      "project": "rust-cli",
+      "scopes": ["global"],
+      "entities": ["rust", "error-handling"],
+      "current_gold_id": "pref-rust-errors-current",
+      "stale_gold_id": "pref-rust-errors-stale",
+      "top_k": 5
+    }
+  ],
+  "crossref_cases": [
+    {
+      "case_id": "xref-async-cli",
+      "project": "rust-cli",
+      "entities": ["async", "tokio"],
+      "relevant_gold_ids": ["idea-async-cli-tool"],
+      "max_suggestions": 2
+    }
+  ],
+  "classifier_cases": [
+    {
+      "case_id": "cls-pref-rust",
+      "statement": "I prefer thiserror over anyhow for error handling in Rust.",
+      "project": "rust-cli",
+      "expected_type": "preference"
+    },
+    {
+      "case_id": "cls-pref-python",
+      "statement": "I always format Python with ruff.",
+      "project": "py-svc",
+      "expected_type": "preference"
+    },
+    {
+      "case_id": "cls-fact-tokio",
+      "statement": "This project pins tokio 1.38.",
+      "project": "rust-cli",
+      "expected_type": "project_fact"
+    },
+    {
+      "case_id": "cls-fact-postgres",
+      "statement": "The webapp uses postgres 16 as its datastore.",
+      "project": "webapp",
+      "expected_type": "project_fact"
+    }
+  ],
+  "no_leak_cases": [
+    {
+      "case_id": "leak-tokio-into-webapp",
+      "fact_gold_id": "fact-rustcli-tokio",
+      "unrelated_project": "webapp",
+      "query": "tokio async runtime version",
+      "entities": ["tokio", "async"],
+      "top_k": 10
+    },
+    {
+      "case_id": "leak-postgres-into-rustcli",
+      "fact_gold_id": "fact-webapp-postgres",
+      "unrelated_project": "rust-cli",
+      "query": "postgres database datastore",
+      "entities": ["postgres", "database"],
+      "top_k": 10
+    }
+  ]
+}

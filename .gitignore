@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+wheels/
+.installed.cfg
+*.manifest
+*.spec
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Test / type / lint caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- Tooling / editors ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Local data / artifacts ---
+*.log
+data/
+archive/
