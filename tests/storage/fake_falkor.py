@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from mnemozine.storage.cosine import cosine_similarity
+
 
 class _Result:
     """Minimal FalkorDB QueryResult stand-in: rows live on ``result_set``."""
@@ -51,6 +53,14 @@ class FakeFalkorDriver:
         if "CREATE VECTOR INDEX" in c:
             return _Result([])
 
+        # --- index-backed vector KNN (the FR-RET-2 scoped_query path) --------
+        # Mirror the real FalkorDB ``db.idx.vector.queryNodes`` contract: rank the
+        # scope/tier/entity-filtered candidates by cosine *distance* (1 - cosine,
+        # so 0 == identical, matching FalkorDB), return ``[node, score]`` rows in
+        # ascending-distance order, then honor the over-fetch ``LIMIT $top_k``.
+        if "db.idx.vector.queryNodes" in c:
+            return self._vector_knn(c, params)
+
         # --- MnemozineMemory --------------------------------------------------
         if ":MnemozineMemory" in c:
             return self._memory(c, params)
@@ -70,8 +80,14 @@ class FakeFalkorDriver:
     # -- memory ---------------------------------------------------------------
 
     def _memory(self, c: str, p: dict[str, Any]) -> _Result:
-        if c.startswith("CREATE (m:MnemozineMemory $props)"):
+        if c.startswith("CREATE (m:MnemozineMemory) SET m = $props"):
             props = dict(p["props"])
+            # The real backend now splits the embedding out of $props and stores
+            # it as a typed vector via ``SET m.embedding = vecf32($embedding)`` in
+            # the same statement; fold it back onto the node so the fake's stored
+            # shape matches what the backend reads back.
+            if "embedding" in p:
+                props["embedding"] = list(p["embedding"])
             self.memories[props["id"]] = props
             return _Result([[props]])
 
@@ -113,6 +129,31 @@ class FakeFalkorDriver:
         if "LIMIT $cap" in c and "cap" in p:
             rows = rows[: p["cap"]]
         return _Result(rows)
+
+    def _vector_knn(self, c: str, p: dict[str, Any]) -> _Result:
+        """Interpret the index-backed KNN scoped_query against the dict store.
+
+        Applies the same scope/validity/tier/entity WHERE filters the backend
+        emits (reusing :meth:`_memory_matches`), ranks by cosine distance to the
+        query vector ``$qv``, and returns ``[node, distance]`` rows ascending —
+        the shape the backend converts back to a cosine-similarity score. Honors
+        the over-fetch ``LIMIT $top_k`` so behaviour matches FalkorDB's post-KNN
+        cut. (The over-fetch ``$k`` is irrelevant in the fake since it ranks the
+        full candidate set anyway — exactly the ordering the index would yield.)
+        """
+
+        qv = list(p.get("qv") or [])
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for m in self.memories.values():
+            if not self._memory_matches(c, m, p):
+                continue
+            distance = 1.0 - cosine_similarity(qv, list(m.get("embedding") or []))
+            scored.append((distance, m))
+        scored.sort(key=lambda t: t[0])
+        top_k = p.get("top_k")
+        if top_k is not None:
+            scored = scored[:top_k]
+        return _Result([[m, distance] for distance, m in scored])
 
     @staticmethod
     def _memory_matches(c: str, m: dict[str, Any], p: dict[str, Any]) -> bool:

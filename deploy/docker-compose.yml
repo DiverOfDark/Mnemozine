@@ -236,6 +236,28 @@ services:
       start_period: 20s
 
   # -------------------------------------------------------------------------
+  # Eval harness — the §9 "precision stays flat as the store grows" assertion
+  # (Goal-5 / FR-RET-2). One-shot, on-demand: it runs the eval CLI's `scaling`
+  # subcommand across the distractor-inflation levels and exits 0/1, so it is in
+  # the `eval` profile (not started by a plain `up`). Run it explicitly with:
+  #   docker compose -f deploy/docker-compose.yml run --rm mnemozine-eval
+  # It is built from the shared mnemozine image and shares the same env so it can
+  # also be pointed at the live store; the default `scaling` run is offline.
+  # -------------------------------------------------------------------------
+  mnemozine-eval:
+    <<: [*mnemozine-image, *mnemozine-env]
+    profiles: ["eval"]
+    restart: "no"
+    command: ["mnemozine-eval", "scaling"]
+    depends_on:
+      falkordb:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      <<: *mnemozine-conn-env
+
+  # -------------------------------------------------------------------------
   # Maintenance scheduler — consolidate/resolve/decay/audit on a cron (FR-MNT-*).
   # -------------------------------------------------------------------------
   mnemozine-maintenance:

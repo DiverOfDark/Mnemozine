@@ -100,6 +100,9 @@ class GraphitiClient:
         self._embedding_dimensions = embedding_dimensions
         self._graphiti: Any | None = None
         self._driver: Any | None = None
+        # Set if the Graphiti engine could not be constructed (e.g. no cloud LLM
+        # key); the FalkorDB driver is still usable for the project's raw Cypher.
+        self._graphiti_init_error: Exception | None = None
 
     @property
     def graph_name(self) -> str:
@@ -147,7 +150,21 @@ class GraphitiClient:
             password=self._settings.password,
             database=self._settings.graph_name,
         )
-        self._graphiti = Graphiti(graph_driver=self._driver)
+        # OQ4 caveat (verified live against graphiti-core[falkordb]==0.29.2): the
+        # ``Graphiti`` engine eagerly constructs a cloud ``OpenAIClient()`` in its
+        # __init__ when no ``llm_client`` is passed, which raises ``OpenAIError``
+        # if ``OPENAI_API_KEY`` is unset. Mnemozine never uses Graphiti's
+        # extraction/embedding pipeline — it talks raw Cypher through the
+        # ``FalkorDriver`` (see :meth:`execute_query`) and runs its own injected
+        # LLM/embedding providers — so we tolerate that failure: keep the driver
+        # (the only thing the storage backend needs) and leave the Graphiti engine
+        # unbuilt rather than forcing operators to provision a cloud key just to
+        # use a fully local FalkorDB store.
+        try:
+            self._graphiti = Graphiti(graph_driver=self._driver)
+        except Exception as exc:  # noqa: BLE001 - any eager-client failure is non-fatal here
+            self._graphiti = None
+            self._graphiti_init_error = exc
         await self._build_indices()
 
     async def _build_indices(self) -> None:
@@ -155,12 +172,17 @@ class GraphitiClient:
 
         Both are idempotent in FalkorDB (``IF NOT EXISTS`` / build_indices guards),
         so this is safe to call on every connect (FR-MNT-5 spirit: re-runnable).
+
+        Graphiti's native fulltext/range indices are built through whichever object
+        exposes ``build_indices_and_constraints`` — the Graphiti engine when it was
+        constructed, else the FalkorDriver directly (the engine may be absent when
+        no cloud LLM key is configured; see :meth:`connect`). The Mnemozine vector
+        index (FR-STO-2) is always created via :meth:`ensure_vector_index`.
         """
 
-        # Let Graphiti set up its native fulltext/range indices + constraints.
-        graphiti = self.graphiti  # raises if connect() not yet called
-        if hasattr(graphiti, "build_indices_and_constraints"):
-            await graphiti.build_indices_and_constraints()
+        builder = self._graphiti if self._graphiti is not None else self._driver
+        if builder is not None and hasattr(builder, "build_indices_and_constraints"):
+            await builder.build_indices_and_constraints()
         await self.ensure_vector_index()
 
     async def ensure_vector_index(self) -> None:
@@ -168,16 +190,30 @@ class GraphitiClient:
 
         FalkorDB exposes vector search via a node vector index on a property; this
         indexes ``MnemozineMemory.embedding`` with cosine similarity at the
-        configured dimensionality so :meth:`scoped_query` can do semantic search
-        inside the composed-scope subset (FR-RET-2). ``IF NOT EXISTS`` makes it
-        idempotent.
+        configured dimensionality so :meth:`scoped_query` can do an index-backed
+        KNN inside the composed-scope subset (FR-RET-2).
+
+        Idempotency: FalkorDB's ``CREATE VECTOR INDEX`` does **not** accept the
+        ``IF NOT EXISTS`` qualifier (verified live against falkordb v4.x — it is a
+        syntax error). Re-creating an existing index instead raises
+        ``Attribute 'embedding' is already indexed``; we swallow exactly that so
+        the call stays safe to run on every connect (FR-MNT-5: re-runnable). The
+        ``dimension``/``similarityFunction`` OPTIONS must be inline literals, so
+        the dimension is interpolated from the integer ``embedding_dimensions``
+        (not a query param) — it is an ``int`` field, never user text.
         """
 
         cypher = (
-            f"CREATE VECTOR INDEX IF NOT EXISTS FOR (m:{MEMORY_LABEL}) "
-            f"ON (m.embedding) OPTIONS {{dimension: $dim, similarityFunction: 'cosine'}}"
+            f"CREATE VECTOR INDEX FOR (m:{MEMORY_LABEL}) "
+            f"ON (m.embedding) "
+            f"OPTIONS {{dimension: {int(self._embedding_dimensions)}, "
+            f"similarityFunction: 'cosine'}}"
         )
-        await self.execute_query(cypher, dim=self._embedding_dimensions)
+        try:
+            await self.execute_query(cypher)
+        except Exception as exc:  # noqa: BLE001 - only the already-indexed case is benign
+            if "already indexed" not in str(exc).lower():
+                raise
 
     async def execute_query(self, cypher: str, **params: Any) -> Any:
         """Run a raw Cypher statement against the FalkorDB graph.

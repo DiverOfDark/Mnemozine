@@ -327,26 +327,61 @@ four hook entrypoints are installed as console scripts by the package:
 | `Stop` | `mnemozine-hook-stop` | flush the session's chunk into ingestion at session end (FR-ING-6) |
 | `PreCompact` | `mnemozine-hook-pre-compact` | flush the chunk before compaction (FR-ING-6) |
 
-Register them in Claude Code's `settings.json` `hooks` block (use the absolute
-path to the installed scripts, e.g. `.venv/bin/mnemozine-hook-session-start`):
+Register all four in Claude Code's `settings.json` `hooks` block. Each entry is
+a `command`-type hook; the four entrypoints read the hook JSON from **stdin** and
+take **no command-line arguments**, so the `command` is just the path to the
+installed console script (no flags). `SessionStart` / `UserPromptSubmit` /
+`Stop` / `PreCompact` are not tool-matched events, so no `matcher` is needed.
+
+Drop this into `~/.claude/settings.json` (user-global) or a project's
+`.claude/settings.json`. Use the **absolute path** to the installed scripts —
+i.e. the path that `which mnemozine-hook-session-start` prints inside the
+environment where you ran `pip install -e .` (typically `…/.venv/bin/…`):
 
 ```json
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "/path/to/.venv/bin/mnemozine-hook-session-start" }] }
+      {
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/.venv/bin/mnemozine-hook-session-start" }
+        ]
+      }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "/path/to/.venv/bin/mnemozine-hook-user-prompt-submit" }] }
+      {
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/.venv/bin/mnemozine-hook-user-prompt-submit" }
+        ]
+      }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "/path/to/.venv/bin/mnemozine-hook-stop" }] }
+      {
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/.venv/bin/mnemozine-hook-stop" }
+        ]
+      }
     ],
     "PreCompact": [
-      { "hooks": [{ "type": "command", "command": "/path/to/.venv/bin/mnemozine-hook-pre-compact" }] }
+      {
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/.venv/bin/mnemozine-hook-pre-compact" }
+        ]
+      }
     ]
   }
 }
+```
+
+If the scripts are on `PATH` for the shell Claude Code spawns hooks in, you may
+use the bare names (`"command": "mnemozine-hook-session-start"`), but an absolute
+path is the robust default since the hook subprocess does not inherit your
+interactive shell's activated venv. Resolve the four absolute paths at once with:
+
+```bash
+for h in session-start user-prompt-submit stop pre-compact; do
+  command -v "mnemozine-hook-$h"
+done
 ```
 
 Notes:

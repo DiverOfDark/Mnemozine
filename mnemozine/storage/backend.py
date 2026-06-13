@@ -72,6 +72,35 @@ from mnemozine.storage.graphiti_client import (
 # the real implementation can make the narrowly-scoped LLM call.
 ContradictsFn = Callable[[MemoryUnit, list[MemoryUnit]], Awaitable[list[MemoryUnit]]]
 
+# FR-RET-2 index-backed KNN tuning. ``db.idx.vector.queryNodes`` applies the
+# scope/tier/entity WHERE *after* the KNN cut, so we over-fetch K to avoid the
+# post-filter being starved by nearer out-of-scope neighbours, bounded by an
+# absolute cap so a large top_k can't ask the index for an effectively unbounded
+# scan (which would defeat the flat-search-space goal).
+_KNN_OVERFETCH = 10
+_KNN_MAX_K = 512
+
+# Substrings FalkorDB uses when the vector index/procedure is unavailable. Used to
+# distinguish "index genuinely absent -> fall back to the bounded scan" from a
+# real query error (which must surface).
+_MISSING_VECTOR_INDEX_MARKERS = (
+    "invalid arguments for procedure 'db.idx.vector.querynodes'",
+    "unknown procedure 'db.idx.vector.querynodes'",
+    "unknown function 'vecf32'",
+    "no such index",
+)
+
+
+def _is_missing_vector_index(exc: Exception) -> bool:
+    """True if ``exc`` indicates the FalkorDB vector index/procedure is absent.
+
+    Kept conservative (specific markers) so an unrelated failure is never silently
+    swallowed into the slow fallback path.
+    """
+
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _MISSING_VECTOR_INDEX_MARKERS)
+
 
 async def _no_contradictions(_new: MemoryUnit, _candidates: list[MemoryUnit]) -> list[MemoryUnit]:
     """Default contradiction predicate: nothing contradicts (add/reinforce only)."""
@@ -120,18 +149,63 @@ class GraphitiStorageBackend:
     def _rows(result: Any) -> list[list[Any]]:
         """Normalize a FalkorDB driver result into a list of row-lists.
 
-        The Graphiti FalkorDB driver returns FalkorDB ``QueryResult``-shaped
-        objects whose rows live on ``.result_set``; a couple of fakes/drivers
-        return ``(records, ...)`` tuples or a bare list. This collapses those to a
-        plain ``list[list]`` so the rest of the backend is shape-agnostic.
+        Two concrete result shapes must be collapsed to a plain ``list[list]`` so
+        the rest of the backend is shape-agnostic:
+
+        * **the real Graphiti FalkorDB driver** — ``FalkorDriver.execute_query``
+          returns ``(records, header, summary)`` where ``records`` is a list of
+          **dicts** keyed by the RETURN aliases (e.g. ``{"m": <Node>}``). We project
+          each dict back to a row-list in header order so ``row[0]`` is the first
+          returned value (a ``falkordb.Node``/``Edge`` or scalar), matching how the
+          backend indexes rows.
+        * **the in-process fake / a QueryResult-shaped object** — rows live on
+          ``.result_set`` as row-lists already.
+
+        Returning the keys of a dict (which bare ``list(dict)`` would do) was the
+        original bug: ``row[0]`` then yielded the alias string ``"m"`` rather than
+        the node, so every read path silently broke against real FalkorDB.
         """
 
         if result is None:
             return []
+        header: list[str] | None = None
         if isinstance(result, tuple):
-            result = result[0]
-        rows = getattr(result, "result_set", result)
-        return [list(r) for r in rows] if rows else []
+            # (records, header, summary) from the real FalkorDriver.
+            records = result[0]
+            if len(result) > 1 and result[1]:
+                header = [str(h) for h in result[1]]
+        else:
+            records = getattr(result, "result_set", result)
+        if not records:
+            return []
+
+        out: list[list[Any]] = []
+        for r in records:
+            if isinstance(r, dict):
+                # Dict record keyed by RETURN alias: project in header order so
+                # positional indexing (row[0], row[1]) is stable.
+                keys = header if header is not None else list(r.keys())
+                out.append([r.get(k) for k in keys])
+            else:
+                out.append(list(r))
+        return out
+
+    @staticmethod
+    def _props(value: Any) -> dict[str, Any]:
+        """Extract a property mapping from a returned graph value.
+
+        A ``falkordb.Node``/``Edge`` exposes its properties on ``.properties`` and
+        is *not* dict-iterable (``dict(node)`` raises ``TypeError``); the fake
+        driver returns plain ``dict``s. This normalizes both to a property dict so
+        the (de)serialization code is driver-agnostic.
+        """
+
+        if isinstance(value, dict):
+            return value
+        props = getattr(value, "properties", None)
+        if isinstance(props, dict):
+            return dict(props)
+        return dict(value)
 
     async def _query(self, cypher: str, **params: Any) -> list[list[Any]]:
         return self._rows(await self._client.execute_query(cypher, **params))
@@ -143,6 +217,13 @@ class GraphitiStorageBackend:
 
         FalkorDB stores scalars + arrays; the nested ``Provenance`` is JSON-encoded
         into a single property to avoid a second node where it adds no graph value.
+
+        ``embedding`` is included as a plain ``list[float]`` here, but the *insert
+        path wraps it in ``vecf32(...)``* (see :meth:`_insert`) so FalkorDB stores
+        it as a typed float32 vector — that typed-vector property is what the
+        ``CREATE VECTOR INDEX`` actually indexes, and therefore what
+        :meth:`scoped_query`'s index-backed KNN can search. Storing it as a bare
+        array would leave the vector index empty.
         """
 
         return {
@@ -187,10 +268,9 @@ class GraphitiStorageBackend:
         )
 
     async def _node_to_memory(self, node: Any) -> MemoryUnit:
-        """Convert a returned graph node (mapping-like) into a MemoryUnit."""
+        """Convert a returned graph node (Node/dict) into a MemoryUnit."""
 
-        props = dict(node) if not isinstance(node, dict) else node
-        return self._row_to_memory(props)
+        return self._row_to_memory(self._props(node))
 
     # -- the FR-MNT-1 4-way write decision ------------------------------------
 
@@ -277,8 +357,24 @@ class GraphitiStorageBackend:
         return WriteResult(decision=WriteDecision.ADD, memory=inserted)
 
     async def _insert(self, memory: MemoryUnit, embedding: list[float]) -> MemoryUnit:
+        # Two FalkorDB constraints drive the exact shape of this CREATE:
+        #
+        # 1. ``CREATE (m:Label $props)`` — injecting the property *map literal*
+        #    from a parameter — fails with "Encountered unhandled type in inlined
+        #    properties" on FalkorDB. The portable form is to create the node, then
+        #    ``SET m = $props`` (a param map assignment), which also correctly maps
+        #    ``None`` values to absent/null props (so ``m.valid_to IS NULL`` holds).
+        # 2. The embedding must land as a typed float32 vector (``vecf32``) for the
+        #    vector index to index it; a plain array stays invisible to the index.
+        #    So it is split out of $props and set through ``vecf32()``.
         props = await self._memory_props(memory, embedding=embedding)
-        await self._query(f"CREATE (m:{MEMORY_LABEL} $props) RETURN m", props=props)
+        props.pop("embedding", None)
+        await self._query(
+            f"CREATE (m:{MEMORY_LABEL}) SET m = $props "
+            "SET m.embedding = vecf32($embedding) RETURN m",
+            props=props,
+            embedding=embedding,
+        )
         return memory
 
     async def _reinforce(self, existing: MemoryUnit, new_confidence: float) -> MemoryUnit:
@@ -297,6 +393,29 @@ class GraphitiStorageBackend:
 
     # -- scoped semantic retrieval (FR-RET-2 / FR-STO-3) ----------------------
 
+    def _scoped_filters(
+        self,
+        scope_strs: list[str],
+        entities: Sequence[str] | None,
+        include_archived: bool,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Build the shared scope/validity/tier/entity WHERE clauses + params.
+
+        Used by both the index-backed KNN path and the full-scan fallback so the
+        two stay behaviourally identical on everything except *how* candidates are
+        ranked. The clauses reference ``m`` (the matched/yielded memory node).
+        """
+
+        where = ["m.scope IN $scopes", "m.valid_to IS NULL"]
+        params: dict[str, Any] = {"scopes": scope_strs}
+        if not include_archived:
+            where.append("m.tier = $hot")
+            params["hot"] = Tier.HOT.value
+        if entities:
+            where.append("any(e IN m.entities WHERE e IN $entities)")
+            params["entities"] = list(entities)
+        return where, params
+
     async def scoped_query(
         self,
         query: str,
@@ -308,34 +427,83 @@ class GraphitiStorageBackend:
     ) -> list[RetrievedMemory]:
         """Semantic search restricted to the composed scope subset (FR-RET-2).
 
-        Never a graph-wide scan: candidates are pre-filtered in Cypher to the
-        given ``scopes`` (current project + global), an open validity window, the
-        hot tier (unless ``include_archived``), and — when given — the active
-        ``entities`` neighborhood, *then* ranked by cosine similarity to the query
-        embedding. Pre-filtering before ranking is what keeps the effective search
-        space roughly constant as the store grows (FR-RET-2).
+        Never a graph-wide in-process scan. The candidate ranking comes from
+        **FalkorDB's vector index** (FR-STO-2): a ``db.idx.vector.queryNodes`` KNN
+        over the ``MnemozineMemory.embedding`` index returns the nearest neighbours
+        by cosine *distance*, and the scope / open-validity-window / hot-tier /
+        entity-overlap pre-filters are applied as a ``WHERE`` on the yielded nodes.
+        Pushing the nearest-neighbour search into the index — rather than pulling
+        every scope+entity row into Python and ranking with in-process cosine — is
+        what keeps the effective search space roughly constant as the store grows
+        (FR-RET-2 / Goal-5). Active (open window, hot tier) memories only, unless
+        ``include_archived``.
+
+        Because ``queryNodes`` filters *after* the KNN cut, we over-fetch ``K``
+        (``top_k * _KNN_OVERFETCH``, bounded by ``_KNN_MAX_K``) so the post-filter
+        still yields the true ``top_k`` nearest *within* the composed scope rather
+        than being starved by nearer out-of-scope neighbours.
+
+        Falls back to a scope-pre-filtered scan + in-process cosine **only** when
+        the vector index is genuinely absent (e.g. a freshly-created graph before
+        ``ensure_vector_index``), so the path degrades gracefully instead of
+        raising.
         """
 
         scope_strs = [s.as_str() for s in scopes]
         if not scope_strs:
             return []
         query_vec = await self._embeddings.embed(query)
+        where, params = self._scoped_filters(scope_strs, entities, include_archived)
 
-        where = ["m.scope IN $scopes", "m.valid_to IS NULL"]
-        params: dict[str, Any] = {"scopes": scope_strs}
-        if not include_archived:
-            where.append("m.tier = $hot")
-            params["hot"] = Tier.HOT.value
-        if entities:
-            where.append("any(e IN m.entities WHERE e IN $entities)")
-            params["entities"] = list(entities)
-        cypher = f"MATCH (m:{MEMORY_LABEL}) WHERE {' AND '.join(where)} RETURN m"
-        rows = await self._query(cypher, **params)
+        # Over-fetch K so the post-KNN scope/tier/entity filter is not starved by
+        # nearer out-of-scope neighbours; bound it so a huge top_k can't ask the
+        # index for an unbounded scan.
+        knn_k = min(max(top_k * _KNN_OVERFETCH, top_k), _KNN_MAX_K)
+        knn_cypher = (
+            f"CALL db.idx.vector.queryNodes("
+            f"'{MEMORY_LABEL}', 'embedding', $k, vecf32($qv)) "
+            "YIELD node AS m, score "
+            f"WHERE {' AND '.join(where)} "
+            "RETURN m, score ORDER BY score ASC LIMIT $top_k"
+        )
+        try:
+            rows = await self._query(
+                knn_cypher, k=knn_k, qv=query_vec, top_k=top_k, **params
+            )
+        except Exception as exc:  # noqa: BLE001 - narrowed by _is_missing_index
+            if not _is_missing_vector_index(exc):
+                raise
+            return await self._scoped_query_fallback(
+                query_vec, where, params, top_k=top_k
+            )
 
         scored: list[RetrievedMemory] = []
         for row in rows:
-            node = row[0]
-            props = dict(node) if not isinstance(node, dict) else node
+            mem = self._row_to_memory(self._props(row[0]))
+            # The index returns cosine *distance* (0 = identical); convert back to
+            # the cosine *similarity* RetrievedMemory.score carries everywhere else.
+            distance = float(row[1])
+            scored.append(RetrievedMemory(memory=mem, score=1.0 - distance))
+        return scored
+
+    async def _scoped_query_fallback(
+        self,
+        query_vec: list[float],
+        where: list[str],
+        params: dict[str, Any],
+        *,
+        top_k: int,
+    ) -> list[RetrievedMemory]:
+        """Scope-pre-filtered scan + in-process cosine, used only if the vector
+        index is absent. Still never a graph-wide scan: the same scope / validity
+        / tier / entity WHERE bounds the candidate set before ranking.
+        """
+
+        cypher = f"MATCH (m:{MEMORY_LABEL}) WHERE {' AND '.join(where)} RETURN m"
+        rows = await self._query(cypher, **params)
+        scored: list[RetrievedMemory] = []
+        for row in rows:
+            props = self._props(row[0])
             mem = self._row_to_memory(props)
             vec = props.get("embedding") or []
             score = cosine_similarity(query_vec, vec)
@@ -387,8 +555,10 @@ class GraphitiStorageBackend:
         if memory is None:
             raise KeyError(memory_id)
         embedding = await self._embeddings.embed(memory.content)
+        # Re-store as a typed float32 vector (vecf32) so the re-embedded value
+        # stays indexed by the FalkorDB vector index (see _insert).
         await self._query(
-            f"MATCH (m:{MEMORY_LABEL} {{id: $id}}) SET m.embedding = $embedding RETURN m",
+            f"MATCH (m:{MEMORY_LABEL} {{id: $id}}) SET m.embedding = vecf32($embedding) RETURN m",
             id=memory_id,
             embedding=embedding,
         )
@@ -479,7 +649,7 @@ class GraphitiStorageBackend:
 
     @staticmethod
     def _row_to_entity(node: Any) -> Entity:
-        props = dict(node) if not isinstance(node, dict) else node
+        props = GraphitiStorageBackend._props(node)
         return Entity(
             id=props["id"],
             canonical_name=props["canonical_name"],
@@ -604,7 +774,7 @@ class GraphitiStorageBackend:
 
     @staticmethod
     def _row_to_edge(rel: Any) -> Edge:
-        props = dict(rel) if not isinstance(rel, dict) else rel
+        props = GraphitiStorageBackend._props(rel)
         return Edge(
             id=props["id"],
             from_entity=props["from_entity"],

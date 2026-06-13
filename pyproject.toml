@@ -60,6 +60,12 @@ packages = ["mnemozine"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    # Opt-in live integration tests that need a real FalkorDB on the configured
+    # URL (default redis://localhost:6379). Auto-skipped when the server is
+    # unreachable, so the default offline suite stays green with no infra.
+    "live_falkordb: requires a reachable FalkorDB (skipped when absent)",
+]
 
 [tool.ruff]
 line-length = 100

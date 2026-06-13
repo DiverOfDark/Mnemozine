@@ -80,14 +80,30 @@ def test_falkordb_has_named_persistence_volume() -> None:
 
 
 def test_every_long_running_service_has_a_healthcheck() -> None:
-    """Healthchecks on every long-running service (one-shot ollama-init excluded)."""
+    """Healthchecks on every long-running service.
+
+    One-shot / on-demand jobs are excluded: ``ollama-init`` (model pull) and
+    ``mnemozine-eval`` (runs the §9 scaling assertion once and exits).
+    """
     compose = _load_compose()
-    one_shot = {"ollama-init"}
+    one_shot = {"ollama-init", "mnemozine-eval"}
     for name, svc in compose["services"].items():
         if name in one_shot:
             continue
         assert "healthcheck" in svc, f"service {name} has no healthcheck"
         assert "test" in svc["healthcheck"], f"service {name} healthcheck has no test"
+
+
+def test_eval_service_present_and_runs_eval_cli() -> None:
+    """The §9 eval harness is wired as a one-shot service (Goal-5 scaling proof)."""
+    compose = _load_compose()
+    assert "mnemozine-eval" in compose["services"], "compose missing mnemozine-eval"
+    svc = compose["services"]["mnemozine-eval"]
+    cmd = svc["command"]
+    assert "mnemozine-eval" in cmd, f"mnemozine-eval should run its console script, got {cmd}"
+    # Built from the shared image and not auto-started by a plain `up`.
+    assert "build" in svc or "image" in svc, "mnemozine-eval has no build/image"
+    assert "eval" in svc.get("profiles", []), "mnemozine-eval should be in the 'eval' profile"
 
 
 def test_mnemozine_services_use_shared_image_build() -> None:
