@@ -3,7 +3,7 @@
 **Status:** Ready for implementation
 **Owner:** (you)
 **Implementer:** Claude Code
-**Last updated:** 2026-06-13 (rev 2 — stack decisions resolved)
+**Last updated:** 2026-06-13 (rev 3 — Python + LiteLLM + Helm locked; full build authorized)
 
 ---
 
@@ -76,7 +76,7 @@ Five layers, top to bottom:
 
 **Graph backend: FalkorDB.** Graphiti requires a Cypher-speaking graph store; FalkorDB (Redis-based) is chosen over Neo4j for a lighter homelab footprint and a permissive license. FalkorDB holds **both the graph and the vector embeddings** — there is no separate Postgres in the hot path. (Earlier drafts mentioned Postgres; it is dropped to avoid a second source of truth. If a relational sidecar is ever needed for operational metadata, add it explicitly then.)
 
-Suggested implementation language: **Python** (Graphiti is Python-native). MCP server may be Python or TypeScript.
+Implementation language: **Python** (decided — Graphiti is Python-native and the system is I/O-bound LLM orchestration where Rust buys little; hot-path Rust rewrites remain possible later). All services — engine, ingestion, extraction, retrieval, MCP server, maintenance — are Python.
 
 ### 5.5 Concrete Stack & Decisions
 
@@ -90,7 +90,9 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 | Scope model | **Single-user.** Scopes = `global` + `project:<id>`. No `user_id`. |
 | Idempotency key | `(source, session_id, content-hash)` — **hash-on-content**, resume-safe. |
 | SessionStart injection budget | **~500 token hard cap** — compact index + short snippets for top preferences; full detail via `recall()`. |
-| Language | Python (engine + ingestion + maintenance); MCP server Python or TypeScript. |
+| Language | **Python**, all services (decided — Graphiti is Python-native). |
+| OpenAI-format gateway | **LiteLLM** proxy + a custom logging callback that emits common-schema events. Fronts the operator's repointable agents and, optionally, Hermes. |
+| Deployment | **Helm chart** (homelab k8s deploy) **+ docker-compose** (local dev / eval harness without a cluster), sharing image definitions. |
 | Secrets in ingest | `tool_calls` are **stripped on ingest**. Credentials that survive in plain content are acceptable — deployment is a secured, fully-local homelab environment (see FR-ING-7). |
 
 ---
@@ -119,7 +121,7 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 - **Critical:** these local transcripts are deleted after 30 days by default (`cleanupPeriodDays`). The ingester must run on a schedule frequent enough that nothing is lost (recommend: tail in near-real-time via a watcher; do not rely on batch-only runs). Optionally bump `cleanupPeriodDays` as a safety net.
 - Prefer a `Stop` / `PreCompact` hook to flush a session to the ingester at end-of-session and before compaction, in addition to the directory watcher.
 
-**FR-ING-3 — OpenAI-format ingestion.** Scope: **agents the operator controls and can repoint** at a memory gateway via an OpenAI-format `base_url`. A thin logging gateway/proxy sits in front of the model endpoint, captures turns, and emits events in the common schema. Explicit non-capability: third-party apps that cannot be reconfigured to use the gateway base_url (e.g. ChatGPT desktop, Cursor) are **not** captured by this path. If such a surface ever needs capturing, it requires a separate adapter (out of current scope).
+**FR-ING-3 — OpenAI-format ingestion.** Scope: **agents the operator controls and can repoint** at a memory gateway via an OpenAI-format `base_url`. Implemented as **LiteLLM** (mature OpenAI-format proxy) with a **custom logging callback** that captures each turn and emits events in the common schema — minimal bespoke code, native support for local Qwen and cloud backends behind one base_url. Explicit non-capability: third-party apps that cannot be reconfigured to use the gateway base_url (e.g. ChatGPT desktop, Cursor) are **not** captured by this path. If such a surface ever needs capturing, it requires a separate adapter (out of current scope).
 
 **FR-ING-4 — Hermes ingestion.** Hermes = the Nous Research Hermes agent (`https://hermes-agent.nousresearch.com/`), self-hosted on a homelab VM. Because it is self-owned, instrument the VM deployment to emit events directly into the common schema (preferred), or front its OpenAI-compatible endpoint with the same FR-ING-3 logging gateway if direct instrumentation is impractical.
 
@@ -268,8 +270,8 @@ All five goals are in scope from day one — the architecture holds all of them.
 
 ## 11. Deliverables
 
-1. Self-hostable deployment (docker-compose) for FalkorDB + Graphiti + MCP server, with Ollama (bge-m3) and a Qwen/OpenAI-format LLM endpoint as configured services.
-2. Ingestion services for Claude Code (watcher + hooks), OpenAI-format logging gateway, Hermes adapter; plus the synthetic distractor generator for eval scaling.
+1. Self-hostable deployment as **both a Helm chart and docker-compose** for FalkorDB + Graphiti + MCP server, with Ollama (bge-m3), a Qwen/OpenAI-format LLM endpoint, and the LiteLLM gateway as configured services.
+2. Ingestion services for Claude Code (watcher + hooks), the **LiteLLM** OpenAI-format logging gateway + callback, Hermes adapter; plus the synthetic distractor generator for eval scaling.
 3. Typed extraction pipeline with the classifier.
 4. MCP server exposing `recall()` and supporting hook-driven injection.
 5. Claude Code hook scripts: `SessionStart`, `UserPromptSubmit`, `Stop`/`PreCompact`.
