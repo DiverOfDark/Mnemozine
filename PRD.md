@@ -1,9 +1,9 @@
 # PRD: Unified Conversational Memory Layer
 
-**Status:** Draft for implementation
+**Status:** Ready for implementation
 **Owner:** (you)
 **Implementer:** Claude Code
-**Last updated:** 2026-06-13
+**Last updated:** 2026-06-13 (rev 2 — stack decisions resolved)
 
 ---
 
@@ -29,8 +29,8 @@ The defining constraint of this system is that it **consolidates rather than acc
 
 - Not a general-purpose data warehouse or analytics engine.
 - Not a replacement for version control, documentation, or a project management tool.
-- Not a multi-tenant SaaS. Single-operator (optionally small team) self-hosted deployment only.
-- No cloud-only dependencies. Every component must be self-hostable.
+- Not a multi-tenant SaaS. **Single-operator only** — scopes are `global` + `project:<id>`, with no `user_id` partitioning. (Team support is explicitly out of scope; revisit only if a team materializes.)
+- No cloud-only *infrastructure* dependencies. Storage, retrieval, ingestion, and serving are fully self-hostable. **Exception:** the extraction/embedding LLM endpoints are pluggable via an OpenAI-format base_url and MAY point at a cloud model if the operator chooses on cost grounds — but the system MUST run end-to-end against local models (Qwen for extraction, bge-m3 for embeddings) with no cloud dependency.
 - Not building a new agent runtime — this is a memory layer that existing agents call.
 
 ---
@@ -63,7 +63,7 @@ Five layers, top to bottom:
 [ 2. Typed Extraction ]  -- classify: preference / project-fact / idea-seed --
             |
             v
-[ 3. Storage ]  -- Graphiti temporal knowledge graph on Postgres + graph backend --
+[ 3. Storage ]  -- Graphiti temporal knowledge graph on FalkorDB (graph + vectors) --
             |
             v
 [ 4. Retrieval & Delivery ]  -- MCP server + Claude Code hooks --
@@ -74,7 +74,24 @@ Five layers, top to bottom:
 
 **Stack decision:** Graphiti (Zep's open-source temporal knowledge graph engine) is the storage core. It is the only option that is simultaneously self-hostable, graph-native (powers cross-referencing), and temporal (handles changing preferences via validity windows). Graphiti provides the engine; this project builds the ingestion, extraction, MCP serving, and maintenance layers around it.
 
+**Graph backend: FalkorDB.** Graphiti requires a Cypher-speaking graph store; FalkorDB (Redis-based) is chosen over Neo4j for a lighter homelab footprint and a permissive license. FalkorDB holds **both the graph and the vector embeddings** — there is no separate Postgres in the hot path. (Earlier drafts mentioned Postgres; it is dropped to avoid a second source of truth. If a relational sidecar is ever needed for operational metadata, add it explicitly then.)
+
 Suggested implementation language: **Python** (Graphiti is Python-native). MCP server may be Python or TypeScript.
+
+### 5.5 Concrete Stack & Decisions
+
+| Concern | Decision |
+|---------|----------|
+| Graph + vector backend | **FalkorDB** (single store; no Postgres) |
+| Temporal KG engine | **Graphiti** — pin a specific released version in `pyproject.toml`; upgrade deliberately, never floating |
+| Extraction LLM | Pluggable **OpenAI-format base_url**. Dev/default target: **local Qwen** (e.g. Qwen2.5) self-hosted. Cloud is a drop-in swap via the same env var, chosen later on projected cost. |
+| Embedding model | **bge-m3 via Ollama**, self-hosted. Embeddings are the highest-volume LLM cost (every memory + every query) and stay local for stability and cost control. |
+| Ingestion unit | **Chunk/session level**, not per-message (matches Graphiti episodes; avoids per-message LLM storms — see FR-ING-6). |
+| Scope model | **Single-user.** Scopes = `global` + `project:<id>`. No `user_id`. |
+| Idempotency key | `(source, session_id, content-hash)` — **hash-on-content**, resume-safe. |
+| SessionStart injection budget | **~500 token hard cap** — compact index + short snippets for top preferences; full detail via `recall()`. |
+| Language | Python (engine + ingestion + maintenance); MCP server Python or TypeScript. |
+| Secrets in ingest | `tool_calls` are **stripped on ingest**. Credentials that survive in plain content are acceptable — deployment is a secured, fully-local homelab environment (see FR-ING-7). |
 
 ---
 
@@ -102,11 +119,15 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 - **Critical:** these local transcripts are deleted after 30 days by default (`cleanupPeriodDays`). The ingester must run on a schedule frequent enough that nothing is lost (recommend: tail in near-real-time via a watcher; do not rely on batch-only runs). Optionally bump `cleanupPeriodDays` as a safety net.
 - Prefer a `Stop` / `PreCompact` hook to flush a session to the ingester at end-of-session and before compaction, in addition to the directory watcher.
 
-**FR-ING-3 — OpenAI ingestion.** Capture turns via a thin logging proxy/wrapper around API calls (preferred — gives structured, real-time capture) rather than relying on app export. The proxy emits events in the common schema.
+**FR-ING-3 — OpenAI-format ingestion.** Scope: **agents the operator controls and can repoint** at a memory gateway via an OpenAI-format `base_url`. A thin logging gateway/proxy sits in front of the model endpoint, captures turns, and emits events in the common schema. Explicit non-capability: third-party apps that cannot be reconfigured to use the gateway base_url (e.g. ChatGPT desktop, Cursor) are **not** captured by this path. If such a surface ever needs capturing, it requires a separate adapter (out of current scope).
 
-**FR-ING-4 — Hermes ingestion.** Treat as a generic source. If Hermes is self-owned, instrument it to emit events directly into the common schema; otherwise wrap it with the same logging-proxy approach as OpenAI.
+**FR-ING-4 — Hermes ingestion.** Hermes = the Nous Research Hermes agent (`https://hermes-agent.nousresearch.com/`), self-hosted on a homelab VM. Because it is self-owned, instrument the VM deployment to emit events directly into the common schema (preferred), or front its OpenAI-compatible endpoint with the same FR-ING-3 logging gateway if direct instrumentation is impractical.
 
-**FR-ING-5 — Idempotent ingest.** Re-ingesting the same transcript (e.g. after a crash) must not create duplicates. Key on `(source, session_id, message offset/hash)`.
+**FR-ING-5 — Idempotent ingest.** Re-ingesting the same transcript (e.g. after a crash, or after a Claude Code session resume/rewind that rewrites line offsets) must not create duplicates. Key on **`(source, session_id, content-hash)`** — hash the normalized message content, **not** the byte/line offset, so resumed/edited sessions de-duplicate correctly.
+
+**FR-ING-6 — Chunk-level ingestion unit.** The unit of extraction is a **chunk/session**, not an individual message. Accumulate messages into a chunk (per session, bounded by size or session-end) and submit the chunk as one Graphiti episode. This matches Graphiti's episode model and avoids a per-message LLM storm (see R3). The Claude Code `Stop`/`PreCompact` hooks flush the current chunk at session end and before compaction.
+
+**FR-ING-7 — Secret hygiene on ingest.** Strip `tool_calls` (and tool results) from events before storage — they are the highest-density source of raw credentials, file dumps, and command output, and add little durable memory value. Credentials that remain inside ordinary message content are accepted as-is: the entire deployment (FalkorDB, archive tier, LLM endpoints, MCP server) runs in a secured, fully-local homelab environment with no external egress of memory content. No additional content-level secret scrubbing is required for v1.
 
 ### 6.2 Typed Extraction Layer (the crux — highest-care component)
 
@@ -124,7 +145,7 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 ### 6.3 Storage Layer
 
 **FR-STO-1 — Temporal knowledge graph.** Use Graphiti. Facts are stored with validity windows so superseded facts are marked invalid (closed window) rather than deleted.
-**FR-STO-2 — Backends.** Postgres for relational/metadata; the graph backend per Graphiti requirements. Vector embeddings for semantic search over memory units and idea-seeds.
+**FR-STO-2 — Backend.** **FalkorDB** is the single store — it holds the temporal graph and the vector embeddings (bge-m3) for semantic search over memory units and idea-seeds. No separate relational store in v1.
 **FR-STO-3 — Scopes.** Memories are tagged with scope (`global`, `project:<id>`) and entities. Retrieval composes scopes.
 **FR-STO-4 — Archive tier.** Superseded/decayed memories and raw transcripts move to a cold archive tier — retained (for history and cross-reference) but excluded from the default hot retrieval path.
 
@@ -136,6 +157,12 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 
 **FR-RET-3 — Proactive index injection (SessionStart hook).** On Claude Code `SessionStart`, detect context (cwd, `Cargo.toml`/`package.json`, git remote, recent turns), derive active entities, and inject a **compact index** — not a memory dump. Example shape: "Relevant: 3 preferences (rust/error-handling), 1 possibly-related idea (project C — shares async-runtime, cli-parsing)."
 
+**Injection format contract (applies to FR-RET-3 and FR-RET-5).** Injected memory consumes tokens in the live working context and competes with the actual task, so it is hard-budgeted:
+- **Hard cap: ~500 tokens** for the SessionStart injection. The hook MUST truncate to budget (drop lowest-ranked items) rather than overflow.
+- Structure: a compact index (counts + entity tags + 1-line idea-seed hints) **plus** short content snippets for the top-ranked preferences only. Anything beyond that is pulled on demand via `recall()`.
+- The injection is advisory context for the agent, not a directive; it must be clearly delimited so the model treats it as background.
+- Mid-session injections (FR-RET-5) draw from the same 500-token budget envelope and should be finer-grained and even smaller per-injection.
+
 **FR-RET-4 — On-demand recall tool.** Expose a `recall(query, scope?)` MCP tool so an agent can pull full detail when the index hints at something worth chasing. Keeps injected context small.
 
 **FR-RET-5 — Mid-session injection (UserPromptSubmit hook).** As the conversation moves into new topics, inject finer-grained memories relevant to the specific prompt.
@@ -144,7 +171,13 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 
 ### 6.5 Maintenance Layer (scheduled job — as important as ingestion)
 
-**FR-MNT-1 — Dedup-and-reinforce on write.** On each write, check for a semantically equivalent existing memory; if found, reinforce it (bump confidence, refresh timestamp) instead of inserting a duplicate. (add / update / no-op decision.)
+**FR-MNT-1 — Dedup, reinforce, and supersede on write (4-way decision).** On each write, compare against existing memories in the **same scope with overlapping entities** and decide one of:
+- **add** — no related memory exists → insert.
+- **reinforce** — a semantically equivalent memory exists → bump confidence, refresh timestamp, no new node.
+- **supersede** — a related memory that *contradicts* the new one exists (e.g. "prefers `anyhow`" → "prefers `thiserror`") → **close the old memory's validity window** (`valid_to = now`, moves it off the hot path) and insert the new one as active. This is the mechanism that delivers UC-2 / Goal 2; the temporal model alone does not detect reversals.
+- **no-op** — new memory is strictly weaker/older than what exists.
+
+Contradiction detection is a **single cheap LLM call scoped narrowly** to candidate memories of `type=preference` in the same scope sharing ≥1 entity — never a graph-wide scan. Graphiti's native edge-invalidation handles contradiction at the entity-edge level underneath this; FR-MNT-1 adds the MemoryUnit-level preference-reversal decision on top.
 
 **FR-MNT-2 — Tiered consolidation.** Maintain resolution tiers: raw transcript → extracted fact → consolidated theme. Retrieval operates on distilled tiers. A periodic pass merges related facts into higher-level units.
 
@@ -153,6 +186,23 @@ Suggested implementation language: **Python** (Graphiti is Python-native). MCP s
 **FR-MNT-4 — Entity resolution.** Periodically merge duplicate entities (`rust` / `rust-lang` / "the Rust work") so the graph does not fragment. Prune low-weight edges and cap node degree to keep traversal bounded.
 
 **FR-MNT-5 — Scheduled execution.** Maintenance runs on a cron-like schedule (consolidate, resolve, decay, audit). Must be idempotent and safe to run repeatedly.
+
+### 6.6 Tuning Parameters (set & calibrate during Phase 1)
+
+These are deliberately unset in the spec — they must be empirically calibrated against the eval set, not guessed. Track them as config, not constants.
+
+| Parameter | Governs | Initial guess |
+|-----------|---------|---------------|
+| `retrieval.p95_latency_target` | §9 latency SLA | set baseline in Phase 1 |
+| `crossref.relevance_threshold` | FR-RET-6 surface/suppress cutoff | start high (precision over recall) |
+| `crossref.max_suggestions` | FR-RET-6 cap per context | 1–2 |
+| `inject.token_budget` | FR-RET-3/5 injection cap | 500 |
+| `maintenance.edge_weight_floor` | FR-MNT-4 low-weight edge pruning | calibrate |
+| `maintenance.max_node_degree` | FR-MNT-4 traversal-bound cap | calibrate |
+| `decay.half_life` | FR-MNT-3 recency ranking | calibrate |
+| `decay.archive_after` | FR-MNT-3 hot→archive demotion | e.g. unused N days |
+| `dedup.equivalence_threshold` | FR-MNT-1 reinforce-vs-add | calibrate |
+| `chunk.max_size` | FR-ING-6 episode size | calibrate vs Qwen context |
 
 ---
 
@@ -185,7 +235,11 @@ All five goals are in scope from day one — the architecture holds all of them.
 
 **Build a fixed eval set early (during Phase 1) and run it on every change and on a schedule thereafter.**
 
-- **Precision (primary).** For a held-out set of "should surface / should not surface" cases, measure precision of injected context. Target: precision does NOT decline as the store grows 10x.
+**Eval-set construction (bootstrap — USER-TASK DEPENDENCY).** The eval set encodes *your* preferences across *your* projects, so only the operator can label it. Approach: during the Phase-1 historical backlog import, the pipeline auto-proposes extracted candidates; the operator labels them yes/no in a quick CLI/markdown review pass. Target ~40 high-quality cases, ≈2–3 hrs of operator time. **This is an operator deliverable, not a Claude Code deliverable**, and it gates §9 — schedule it explicitly in Phase 1.
+
+**Testing "precision stays flat at 10×" before a large store exists (synthetic scaling).** Build a **synthetic distractor generator** (Phase-1 deliverable): it inflates the store with LLM-produced plausible-but-irrelevant memories (fake projects, fake cross-domain preferences) at 1×, 10×, 100× volume around the fixed gold set. The precision eval runs at each inflation level and asserts no decline. This makes the headline metric testable in week 1 and doubles as FalkorDB traversal load-testing.
+
+- **Precision (primary).** For a held-out set of "should surface / should not surface" cases, measure precision of injected context. Target: precision does NOT decline as the store grows 10x (verified via the synthetic generator above).
 - **Preference correctness.** For changed-preference cases, the current value is returned and the stale value is not surfaced as active.
 - **Cross-reference quality.** Of proactively surfaced connections, fraction judged relevant (precision over recall — a wrong "this reminds me of…" is worse than a miss).
 - **Classifier accuracy.** Independent accuracy of `preference` vs `project_fact` classification (this gates everything else).
@@ -201,19 +255,24 @@ All five goals are in scope from day one — the architecture holds all of them.
 - **R3 — Per-write LLM cost/latency.** Fact extraction calls an LLM per write; batch the historical backlog import, then go incremental. Use a low-latency model for extraction.
 - **R4 — Claude Code 30-day transcript cleanup.** Loss risk if the ingester lags. Mitigation: near-real-time watcher + end-of-session hook flush.
 - **R5 — Memory drift / poisoning.** Accumulated subtly-wrong memories can bias agent behavior before any single entry looks wrong. Mitigation: periodic audit in the maintenance job; provenance on every memory.
-- **OQ1 — Hermes:** is it self-owned (instrument directly) or third-party (proxy-wrap)?
-- **OQ2 — Single user or small team?** Affects whether scopes need per-user partitioning.
-- **OQ3 — Embedding model choice and re-embedding strategy** when the model is upgraded.
+**Resolved (rev 2):**
+- ~~OQ1 — Hermes self-owned vs third-party~~ → **Self-owned**, Nous Hermes on a homelab VM; instrument directly (FR-ING-4).
+- ~~OQ2 — single user or small team~~ → **Single-user**, no `user_id` partitioning (§3, §5.5).
+- ~~OQ3 — embedding model~~ → **bge-m3 via Ollama** (§5.5). Re-embedding strategy: on a model change, run a full background re-embed pass over the hot tier as a maintenance job; archive tier re-embedded lazily on promotion.
+
+**Still open:**
+- **OQ4 — Graphiti version pin.** Confirm the exact released version to pin and that it supports FalkorDB as a backend at that version before Phase 0 `docker-compose up`.
+- **OQ5 — Cloud-vs-local extraction LLM (final).** Deferred by design: build against local Qwen; make the cloud-vs-local call once projected per-write cost/latency is measured on real backlog volume.
 
 ---
 
 ## 11. Deliverables
 
-1. Self-hostable deployment (docker-compose) for Graphiti + Postgres + graph backend + MCP server.
-2. Ingestion services for Claude Code (watcher + hooks), OpenAI proxy, Hermes adapter.
+1. Self-hostable deployment (docker-compose) for FalkorDB + Graphiti + MCP server, with Ollama (bge-m3) and a Qwen/OpenAI-format LLM endpoint as configured services.
+2. Ingestion services for Claude Code (watcher + hooks), OpenAI-format logging gateway, Hermes adapter; plus the synthetic distractor generator for eval scaling.
 3. Typed extraction pipeline with the classifier.
 4. MCP server exposing `recall()` and supporting hook-driven injection.
 5. Claude Code hook scripts: `SessionStart`, `UserPromptSubmit`, `Stop`/`PreCompact`.
 6. Scheduled maintenance job (consolidation, entity resolution, decay, audit).
 7. Eval harness + initial eval set.
-8. README covering setup, configuration (env vars incl. `CLAUDE_CONFIG_DIR`, `cleanupPeriodDays`), and operations.
+8. README covering setup, configuration (env vars incl. `CLAUDE_CONFIG_DIR`, `cleanupPeriodDays`, extraction LLM `base_url`/model, embedding endpoint, FalkorDB connection, tuning-parameter overrides per §6.6), and operations.
