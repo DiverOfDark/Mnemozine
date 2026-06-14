@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -225,7 +227,45 @@ async def _run_then_close(
     try:
         await coro
     finally:
-        await container.close()
+        # Bound the close: at scale the FalkorDB/redis async teardown can block, and
+        # a one-shot must not hang on cleanup after its work is already persisted.
+        try:
+            await asyncio.wait_for(container.close(), timeout=20.0)
+        except TimeoutError:
+            logger.warning("container.close() did not finish in 20s; continuing shutdown")
+        except Exception:  # noqa: BLE001 - a close failure must not mask the work result
+            logger.exception("container.close() failed during shutdown")
+
+
+def _run_oneshot(coro: Coroutine[Any, Any, None]) -> None:
+    """Run a one-shot coroutine to completion, then terminate the process promptly.
+
+    ``asyncio.run``'s post-coroutine cleanup (cancel-all-tasks + shutdown_asyncgens)
+    can hang indefinitely on stubborn graphiti/redis background tasks at scale,
+    leaving a *finished* ``mnemozine-ingest --backfill`` sleeping forever after its
+    work is already persisted (observed: the backlog completes but the container
+    never exits). Since these are one-shot commands, once the work + bounded
+    connection-close have returned we terminate immediately via ``os._exit``,
+    bypassing that cleanup. Long-running services (mcp / web / all-in-one / the
+    streaming watcher) keep using ``asyncio.run``.
+    """
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    rc = 0
+    try:
+        loop.run_until_complete(coro)
+    except KeyboardInterrupt:
+        rc = 130
+    except BaseException:  # noqa: BLE001 - report then force-exit with a failure code
+        import traceback
+
+        traceback.print_exc()
+        rc = 1
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc)
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +355,17 @@ def _ingest_main(
     """Watch sources and ingest conversations (FR-ING-*)."""
 
     container = Container.from_env()
+    if backfill:
+        # One-shot backlog replay: run the loop + bounded close, then terminate
+        # promptly (asyncio.run's task/asyncgen cleanup can hang on background
+        # tasks at scale, so a finished backfill would otherwise never exit).
+        _run_oneshot(_run_then_close(container, _run_ingest(container, backfill=True)))
+        return
     try:
-        # Run the ingest loop AND close the container under one event loop so the
-        # FalkorDB connection is finalized on the loop that opened it (a second
-        # asyncio.run for close raises "Event loop is closed" against a live store).
-        asyncio.run(_run_then_close(container, _run_ingest(container, backfill=backfill)))
+        # Streaming watcher: run the loop AND close the container under one event
+        # loop so the FalkorDB connection is finalized on the loop that opened it
+        # (a second asyncio.run for close raises "Event loop is closed" live).
+        asyncio.run(_run_then_close(container, _run_ingest(container, backfill=False)))
     except KeyboardInterrupt:  # graceful Ctrl-C on the tailing watcher
         typer.echo("mnemozine-ingest: stopped.")
 
