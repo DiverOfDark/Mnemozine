@@ -159,6 +159,47 @@ cloud extraction endpoint instead, point the extraction URL at it (above) and th
 config dir read-only. Override the host path with `HOST_CLAUDE_CONFIG_DIR`
 (defaults to `$HOME/.claude`).
 
+**Open the WebUI (operator console).** The dark observability console is a
+**separate** local-only FastAPI surface — it is **not** part of
+`docker-compose.yml`. Run it from your venv (Path A) once the store is up:
+
+```bash
+mnemozine-web        # binds http://127.0.0.1:8765 by default; ⌘-click to open
+```
+
+It binds `MNEMOZINE_WEB__HOST` / `MNEMOZINE_WEB__PORT` (`127.0.0.1:8765`) and
+serves the bundled SPA from `mnemozine/web/static` if present. The `/api` is
+**open on the bound host** unless you set a static bearer token
+`MNEMOZINE_WEB__TOKEN`.
+
+> **Port clash:** the WebUI and the MCP server **share default port 8765**. Do
+> not run `mnemozine-web` and `mnemozine-mcp` on the same host without moving one
+> — set `MNEMOZINE_WEB__PORT` or `MNEMOZINE_MCP_PORT`.
+
+### Path B′ — frontend dev loop (Vite)
+
+When you are iterating on the WebUI itself, run the FastAPI backend
+(`mnemozine-web`) on `:8765` and the Vite dev server with hot-reload from `web/`:
+
+```bash
+cd web
+npm install
+npm run dev          # serves the SPA on :5173, proxies /api → http://127.0.0.1:8765
+```
+
+Point the dev server at a remote backend by overriding the proxy target:
+
+```bash
+MNEMOZINE_API_TARGET=http://my-backend:8765 npm run dev
+```
+
+Build the production bundle (emitted into `mnemozine/web/static`, where
+`mnemozine-web` serves it from) with:
+
+```bash
+npm run build
+```
+
 ### Path C — Helm (homelab k8s)
 
 ```bash
@@ -397,6 +438,54 @@ Notes:
   hooks use. The `Stop`/`PreCompact` flush is idempotent — flushing a session the
   watcher already tailed is a no-op (de-dup on the FR-ING-5 content hash).
 
+### Registering the MCP server (the `recall` tool)
+
+The hooks give Claude Code memory **proactively** (session start + prompt
+submit). To let the model also pull memory **on demand** mid-session, register
+the same `mnemozine-mcp` server with Claude Code. It exposes `recall(query,
+scope=None, top_k=10)` plus the two index tools.
+
+For a local Claude Code, run the MCP server over **stdio** (it speaks stdio by
+default). Add it with the CLI:
+
+```bash
+claude mcp add --transport stdio mnemozine -- mnemozine-mcp
+```
+
+…or declare it by hand in `~/.claude.json` (user scope) / `.mcp.json` (project
+scope). Use the **absolute path** to the installed script and point it at the
+**same FalkorDB the hooks write to**:
+
+```json
+{
+  "mcpServers": {
+    "mnemozine": {
+      "command": "/abs/path/to/.venv/bin/mnemozine-mcp",
+      "args": [],
+      "env": {
+        "MNEMOZINE_FALKORDB__URL": "redis://localhost:6379"
+      }
+    }
+  }
+}
+```
+
+If you are instead running the server over the network with a networked
+transport — `mnemozine-mcp --transport streamable-http` (or `sse`), bound to
+`MNEMOZINE_MCP_HOST` / `MNEMOZINE_MCP_PORT` (e.g. the compose `mnemozine-mcp`
+service publishes `:8765`; note its bundled command runs the default `stdio`
+transport, so add the flag to expose HTTP) — register it as an HTTP server
+instead of spawning a fresh stdio process:
+
+```bash
+claude mcp add --transport http mnemozine http://localhost:8765
+```
+
+> **Same store, both ways.** The hooks and the MCP server **must read the same
+> `MNEMOZINE_FALKORDB__URL`** — if hooks write to one FalkorDB and the MCP server
+> reads from another, memory will not flow. Keep both pulling the URL from the
+> same `.env` or environment.
+
 ---
 
 ## Pointing OpenAI-format agents and Hermes at the gateway
@@ -406,9 +495,25 @@ logging callback. The reference proxy config is
 [`mnemozine/ingestion/gateway/config.yaml`](./mnemozine/ingestion/gateway/config.yaml)
 (docker-compose uses [`deploy/litellm.config.yaml`](./deploy/litellm.config.yaml)).
 
+> **Phase-2, default-off.** Both the gateway (FR-ING-3) and Hermes (FR-ING-4)
+> sources are **off by default** — a fresh install only runs the Claude Code
+> watcher. Turn them on with the `MNEMOZINE_INGEST__ENABLE_*` flags below; the
+> ingest loop (`build_ingest_sources()` in `mnemozine/ingestion/loop.py`) reads
+> them and fans every enabled source into one serialized consumer. The gateway
+> callback uses an **in-process** `asyncio.Queue`, so it must run in the same
+> process as `mnemozine-ingest`.
+
 ### OpenAI-format agents (FR-ING-3)
 
-1. Run the gateway:
+1. Enable the gateway source on the `mnemozine-ingest` process:
+
+   ```bash
+   MNEMOZINE_INGEST__ENABLE_GATEWAY=true
+   MNEMOZINE_INGEST__GATEWAY_DEFAULT_PROJECT=my-project   # fallback project
+   MNEMOZINE_INGEST__GATEWAY_QUEUE_MAX=10000              # in-process buffer
+   ```
+
+2. Run the gateway:
 
    ```bash
    litellm --config mnemozine/ingestion/gateway/config.yaml --port 4000
@@ -416,15 +521,41 @@ logging callback. The reference proxy config is
 
    (docker-compose / Helm run the `litellm` service for you.) The callback is
    registered in `litellm_settings.callbacks` as the dotted path
-   `mnemozine.ingestion.gateway.litellm_register.gateway_callback`.
+   `mnemozine.ingestion.gateway.litellm_register.gateway_callback` (LiteLLM
+   resolves it by **string lookup** at runtime — the path must match exactly).
+   The proxy's own upstream models come from the yaml
+   (`os.environ/MNEMOZINE_GATEWAY_QWEN_BASE_URL`, `…_QWEN_API_KEY`):
 
-2. Point any **operator-controlled, repointable** OpenAI-format agent at the
+   ```yaml
+   model_list:
+     - model_name: qwen
+       litellm_params:
+         model: openai/qwen2.5
+         api_base: os.environ/MNEMOZINE_GATEWAY_QWEN_BASE_URL
+         api_key: os.environ/MNEMOZINE_GATEWAY_QWEN_API_KEY
+   litellm_settings:
+     callbacks: mnemozine.ingestion.gateway.litellm_register.gateway_callback
+   ```
+
+3. Point any **operator-controlled, repointable** OpenAI-format agent at the
    gateway by setting its OpenAI `base_url` to `http://<gateway-host>:4000/v1`
-   (and any `api_key` the proxy expects). Every completion that agent makes is
-   then captured and emitted as common-schema events (`source=openai`), with
-   `tool_calls` stripped (FR-ING-7).
+   (port 4000 is the LiteLLM default; `--port` overrides it) and any `api_key`
+   the proxy expects. Every completion that agent makes is then captured and
+   emitted as common-schema events (`source=openai`), with `tool_calls` stripped
+   (FR-ING-7).
 
-3. The gateway's own upstream (the model it proxies to) is the local Qwen by
+   To route a turn to a specific project/session, thread it through LiteLLM's
+   **metadata** dict — there is no request-path routing otherwise:
+
+   ```python
+   metadata={"mnemozine_project": "my-project", "mnemozine_session_id": "sess-123"}
+   ```
+
+   The callback resolves `project` from `mnemozine_project` → `project` → the
+   configured default, and `session_id` from `mnemozine_session_id` →
+   `session_id` → `user` → the LiteLLM call id.
+
+4. The gateway's own upstream (the model it proxies to) is the local Qwen by
    default; swap to a cloud backend by editing the `model_list` `api_base`/
    `api_key` (a single line) — capture still works.
 
@@ -436,17 +567,53 @@ logging callback. The reference proxy config is
 
 Hermes is the self-hosted Nous Research Hermes agent on a homelab VM. Two paths:
 
-- **Preferred — direct instrumentation.** Instrument the VM to push each
-  completed turn into `mnemozine.ingestion.hermes.HermesAdapter` (an
+- **Preferred — direct instrumentation.** Enable the Hermes source:
+
+  ```bash
+  MNEMOZINE_INGEST__ENABLE_HERMES=true
+  MNEMOZINE_INGEST__HERMES_DEFAULT_PROJECT=hermes        # fallback project
+  MNEMOZINE_INGEST__HERMES_QUEUE_MAX=10000               # in-process buffer
+  ```
+
+  Then instrument the VM to push each completed turn into the
+  `HermesAdapter` (`mnemozine.ingestion.hermes.HermesAdapter`, an
   `IngestSource`), which normalizes Hermes-native payloads into the common schema
-  (`source=hermes`), stripping `tool_calls`. Recorded turns replay via
+  (`source=hermes`), stripping `tool_calls`:
+
+  ```python
+  hermes.feed(payload)          # sync, returns the emitted IngestEvent list
+  await hermes.afeed(payload)   # async, awaits queue space
+  ```
+
+  The adapter is field-name tolerant — `conversation_id` / `session_id` / `id`
+  for the session, `messages` / `turns` for the turn list, `content` / `text`
+  for text, `timestamp` / `created_at` for time. Recorded turns replay via
   `backfill` for the Phase-1 historical import.
 
 - **Fallback — front it with a gateway.** If direct instrumentation is
-  impractical, run a **second** LiteLLM proxy whose upstream `api_base` is
-  Hermes' OpenAI-compatible endpoint and whose callback references
-  `mnemozine.ingestion.gateway.litellm_register.hermes_gateway_callback`
-  (`source=hermes`). The Hermes variant is sketched (commented) at the bottom of
+  impractical, enable the gateway source and run a **second** LiteLLM proxy whose
+  upstream `api_base` is Hermes' OpenAI-compatible endpoint and whose callback
+  references `mnemozine.ingestion.gateway.litellm_register.hermes_gateway_callback`
+  (note: **not** `gateway_callback` — that stamps `source=openai`):
+
+  ```bash
+  MNEMOZINE_INGEST__ENABLE_GATEWAY=true
+  MNEMOZINE_INGEST__HERMES_BASE_URL=https://hermes-agent.nousresearch.com/
+  MNEMOZINE_INGEST__HERMES_API_KEY=<api-key-if-needed>
+  ```
+
+  ```yaml
+  model_list:
+    - model_name: hermes
+      litellm_params:
+        model: openai/hermes
+        api_base: https://hermes-agent.nousresearch.com/v1
+        api_key: os.environ/MNEMOZINE_HERMES_API_KEY
+  litellm_settings:
+    callbacks: mnemozine.ingestion.gateway.litellm_register.hermes_gateway_callback
+  ```
+
+  The Hermes variant is sketched (commented) at the bottom of
   `gateway/config.yaml`.
 
 ### Reading memory back
