@@ -29,6 +29,22 @@ Port-forward it locally:
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "mnemozine.mcp.fullname" . }} {{ .Values.mcp.service.port }}:{{ .Values.mcp.service.port }}
 {{- end }}
 
+{{- if not .Values.ingest.enabled }}
+
+Ingest is DISABLED in-cluster (ingest.enabled=false). Run it off-cluster (e.g.
+on your main PC) as `mnemozine-ingest` pointed at the cluster store:
+  MNEMOZINE_FALKORDB__URL=redis://<node-or-lb-host>:{{ .Values.falkordb.service.port }}
+  MNEMOZINE_EMBEDDING__BASE_URL=http://<ollama-host>:{{ .Values.ollama.service.port }}
+  MNEMOZINE_EXTRACTION__BASE_URL=http://<ollama-host>:{{ .Values.ollama.service.port }}/v1
+{{- if not .Values.falkordb.externalAccess.enabled }}
+Expose FalkorDB first: set falkordb.service.type=NodePort/LoadBalancer or
+falkordb.externalAccess.enabled=true.
+{{- else }}
+FalkorDB is exposed via the `{{ include "mnemozine.falkordb.fullname" . }}-external` Service
+(type {{ .Values.falkordb.externalAccess.type }}); reach it on that host:{{ .Values.falkordb.service.port }}.
+{{- end }}
+{{- end }}
+
 Tuning (PRD §6.6) is parameterized under `.Values.tuning` and rendered into the
 ConfigMap as MNEMOZINE_* env. Override with -f my-values.yaml or --set, e.g.:
   --set tuning.crossref.relevanceThreshold=0.85 --set tuning.inject.tokenBudget=400

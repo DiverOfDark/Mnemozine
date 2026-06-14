@@ -23,9 +23,12 @@ internals.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import signal
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import typer
 
@@ -41,6 +44,8 @@ from mnemozine.interfaces import (
 )
 
 if TYPE_CHECKING:
+    from fastapi import FastAPI
+
     from mnemozine.services import MnemozineIngestService
 
 logger = logging.getLogger(__name__)
@@ -188,6 +193,7 @@ class Container:
         """
 
         from mnemozine.extract import TypedExtractor
+        from mnemozine.services import MnemozineIngestService
 
         extractor = TypedExtractor(self.build_llm_provider(), settings=self.settings)
         self._extractor = extractor
@@ -199,6 +205,27 @@ class Container:
         if self._storage is not None:
             await self._storage.close()
             self._storage = None
+
+
+async def _run_then_close(
+    container: Container, coro: Coroutine[Any, Any, None]
+) -> None:
+    """Await ``coro`` and then close the container in the SAME event loop.
+
+    The standalone scripts must NOT close the container in a *second*
+    ``asyncio.run`` after the work loop has already finished: the FalkorDB async
+    redis connection is bound to the loop that opened it (in ``build_storage``), so
+    closing it from a fresh loop raises ``RuntimeError: Event loop is closed`` (the
+    redis pool's transport tears down against the original, now-closed loop) — a
+    crash on every ``mnemozine-ingest`` / ``mnemozine-maintenance`` exit, only ever
+    seen against a *live* store. Running the work and the close under one loop keeps
+    the connection lifecycle on a single loop, so ``close`` runs cleanly.
+    """
+
+    try:
+        await coro
+    finally:
+        await container.close()
 
 
 # ---------------------------------------------------------------------------
@@ -289,11 +316,12 @@ def _ingest_main(
 
     container = Container.from_env()
     try:
-        asyncio.run(_run_ingest(container, backfill=backfill))
+        # Run the ingest loop AND close the container under one event loop so the
+        # FalkorDB connection is finalized on the loop that opened it (a second
+        # asyncio.run for close raises "Event loop is closed" against a live store).
+        asyncio.run(_run_then_close(container, _run_ingest(container, backfill=backfill)))
     except KeyboardInterrupt:  # graceful Ctrl-C on the tailing watcher
         typer.echo("mnemozine-ingest: stopped.")
-    finally:
-        asyncio.run(container.close())
 
 
 # ---------------------------------------------------------------------------
@@ -343,10 +371,9 @@ def _maintenance_run_cmd() -> None:
     """Run the full maintenance pass once and exit (idempotent, FR-MNT-5)."""
 
     container = Container.from_env()
-    try:
-        asyncio.run(_maintenance_run_once(container))
-    finally:
-        asyncio.run(container.close())
+    # Single-loop run+close (see _run_then_close): a second asyncio.run for close
+    # would raise "Event loop is closed" against a live FalkorDB connection.
+    asyncio.run(_run_then_close(container, _maintenance_run_once(container)))
 
 
 @maintenance_app.command("serve")
@@ -355,11 +382,9 @@ def _maintenance_serve_cmd() -> None:
 
     container = Container.from_env()
     try:
-        asyncio.run(_maintenance_serve(container))
+        asyncio.run(_run_then_close(container, _maintenance_serve(container)))
     except (KeyboardInterrupt, asyncio.CancelledError):
         typer.echo("mnemozine-maintenance: scheduler stopped.")
-    finally:
-        asyncio.run(container.close())
 
 
 @maintenance_app.command("migrate-index")
@@ -452,3 +477,316 @@ def run_web() -> None:
     app = create_app(container)
     cfg = container.settings.web
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=container.settings.log_level.lower())
+
+
+# ---------------------------------------------------------------------------
+# mnemozine — the all-in-one entrypoint (build Container once, run every ENABLED
+# component concurrently under one event loop, graceful shutdown).
+# ---------------------------------------------------------------------------
+
+
+def _build_no_signal_server(config: Any) -> Any:
+    """Build a uvicorn ``Server`` that never installs its own signal handlers.
+
+    The all-in-one coordinator (:func:`_run_all`) owns SIGINT/SIGTERM via
+    ``loop.add_signal_handler`` so a stop signal cancels *all* components together.
+    uvicorn's default ``capture_signals`` would override those handlers (it uses
+    ``signal.signal``); overriding it to a no-op context manager leaves the
+    coordinator in control. uvicorn is imported lazily here so the non-HTTP
+    entrypoints (e.g. ``mnemozine-ingest``) never import the web stack.
+    """
+
+    import uvicorn
+
+    class _NoSignalServer(uvicorn.Server):
+        @contextlib.contextmanager
+        def capture_signals(self) -> Iterator[None]:
+            yield
+
+    return _NoSignalServer(config)
+
+
+async def _serve_uvicorn(app: Any, *, host: str, port: int, log_level: str) -> None:
+    """Serve an ASGI ``app`` with uvicorn as a cancellable coroutine.
+
+    Unlike ``uvicorn.run`` (which installs signal handlers and owns the loop), this
+    awaits ``serve()`` on the *current* loop using a no-signal server so the
+    coordinator owns SIGINT/SIGTERM. On cancellation we set ``should_exit`` and
+    await the server's graceful shutdown before re-raising.
+    """
+
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level=log_level, lifespan="on")
+    server = _build_no_signal_server(config)
+    serve_task = asyncio.ensure_future(server.serve())
+    try:
+        await serve_task
+    except asyncio.CancelledError:
+        server.should_exit = True
+        with contextlib.suppress(asyncio.CancelledError):
+            await serve_task
+        raise
+
+
+async def _ingest_component(container: Container) -> None:
+    """Run the streaming ingest loop (FR-ING-*) as a background component.
+
+    Equivalent to ``mnemozine-ingest`` (no ``--backfill``): tails every enabled
+    source forever. Reuses :func:`_run_ingest` so the all-in-one path and the
+    standalone script wire ingest identically (same hook ``services_loader``, same
+    fan-in pipeline).
+
+    Resilience: in the all-in-one, :func:`_run_all` shuts every component down as
+    soon as *any* one finishes (``FIRST_COMPLETED``). A streaming ingest loop is
+    meant to run forever, but it returns early if no source is enabled OR every
+    source producer exits (e.g. a Claude Code watcher hitting an unreadable mount
+    raises, is caught per-source, and that producer ends). Without the guard below
+    that early return would tear down the WebUI + MCP + maintenance too. So when
+    the loop returns we log it and *park* indefinitely instead of returning, which
+    keeps the rest of the all-in-one serving; a real SIGINT/SIGTERM still cancels
+    this parked await. (The standalone ``mnemozine-ingest`` script is unaffected —
+    it calls :func:`_run_ingest` directly and simply exits when the loop returns.)
+    """
+
+    await _run_ingest(container, backfill=False)
+    logger.warning(
+        "mnemozine: ingest loop ended (no enabled source or all sources stopped); "
+        "keeping the rest of the all-in-one running"
+    )
+    await asyncio.Event().wait()  # park until cancelled at shutdown
+
+
+async def _maintenance_component(container: Container) -> None:
+    """Run the maintenance cron scheduler (FR-MNT-5) as a background component.
+
+    Equivalent to ``mnemozine-maintenance serve``: builds the default job set over
+    the shared container and runs the APScheduler cron loop until cancelled.
+    """
+
+    await _maintenance_serve(container)
+
+
+async def _mcp_standalone_component(container: Container) -> None:
+    """Serve the MCP server over streamable-HTTP on its own port (web disabled).
+
+    Used when ``run.mcp`` is enabled but ``run.web`` is not, so there is no FastAPI
+    app to mount into. Binds ``mcp_host`` / ``mcp_port`` and runs the streamable
+    HTTP ASGI app under uvicorn; the sub-app's own lifespan drives the session
+    manager here (no mounting), so no extra lifespan wiring is needed.
+    """
+
+    from mnemozine.retrieval.retriever import ScopedRetriever
+    from mnemozine.retrieval.server import build_mcp_http_app
+
+    retriever = cast(ScopedRetriever, await container.build_retriever())
+    _server, asgi_app = build_mcp_http_app(retriever, settings=container.settings)
+    cfg = container.settings
+    await _serve_uvicorn(
+        asgi_app,
+        host=cfg.mcp_host,
+        port=cfg.mcp_port,
+        log_level=cfg.log_level.lower(),
+    )
+
+
+async def _build_web_app(container: Container, *, mount_mcp: bool) -> FastAPI:
+    """Build the FastAPI WebUI app, optionally mounting the MCP app at ``/mcp``.
+
+    When ``mount_mcp`` is True the MCP streamable-HTTP ASGI app is mounted under
+    the WebUI app so both are served from the single ``web.port`` (default 8765),
+    resolving the historical web/MCP port clash. The MCP session manager (created
+    lazily by ``streamable_http_app()``) must run for the lifetime of the parent
+    app; a Starlette ``Mount`` does **not** invoke the sub-app's lifespan, so we
+    splice ``server.session_manager.run()`` into the FastAPI app's lifespan.
+    """
+
+    from contextlib import AsyncExitStack
+    from contextlib import asynccontextmanager as _acm
+
+    from starlette.routing import Mount
+
+    from mnemozine.retrieval.retriever import ScopedRetriever
+    from mnemozine.retrieval.server import build_mcp_http_app
+    from mnemozine.web import create_app
+
+    app = create_app(container)
+
+    if not mount_mcp:
+        return app
+
+    retriever = cast(ScopedRetriever, await container.build_retriever())
+    # Build the sub-app with its route at "/" so the ``Mount("/mcp", ...)`` below
+    # supplies the prefix and the endpoint lands at exactly ``/mcp`` (not /mcp/mcp).
+    server, asgi_app = build_mcp_http_app(
+        retriever, settings=container.settings, streamable_http_path="/"
+    )
+
+    # Insert the MCP mount at index 0 so it is matched BEFORE the SPA catch-all
+    # (``/{full_path:path}``, added last by create_app) and is not swallowed by the
+    # SPA fallback. A ``Mount("/mcp")`` only matches the ``/mcp`` prefix, so the
+    # ``/api`` routers are untouched.
+    #
+    # A Starlette ``Mount("/mcp")`` serves the sub-app at ``/mcp/...`` but does NOT
+    # answer the bare, slash-less ``/mcp`` itself — without the route below that
+    # exact path falls through to the SPA catch-all and a client configured with
+    # ``http://host:8765/mcp`` (the documented endpoint, and the standalone server's
+    # default path) would get the HTML SPA instead of the MCP transport. Insert an
+    # explicit redirect ``/mcp`` -> ``/mcp/`` ahead of both so the contracted
+    # slash-less URL reaches the transport. Use 307 so the client re-issues the same
+    # method/body (a POST initialize must stay a POST).
+    from starlette.responses import RedirectResponse
+    from starlette.routing import Route
+
+    async def _mcp_redirect(_request: Any) -> RedirectResponse:
+        return RedirectResponse(url="/mcp/", status_code=307)
+
+    app.router.routes.insert(0, Mount("/mcp", app=asgi_app))
+    app.router.routes.insert(
+        0, Route("/mcp", _mcp_redirect, methods=["GET", "POST", "DELETE"])
+    )
+
+    prior_lifespan = app.router.lifespan_context
+
+    @_acm
+    async def _combined_lifespan(fastapi_app: FastAPI) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            # Drive the MCP StreamableHTTP session manager for the app's lifetime.
+            await stack.enter_async_context(server.session_manager.run())
+            await stack.enter_async_context(prior_lifespan(fastapi_app))
+            yield
+
+    app.router.lifespan_context = _combined_lifespan
+    return app
+
+
+async def _web_component(container: Container, *, mount_mcp: bool) -> None:
+    """Serve the WebUI (and, when ``mount_mcp``, the MCP app at /mcp) on one port."""
+
+    app = await _build_web_app(container, mount_mcp=mount_mcp)
+    cfg = container.settings.web
+    await _serve_uvicorn(
+        app,
+        host=cfg.host,
+        port=cfg.port,
+        log_level=container.settings.log_level.lower(),
+    )
+
+
+def _select_components(
+    container: Container,
+) -> dict[str, Callable[[], Coroutine[Any, Any, None]]]:
+    """Map each ENABLED component to its coroutine factory (disabled -> absent).
+
+    The selection rule for the web/MCP pair implements the contract:
+
+    * web + mcp  -> one ``web`` component serving the WebUI with the MCP app mounted
+      at ``/mcp`` on the single ``web.port`` (no separate MCP server).
+    * web only   -> ``web`` component, no MCP mount.
+    * mcp only   -> ``mcp`` component, MCP standalone on ``mcp_port``.
+    * neither    -> no HTTP server.
+
+    ``ingest`` and ``maintenance`` are independent background tasks. A component
+    absent from the returned mapping is never started.
+    """
+
+    run = container.settings.run
+    components: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
+
+    if run.web:
+        mount_mcp = run.mcp
+        components["web"] = lambda: _web_component(container, mount_mcp=mount_mcp)
+    elif run.mcp:
+        components["mcp"] = lambda: _mcp_standalone_component(container)
+
+    if run.ingest:
+        components["ingest"] = lambda: _ingest_component(container)
+    if run.maintenance:
+        components["maintenance"] = lambda: _maintenance_component(container)
+
+    return components
+
+
+async def _run_all(container: Container) -> None:
+    """Run every ENABLED component concurrently with graceful shutdown.
+
+    Builds the component set from ``settings.run.*`` (see :func:`_select_components`)
+    and launches each as an asyncio task under this one event loop. SIGINT/SIGTERM
+    (or any task crashing) triggers shutdown: every task is cancelled and awaited,
+    then ``container.close()`` releases the shared storage connection. Disabled
+    components are never created, so this is a no-op-safe superset of every
+    standalone script (e.g. ``run.ingest`` only == ``mnemozine-ingest``).
+    """
+
+    components = _select_components(container)
+    if not components:
+        logger.warning("mnemozine: no components enabled (settings.run.*); exiting")
+        return
+
+    logger.info("mnemozine: starting components: %s", ", ".join(sorted(components)))
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+
+    def _request_stop() -> None:
+        logger.info("mnemozine: shutdown signal received")
+        stop.set()
+
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, _request_stop)
+            installed.append(signum)
+        except (NotImplementedError, RuntimeError):  # pragma: no cover - non-main thread / Windows
+            pass
+
+    tasks: dict[str, asyncio.Task[None]] = {
+        name: asyncio.create_task(factory(), name=f"mnemozine-{name}")
+        for name, factory in components.items()
+    }
+    stop_task = asyncio.create_task(stop.wait(), name="mnemozine-stop")
+
+    try:
+        # Wake on first of: a stop signal, or any component finishing/crashing.
+        await asyncio.wait(
+            [stop_task, *tasks.values()],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for signum in installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(signum)
+        stop_task.cancel()
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(
+            stop_task, *tasks.values(), return_exceptions=True
+        )
+        for name, result in zip(tasks, results[1:], strict=True):
+            if isinstance(result, Exception) and not isinstance(
+                result, asyncio.CancelledError
+            ):
+                logger.error("mnemozine: component %s exited with error", name, exc_info=result)
+        await container.close()
+
+
+def run_all() -> None:
+    """Console-script entrypoint for ``mnemozine`` (the all-in-one process).
+
+    Builds the :class:`Container` **once** and runs every component enabled in
+    ``settings.run.*`` concurrently under one event loop (see :func:`_run_all`):
+    the WebUI + MCP (mounted at ``/mcp`` on the single ``web.port`` 8765), the
+    ingest loop, and the maintenance scheduler. Toggle components with
+    ``MNEMOZINE_RUN__MCP`` / ``__INGEST`` / ``__MAINTENANCE`` / ``__WEB`` (all
+    default true). To split ingest onto another machine, run this with only
+    ``MNEMOZINE_RUN__INGEST=true`` pointed at a remote ``MNEMOZINE_FALKORDB__URL``
+    plus remote embedding/extraction endpoints — equivalent to ``mnemozine-ingest``.
+    """
+
+    container = Container.from_env()
+    logging.basicConfig(level=container.settings.log_level.upper())
+    try:
+        asyncio.run(_run_all(container))
+    except KeyboardInterrupt:  # pragma: no cover - asyncio.run usually handles SIGINT first
+        typer.echo("mnemozine: stopped.")

@@ -131,6 +131,7 @@ USER mnemozine
 # and forward signals cleanly under both docker-compose and Kubernetes.
 ENTRYPOINT ["tini", "--"]
 
-# Default command: the MCP server. docker-compose / Helm override `command` per
-# service (mnemozine-ingest, mnemozine-maintenance, ...).
-CMD ["mnemozine-mcp"]
+# Default command: the all-in-one supervisor (run_all) — runs MCP + ingest +
+# maintenance + WebUI in one process, toggled by MNEMOZINE_RUN__*. docker-compose
+# / Helm override `command` to run a single component (mnemozine-ingest, etc.).
+CMD ["mnemozine"]

@@ -20,8 +20,43 @@ spec:
       port: {{ .Values.falkordb.service.port }}
       targetPort: redis
       protocol: TCP
+      {{- if and (eq .Values.falkordb.service.type "NodePort") .Values.falkordb.service.nodePort }}
+      nodePort: {{ .Values.falkordb.service.nodePort }}
+      {{- end }}
   selector:
     {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+{{- if .Values.falkordb.externalAccess.enabled }}
+---
+# Optional dedicated Service for OFF-cluster access (e.g. a main-PC ingest
+# connecting to the cluster FalkorDB store). Leaves the internal ClusterIP
+# Service above untouched. Reach it at redis://<node-or-lb-host>:<port>.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-external
+  labels:
+    {{- include "mnemozine.componentLabels" (dict "root" . "component" $component) | nindent 4 }}
+  {{- with (merge (deepCopy (default (dict) .Values.falkordb.externalAccess.annotations)) (default (dict) .Values.commonAnnotations)) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.falkordb.externalAccess.type }}
+  {{- if and (eq .Values.falkordb.externalAccess.type "LoadBalancer") .Values.falkordb.externalAccess.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.falkordb.externalAccess.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: redis
+      port: {{ .Values.falkordb.service.port }}
+      targetPort: redis
+      protocol: TCP
+      {{- if and (eq .Values.falkordb.externalAccess.type "NodePort") .Values.falkordb.externalAccess.nodePort }}
+      nodePort: {{ .Values.falkordb.externalAccess.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "mnemozine.componentSelectorLabels" (dict "root" . "component" $component) | nindent 4 }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet

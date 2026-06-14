@@ -60,16 +60,21 @@ builds against.
 |---------|--------|
 | Graph + vector backend | **FalkorDB** (single store; no Postgres) |
 | Temporal KG engine | **Graphiti** — `graphiti-core[falkordb]==0.29.2` (exact pin) |
-| Extraction LLM | Pluggable **OpenAI-format `base_url`**; default local **Qwen2.5** |
+| Extraction LLM | Pluggable **OpenAI-format `base_url`**; default **Qwen2.5 served by Ollama** (LiteLLM-id `openai/qwen2.5` against Ollama's `/v1` OpenAI endpoint) |
 | Embedding model | **bge-m3 via Ollama**, self-hosted (1024-d) |
-| OpenAI-format gateway | **LiteLLM** proxy + a custom logging callback |
+| Application process | one all-in-one **`mnemozine`** entrypoint runs MCP + ingest + maintenance + web under one loop |
+| OpenAI-format gateway | **LiteLLM** proxy + a custom logging callback (optional — the `gateway` compose profile, for capturing OpenAI/Hermes agents) |
 | MCP server | official `mcp` SDK (`FastMCP`) |
 | Maintenance scheduler | APScheduler (or a k8s `CronJob`) |
 | Language / packaging | Python ≥3.11, hatchling, `pydantic-settings` config |
 
 The whole system runs **end-to-end on local models with no cloud dependency**.
-The extraction/embedding endpoints are pluggable, so the extraction LLM MAY point
-at a cloud model later on cost grounds — a one-line `base_url`/`model` swap.
+By default **Ollama serves both the bge-m3 embeddings and the Qwen2.5 extraction
+model**, so the default stack is just **3 services** (FalkorDB + Ollama + the
+all-in-one `mnemozine`); the LiteLLM gateway and a dedicated llama.cpp Qwen server
+are **optional** (compose profiles `gateway` / `qwen-llamacpp`). The
+extraction/embedding endpoints are pluggable, so the extraction LLM MAY point at a
+cloud model later on cost grounds — a one-line `base_url`/`model` swap.
 
 ### Console scripts
 
@@ -77,17 +82,68 @@ Installed by the package (`pyproject.toml [project.scripts]`):
 
 | Script | Purpose |
 |--------|---------|
-| `mnemozine-mcp` | the single MCP server (FR-RET-1) |
-| `mnemozine-ingest` | source → chunk → extract → store loop (FR-ING-*) |
-| `mnemozine-maintenance` | scheduled consolidate/resolve/decay/audit (FR-MNT-*) |
+| `mnemozine` | **the all-in-one process** — builds the container once and runs every *enabled* component (MCP + ingest + maintenance + web) concurrently under one asyncio loop |
+| `mnemozine-mcp` | the single MCP server, standalone (FR-RET-1) |
+| `mnemozine-ingest` | source → chunk → extract → store loop, standalone (FR-ING-*) |
+| `mnemozine-maintenance` | scheduled consolidate/resolve/decay/audit, standalone (FR-MNT-*) |
+| `mnemozine-web` | the WebUI operator console, standalone |
 | `mnemozine-eval` | §9 eval harness + gold-set bootstrap |
 | `mnemozine-hook-session-start` | Claude Code `SessionStart` hook (FR-RET-3) |
 | `mnemozine-hook-user-prompt-submit` | Claude Code `UserPromptSubmit` hook (FR-RET-5) |
 | `mnemozine-hook-stop` | Claude Code `Stop` hook — flush session (FR-ING-6) |
 | `mnemozine-hook-pre-compact` | Claude Code `PreCompact` hook — flush before compaction (FR-ING-6) |
 
-The three service workloads (`mnemozine-mcp` / `-ingest` / `-maintenance`) share
-**one** container image and differ only in the command they run.
+All service workloads share **one** container image and differ only in the
+command they run.
+
+#### The all-in-one `mnemozine` entrypoint and the component toggles
+
+`mnemozine` (= `mnemozine.app:run_all`) builds the `Container` **once** and runs
+every *enabled* component concurrently under a single asyncio loop, with graceful
+shutdown on SIGINT/SIGTERM (so compose's default `SIGTERM`/`stop_signal` just
+works). This is what collapses the stack to **~3 containers** — the `mnemozine`
+app, FalkorDB, and Ollama.
+
+Four boolean toggles (prefix `MNEMOZINE_`, nested delimiter `__`) select which
+components run; **all default `true`** and are listed in
+[`.env.example`](./.env.example):
+
+| Variable | Default | Component |
+|----------|---------|-----------|
+| `MNEMOZINE_RUN__MCP` | `true` | the MCP server (the `recall` tool + index tools) |
+| `MNEMOZINE_RUN__INGEST` | `true` | the ingest loop (source → chunk → extract → store) |
+| `MNEMOZINE_RUN__MAINTENANCE` | `true` | the maintenance scheduler |
+| `MNEMOZINE_RUN__WEB` | `true` | the FastAPI WebUI / `/api` |
+
+A disabled component is never created, so `mnemozine` is a no-op-safe superset of
+every standalone script — running it with only one toggle on is **exactly
+equivalent** to that component's standalone script (e.g. only `RUN__INGEST=true`
+== `mnemozine-ingest`). Use a standalone script to split one component onto
+another machine (see [Split deployment](#split-deployment--running-ingest-on-the-main-pc)).
+
+**Web + MCP share one port.** When `MNEMOZINE_RUN__WEB=true` **and**
+`MNEMOZINE_RUN__MCP=true`, `mnemozine` serves the WebUI **and** the MCP
+streamable-http transport from a **single** port — `MNEMOZINE_WEB__PORT` (default
+**8765**) — by mounting the MCP ASGI app at path **`/mcp`** on the web app. So a
+networked MCP client connects to `http://<host>:8765/mcp` (streamable-http) and
+the WebUI/API is at `http://<host>:8765/` (API under `/api`). This resolves the
+historical web/MCP 8765 clash — the all-in-one default exposes **only 8765**.
+
+The MCP `StreamableHTTP` session manager runs under the FastAPI app's lifespan,
+so uvicorn runs with the lifespan enabled (`run_all` already does this — nothing
+to configure).
+
+> **Fallback (MCP standalone):** if `RUN__WEB=false` but `RUN__MCP=true`, the MCP
+> server runs **standalone** on `MNEMOZINE_MCP_HOST` / `MNEMOZINE_MCP_PORT`
+> (default `127.0.0.1:8765`) at path `/mcp` — in that case expose
+> `MNEMOZINE_MCP_PORT` instead of `MNEMOZINE_WEB__PORT`.
+
+> **Binds.** `MNEMOZINE_WEB__HOST` and `MNEMOZINE_MCP_HOST` both default to
+> `127.0.0.1`. **In a container you typically must set `MNEMOZINE_WEB__HOST=0.0.0.0`**
+> (and `MNEMOZINE_MCP_HOST=0.0.0.0` for the standalone-MCP case) so the port is
+> reachable from outside the container. The WebUI is local-operator only — front
+> it with auth or keep it on a private network, and set `MNEMOZINE_WEB__TOKEN` to
+> gate `/api`.
 
 ---
 
@@ -124,23 +180,61 @@ cp .env.example .env                                   # edit endpoints/keys if 
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Brings up every service with no cluster:
+The **default** stack is **3 services**, because the all-in-one `mnemozine`
+container runs the MCP + ingest + maintenance + web components together (see
+[the component toggles](#the-all-in-one-mnemozine-entrypoint-and-the-component-toggles)):
 
 | Service | Purpose |
 |---------|---------|
 | `falkordb` | single graph + vector store, persisted to named volume `falkordb-data` (`/data`) |
-| `ollama` + `ollama-init` | bge-m3 embeddings; `ollama-init` pulls the model into `ollama-data` on first `up` |
-| `qwen` | local OpenAI-format extraction LLM (llama.cpp server by default), weights in `qwen-models` |
-| `litellm` | OpenAI-format gateway + logging callback, on `:4000` |
-| `mnemozine-mcp` | the MCP server, published on `:8765` |
-| `mnemozine-ingest` | Claude Code watcher + hooks; mounts `~/.claude` read-only at `/claude` |
-| `mnemozine-maintenance` | scheduled consolidate/resolve/decay/audit |
+| `ollama` (+ `ollama-init`) | serves **both** the bge-m3 **embeddings** *and* the **qwen extraction** model; `ollama-init` pulls them into `ollama-data` on first `up` |
+| `mnemozine` | the all-in-one app — MCP + ingest + maintenance + WebUI, published on **`:8765`** (WebUI at `/`, `/api`; MCP at `/mcp`); mounts `~/.claude` read-only at `/claude` for the Claude Code watcher |
+
+Extraction runs **on Ollama** alongside embeddings, so neither a separate `qwen`
+container nor LiteLLM is needed by default. The recommended extraction env (use
+verbatim) points the LiteLLM-format client at Ollama's OpenAI-compatible endpoint:
+
+```bash
+MNEMOZINE_EXTRACTION__BASE_URL=http://ollama:11434/v1   # the /v1 suffix is REQUIRED (Ollama's OpenAI-compatible endpoint)
+MNEMOZINE_EXTRACTION__MODEL=openai/qwen2.5             # LiteLLM provider/model form; "qwen2.5" is the Ollama tag (any pulled qwen tag works, e.g. openai/qwen2.5:7b)
+MNEMOZINE_EXTRACTION__API_KEY=not-needed
+# embeddings stay on Ollama too:
+MNEMOZINE_EMBEDDING__BASE_URL=http://ollama:11434
+MNEMOZINE_EMBEDDING__MODEL=bge-m3
+MNEMOZINE_EMBEDDING__DIMENSIONS=1024
+```
+
+> **The extraction model id is a LiteLLM id.** Against Ollama's OpenAI-compatible
+> `/v1` endpoint it **must** be prefixed `openai/` (the config default
+> `openai/qwen2.5` already is). The `openai/` provider treats `/v1` as a plain
+> OpenAI server; do **not** use the `ollama/` provider here — it speaks Ollama's
+> *native* `/api/*` surface and would 404 against the `/v1` base_url. (To talk to
+> the native Ollama API instead, drop the `/v1` suffix **and** use `ollama/qwen2.5`.)
+
+#### Optional profiles
+
+Two backends are kept off the default `up` and enabled via compose profiles when
+you want them:
+
+| Profile | Brings up | When |
+|---------|-----------|------|
+| `gateway` | `litellm` (OpenAI-format gateway + logging callback, on `:4000`) | to capture **OpenAI-format / Hermes agents** (FR-ING-3/4) — see [Pointing OpenAI-format agents and Hermes at the gateway](#pointing-openai-format-agents-and-hermes-at-the-gateway) |
+| `qwen-llamacpp` | `qwen` (a llama.cpp OpenAI-format server, weights in `qwen-models`) | to run extraction on a **dedicated llama.cpp server** instead of on Ollama |
+
+```bash
+# default 3-service stack:
+docker compose -f deploy/docker-compose.yml up -d --build
+# add the LiteLLM gateway:
+docker compose -f deploy/docker-compose.yml --profile gateway up -d
+# run extraction on a dedicated llama.cpp qwen server instead of Ollama:
+docker compose -f deploy/docker-compose.yml --profile qwen-llamacpp up -d
+```
 
 Inter-service URLs are set under each service's `environment:` (which overrides
 `env_file` in Compose), so containers reach each other by service name
-(`redis://falkordb:6379`, `http://ollama:11434`, `http://litellm:4000/v1`) even
-though `.env` ships `localhost` defaults for bare-metal dev. Override any of them
-with the `MZ_COMPOSE_*` interpolation vars, e.g.:
+(`redis://falkordb:6379`, `http://ollama:11434`, `http://ollama:11434/v1` for
+extraction) even though `.env` ships `localhost` defaults for bare-metal dev.
+Override any of them with the `MZ_COMPOSE_*` interpolation vars, e.g.:
 
 ```bash
 MZ_COMPOSE_EXTRACTION_URL=https://api.openai.com/v1 \
@@ -149,32 +243,24 @@ MZ_COMPOSE_EXTRACTION_API_KEY=sk-... \
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-**Local Qwen model.** The `qwen` service runs a llama.cpp OpenAI-compatible
-server; drop a GGUF into the `qwen-models` volume (or bind-mount one) and set
-`QWEN_MODEL` to its filename (default `qwen2.5-7b-instruct-q4_k_m.gguf`). To use a
-cloud extraction endpoint instead, point the extraction URL at it (above) and the
-`qwen` service becomes optional.
+**Local Qwen on llama.cpp (`qwen-llamacpp` profile).** The `qwen` service runs a
+llama.cpp OpenAI-compatible server; drop a GGUF into the `qwen-models` volume (or
+bind-mount one) and set `QWEN_MODEL` to its filename (default
+`qwen2.5-7b-instruct-q4_k_m.gguf`). To use a cloud extraction endpoint instead,
+point the extraction URL at it (above); the `qwen` service stays off.
 
-**Claude Code transcripts.** `mnemozine-ingest` mounts the host Claude Code
-config dir read-only. Override the host path with `HOST_CLAUDE_CONFIG_DIR`
-(defaults to `$HOME/.claude`).
+**Claude Code transcripts.** The `mnemozine` app mounts the host Claude Code
+config dir read-only for the ingest component. Override the host path with
+`HOST_CLAUDE_CONFIG_DIR` (defaults to `$HOME/.claude`).
 
-**Open the WebUI (operator console).** The dark observability console is a
-**separate** local-only FastAPI surface — it is **not** part of
-`docker-compose.yml`. Run it from your venv (Path A) once the store is up:
-
-```bash
-mnemozine-web        # binds http://127.0.0.1:8765 by default; ⌘-click to open
-```
-
-It binds `MNEMOZINE_WEB__HOST` / `MNEMOZINE_WEB__PORT` (`127.0.0.1:8765`) and
-serves the bundled SPA from `mnemozine/web/static` if present. The `/api` is
-**open on the bound host** unless you set a static bearer token
-`MNEMOZINE_WEB__TOKEN`.
-
-> **Port clash:** the WebUI and the MCP server **share default port 8765**. Do
-> not run `mnemozine-web` and `mnemozine-mcp` on the same host without moving one
-> — set `MNEMOZINE_WEB__PORT` or `MNEMOZINE_MCP_PORT`.
+**WebUI + MCP on one port.** With the all-in-one default (`RUN__WEB` and
+`RUN__MCP` both `true`), the published **`:8765`** serves the WebUI at `/` (API
+under `/api`) **and** the MCP streamable-http transport at `/mcp` — there is no
+separate `mnemozine-web` to start and no port clash to manage. The container sets
+`MNEMOZINE_WEB__HOST=0.0.0.0` so the port is reachable from the host; gate `/api`
+with `MNEMOZINE_WEB__TOKEN` and keep the console on a private network (it is a
+local-operator surface). To turn any component off in compose, set its
+`MNEMOZINE_RUN__*` toggle to `false`.
 
 ### Path B′ — frontend dev loop (Vite)
 
@@ -243,6 +329,70 @@ kubectl -n mnemozine port-forward svc/mz-mnemozine-mcp 8765:8765
 
 ---
 
+## Split deployment — running ingest on the main PC
+
+The common operator scenario: keep the **homelab** running the always-on memory
+layer (FalkorDB + Ollama + MCP/web/maintenance), but run **ingest on your main
+PC** so the Claude Code watcher and the in-process gateway/Hermes callbacks live
+where your transcripts and agents actually run. Because the all-in-one
+`mnemozine` with only `RUN__INGEST=true` is **exactly equivalent** to the
+standalone `mnemozine-ingest` script (the same `_run_ingest`), splitting is just
+two opposite toggle sets pointed at the same FalkorDB.
+
+The two halves:
+
+1. **Homelab — everything *except* ingest.** Run the consolidated stack with the
+   ingest component disabled:
+   - **docker-compose:** set `MNEMOZINE_RUN__INGEST=false` (the `mnemozine`
+     container then serves MCP + web + maintenance only).
+   - **Helm:** `--set ingest.enabled=false` (the homelab renders the MCP / web /
+     maintenance workloads but not the ingest one).
+
+   > The homelab **FalkorDB must be network-reachable from the main PC** — bind it
+   > on the LAN (compose publishes `:6379`; in k8s expose it via a `Service` /
+   > `NodePort` / port-forward) so the remote ingester can write to it.
+
+2. **Main PC — ingest only, pointed at the homelab.** Run the ingest half via
+   `deploy/docker-compose.ingest.yml` (or the `mnemozine-ingest` console script
+   in a venv). Disable the other three components and point the three remote
+   endpoints at the homelab box:
+
+   ```bash
+   # the ingest-only env (exactly equivalent to `mnemozine-ingest`):
+   MNEMOZINE_RUN__INGEST=true
+   MNEMOZINE_RUN__MCP=false
+   MNEMOZINE_RUN__MAINTENANCE=false
+   MNEMOZINE_RUN__WEB=false
+
+   # point at the homelab's FalkorDB + Ollama (embeddings) + extraction endpoint:
+   MNEMOZINE_FALKORDB__URL=redis://<homelab-host>:6379
+   MNEMOZINE_EMBEDDING__BASE_URL=http://<ollama-host>:11434
+   MNEMOZINE_EXTRACTION__BASE_URL=http://<extraction-host>/v1
+   ```
+
+   ```bash
+   # main PC, with deploy/docker-compose.ingest.yml:
+   docker compose -f deploy/docker-compose.ingest.yml up -d --build
+
+   # …or in a venv (Path A) — the standalone script is identical:
+   mnemozine-ingest
+   ```
+
+   When the homelab serves extraction on Ollama (the default), set
+   `MNEMOZINE_EXTRACTION__BASE_URL=http://<ollama-host>:11434/v1` and
+   `MNEMOZINE_EXTRACTION__MODEL=openai/qwen2.5` (the `/v1` suffix and `openai/`
+   prefix are required — the `ollama/` provider would 404 on `/v1`; see
+   [Path B](#path-b--docker-compose-local-full-stack--eval)).
+   The main-PC ingester still mounts your local `~/.claude` read-only so the
+   watcher tails your real transcripts.
+
+The memory written by the remote ingester flows straight into the same FalkorDB
+the homelab's MCP server reads from, so recall on every agent sees it — the
+**single-store invariant** ([Same store, both ways](#registering-the-mcp-server-the-recall-tool))
+holds across machines.
+
+---
+
 ## Configuration (environment variables)
 
 All runtime configuration lives in `mnemozine/config.py` (a
@@ -299,9 +449,31 @@ set. Setting `get_settings()` is cached process-wide.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `MNEMOZINE_MCP_HOST` | `127.0.0.1` | MCP bind host (compose/Helm set `0.0.0.0`) |
-| `MNEMOZINE_MCP_PORT` | `8765` | MCP bind port |
+| `MNEMOZINE_MCP_HOST` | `127.0.0.1` | MCP **standalone** bind host (used only when `RUN__WEB=false`; compose/Helm set `0.0.0.0`) |
+| `MNEMOZINE_MCP_PORT` | `8765` | MCP standalone bind port (when web+mcp share a port, MCP is at `/mcp` on `MNEMOZINE_WEB__PORT` instead) |
 | `MNEMOZINE_LOG_LEVEL` | `INFO` | logging level |
+
+### WebUI operator console
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MNEMOZINE_WEB__HOST` | `127.0.0.1` | WebUI bind host (set `0.0.0.0` in a container so the port is reachable) |
+| `MNEMOZINE_WEB__PORT` | `8765` | WebUI bind port; **also serves MCP at `/mcp`** when web+mcp both run |
+| `MNEMOZINE_WEB__TOKEN` | _(unset)_ | optional static bearer token gating `/api`; unset = open API on the bound host |
+
+### Component run toggles (the all-in-one `mnemozine`)
+
+These select which components the `mnemozine` entrypoint runs; **all default
+`true`**. They are no-ops for the standalone single-component scripts. See
+[the toggle reference](#the-all-in-one-mnemozine-entrypoint-and-the-component-toggles)
+for the web+mcp single-port behavior and the split-deployment use.
+
+| Variable | Default | Component |
+|----------|---------|-----------|
+| `MNEMOZINE_RUN__MCP` | `true` | the MCP server |
+| `MNEMOZINE_RUN__INGEST` | `true` | the ingest loop |
+| `MNEMOZINE_RUN__MAINTENANCE` | `true` | the maintenance scheduler |
+| `MNEMOZINE_RUN__WEB` | `true` | the WebUI / `/api` |
 
 ### §6.6 tuning parameters (config, not constants)
 
@@ -470,16 +642,20 @@ scope). Use the **absolute path** to the installed script and point it at the
 }
 ```
 
-If you are instead running the server over the network with a networked
-transport — `mnemozine-mcp --transport streamable-http` (or `sse`), bound to
-`MNEMOZINE_MCP_HOST` / `MNEMOZINE_MCP_PORT` (e.g. the compose `mnemozine-mcp`
-service publishes `:8765`; note its bundled command runs the default `stdio`
-transport, so add the flag to expose HTTP) — register it as an HTTP server
-instead of spawning a fresh stdio process:
+If you are instead running the server over the network, register it as an HTTP
+server instead of spawning a fresh stdio process. In the consolidated default the
+all-in-one `mnemozine` container already serves MCP over streamable-http at
+**`/mcp`** on the published `:8765` (alongside the WebUI) — point Claude Code at
+that path:
 
 ```bash
-claude mcp add --transport http mnemozine http://localhost:8765
+claude mcp add --transport http mnemozine http://localhost:8765/mcp
 ```
+
+(If you instead run the standalone `mnemozine-mcp` over the network, use
+`mnemozine-mcp --transport streamable-http` (or `sse`) bound to
+`MNEMOZINE_MCP_HOST` / `MNEMOZINE_MCP_PORT` — its bundled command otherwise runs
+the default `stdio` transport, so add the flag to expose HTTP.)
 
 > **Same store, both ways.** The hooks and the MCP server **must read the same
 > `MNEMOZINE_FALKORDB__URL`** — if hooks write to one FalkorDB and the MCP server
@@ -694,7 +870,9 @@ mnemozine-maintenance serve    # run on the configured cron until interrupted
 
 - The cron cadence is `MNEMOZINE_MAINTENANCE__CRON` (default `0 3 * * *`); the
   `serve` mode uses APScheduler.
-- In docker-compose the `mnemozine-maintenance` service runs `serve` continuously.
+- In docker-compose the all-in-one `mnemozine` container runs the maintenance
+  scheduler continuously as its `MNEMOZINE_RUN__MAINTENANCE` component (set the
+  toggle `false` to disable it, e.g. on a remote ingest-only node).
 - In Helm it is a long-lived `Deployment` by default; set
   `maintenance.asCronJob=true` to render a Kubernetes `CronJob` (schedule from
   `maintenance.cronSchedule`, defaulting to `tuning.maintenance.cron`).
@@ -741,9 +919,11 @@ PVC with a backed-up `/data`, and restarting. Snapshotting the underlying volume
 
 ### Health checks
 
-- `mnemozine-mcp` exposes an HTTP surface on its bind port; compose/Helm probe it
-  via TCP/HTTP.
-- `mnemozine-ingest` and `mnemozine-maintenance` have no HTTP surface — liveness
+- The all-in-one `mnemozine` container exposes an HTTP surface on `:8765` (the
+  WebUI/API, with MCP mounted at `/mcp`) whenever `RUN__WEB` and/or `RUN__MCP` are
+  on; compose/Helm probe it via TCP/HTTP.
+- An **ingest-only** or **maintenance-only** process (e.g. the split-deployment
+  node, or a component-toggled standalone script) has no HTTP surface — liveness
   is "the watcher/scheduler process is still running" (`pgrep`).
 
 ---

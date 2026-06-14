@@ -48,6 +48,11 @@ dev = [
 # main()s (each reads the hook JSON from stdin, writes hookSpecificOutput JSON to
 # stdout; register them in Claude Code's settings.json hooks config).
 [project.scripts]
+# All-in-one entrypoint: builds the Container once and runs every component
+# enabled in settings.run.* (MCP + WebUI on one 8765 port, ingest loop,
+# maintenance scheduler) concurrently under one event loop. The standalone
+# scripts below still run exactly one component (e.g. ingest on another machine).
+mnemozine = "mnemozine.app:run_all"
 mnemozine-mcp = "mnemozine.app:run_mcp"
 mnemozine-ingest = "mnemozine.app:run_ingest"
 mnemozine-maintenance = "mnemozine.app:run_maintenance"

@@ -49,13 +49,24 @@ securityContext:
 # chart wires the in-cluster Service DNS automatically and these explicit URLs
 # are IGNORED for that backend. Set `enabled: false` and fill the matching
 # `external.*` value to point at something you run elsewhere.
+#
+# Extraction base_url resolution (see _helpers.tpl "mnemozine.extractionBaseUrl"):
+#   1. litellm.enabled        -> the in-cluster LiteLLM gateway /v1
+#   2. extractionBaseUrl set   -> that explicit URL (cloud / external server)
+#   3. ollama.enabled (DEFAULT)-> the bundled in-cluster Ollama /v1 endpoint, so
+#                                 extraction runs on the SAME Ollama that serves
+#                                 embeddings (set tuning.extraction.model to an
+#                                 openai/<tag>, e.g. openai/qwen2.5 — the openai/
+#                                 LiteLLM provider hits the /v1 path; ollama/ 404s).
 # =============================================================================
 endpoints:
   external:
     falkordbUrl: ""        # e.g. redis://my-falkordb:6379  (used when falkordb.enabled=false)
     ollamaBaseUrl: ""      # e.g. http://my-ollama:11434    (used when ollama.enabled=false)
-    # Extraction LLM, OpenAI-format. Normally the in-cluster LiteLLM gateway.
-    extractionBaseUrl: ""  # e.g. https://api.openai.com/v1 (used when litellm.enabled=false)
+    # Extraction LLM, OpenAI-format. Leave empty to default to the bundled
+    # in-cluster Ollama (when ollama.enabled); set to point extraction at a
+    # cloud / external OpenAI-format server. Always wins over the Ollama default.
+    extractionBaseUrl: ""  # e.g. https://api.openai.com/v1
 
 # =============================================================================
 # MCP server (FR-RET-1)
@@ -100,6 +111,18 @@ mcp:
 
 # =============================================================================
 # Ingestion daemon (FR-ING-*) — Claude Code watcher + LiteLLM callback drain.
+#
+# Set ingest.enabled=false to NOT run ingest in the cluster — e.g. when you run
+# the Claude Code transcript watcher OFF-cluster (on your main PC, where the
+# transcripts live) pointed at the cluster FalkorDB. The off-cluster process is
+# the standalone `mnemozine-ingest` script (or `mnemozine` with only
+# MNEMOZINE_RUN__INGEST=true), with:
+#   MNEMOZINE_FALKORDB__URL=redis://<node-or-lb-host>:<port>   # expose FalkorDB:
+#                                                              # see falkordb.service.type
+#                                                              # / falkordb.externalAccess
+#   MNEMOZINE_EMBEDDING__BASE_URL=http://<ollama-host>:11434
+#   MNEMOZINE_EXTRACTION__BASE_URL=http://<ollama-host>:11434/v1
+# The rest of the stack (mcp / maintenance / web) keeps running in-cluster.
 # =============================================================================
 ingest:
   enabled: true
@@ -192,8 +215,29 @@ falkordb:
     storageClass: ""        # "" = cluster default
     accessModes: ["ReadWriteOnce"]
   service:
+    # ClusterIP is fine for the all-in-cluster default. To let an INGEST process
+    # you run OFF-cluster (e.g. on your main PC, with ingest.enabled=false here)
+    # reach the cluster FalkorDB, expose it: set type to NodePort or LoadBalancer
+    # (and optionally nodePort below). Then point the remote ingest at it with
+    #   MNEMOZINE_FALKORDB__URL=redis://<node-or-lb-host>:<port>
+    # See `externalAccess` below for a separate, dedicated remote-access Service
+    # that leaves this internal Service untouched.
     type: ClusterIP
     port: 6379
+    # Used only when type=NodePort. Leave empty to let k8s allocate one.
+    nodePort: ""
+  # Optional SECOND Service dedicated to off-cluster access (e.g. the main-PC
+  # ingest connecting to the cluster store). Rendered only when enabled, so the
+  # internal ClusterIP Service above is unaffected. Pick NodePort for a homelab
+  # (reachable on every node IP) or LoadBalancer if your cluster provisions one.
+  externalAccess:
+    enabled: false
+    type: NodePort          # NodePort | LoadBalancer
+    # Used only when type=NodePort. Leave empty to let k8s allocate one (30000-32767).
+    nodePort: ""
+    annotations: {}
+    # LoadBalancer source range allow-list (optional; LoadBalancer only).
+    loadBalancerSourceRanges: []
   resources:
     requests:
       cpu: 250m
@@ -265,16 +309,19 @@ ollama:
   affinity: {}
 
 # =============================================================================
-# Qwen — local OpenAI-format extraction LLM (PRD §5.5 / OQ5).
+# Qwen — local OpenAI-format extraction LLM (PRD §5.5 / OQ5). OPTIONAL.
 #
-# Enabled by default so the bundled stack runs end-to-end on local models with
-# no cloud dependency (PRD §3 exception). The default image is a llama.cpp
-# OpenAI-compatible server; provide a GGUF model at `modelPath` (mounted into the
-# models PVC) before first use. To use a cloud / externally-managed extraction
-# endpoint instead, set qwen.enabled=false and litellm.upstream.apiBase.
+# DEFAULT OFF (consolidation): the bundled stack now runs extraction through the
+# same in-cluster Ollama that serves embeddings, via its OpenAI-compatible /v1
+# endpoint (set tuning.extraction.model to an openai/<tag>, e.g. openai/qwen2.5;
+# pull that tag into the Ollama models volume). The dedicated llama.cpp + LiteLLM
+# path below is kept as an optional
+# alternative — enable qwen + litellm together to front a standalone extraction
+# server. The default image is a llama.cpp OpenAI-compatible server; provide a
+# GGUF model at `modelPath` (mounted into the models PVC) before first use.
 # =============================================================================
 qwen:
-  enabled: true
+  enabled: false
   image:
     repository: ghcr.io/ggml-org/llama.cpp
     tag: server
@@ -316,10 +363,16 @@ qwen:
   affinity: {}
 
 # =============================================================================
-# LiteLLM — OpenAI-format gateway + logging callback (FR-ING-3).
+# LiteLLM — OpenAI-format gateway + logging callback (FR-ING-3). OPTIONAL.
+#
+# DEFAULT OFF (consolidation): extraction defaults to the bundled Ollama /v1
+# endpoint (see endpoints.extractionBaseUrl resolution), so no gateway is needed
+# for a fresh install. Enable this (typically together with qwen.enabled) when
+# you want a LiteLLM gateway in front of a dedicated extraction server / cloud
+# model — then extraction is wired to this gateway automatically.
 # =============================================================================
 litellm:
-  enabled: true
+  enabled: false
   image:
     repository: ghcr.io/berriai/litellm
     tag: main-stable
@@ -422,7 +475,14 @@ tuning:
     model: bge-m3                   # OQ3 embedding model
     dimensions: 1024
   extraction:
-    model: openai/qwen2.5           # §5.5 LiteLLM provider/model id
+    # LiteLLM provider/model id for extraction. Default targets the bundled
+    # in-cluster Ollama via its OpenAI-compatible /v1 endpoint, so the `openai/`
+    # prefix is REQUIRED ("qwen2.5" is the ollama tag — any pulled qwen tag works,
+    # e.g. openai/qwen2.5:7b). The `ollama/` LiteLLM provider would instead speak
+    # Ollama's NATIVE /api/* surface and 404 against the /v1 base_url, so do NOT
+    # use it here. When fronting a dedicated OpenAI-format server via the LiteLLM
+    # gateway (litellm.enabled=true), the same openai/<model> form applies.
+    model: openai/qwen2.5           # §5.5 LiteLLM provider/model id (Ollama /v1 default)
 
   logLevel: INFO
 

@@ -1,0 +1,62 @@
+# Mnemozine — SPLIT INGEST onto a DIFFERENT machine (PRD Deliverable #1).
+#
+# This is a STANDALONE compose with a SINGLE service: `mnemozine-ingest`. Run it
+# on a box that has the Claude Code transcripts (e.g. your laptop) and point it
+# at a REMOTE homelab store + model endpoints. It captures turns / tails JSONL
+# transcripts locally and writes memory to the central FalkorDB, embedding and
+# extracting via the central Ollama (and/or a remote extraction endpoint).
+#
+# It runs the standalone `mnemozine-ingest` console script (= one component,
+# mnemozine.app:run_ingest) — exactly equivalent to the all-in-one app started
+# with ONLY MNEMOZINE_RUN__INGEST=true.
+#
+# Usage (from the repo root, on the ingest machine):
+#   cp .env.example .env
+#   # then set the REMOTE endpoints in .env, e.g.:
+#   #   MNEMOZINE_FALKORDB__URL=redis://<homelab-host>:6379
+#   #   MNEMOZINE_EMBEDDING__BASE_URL=http://<homelab-host>:11434
+#   #   MNEMOZINE_EXTRACTION__BASE_URL=http://<homelab-host>:11434/v1
+#   #   MNEMOZINE_EXTRACTION__MODEL=openai/qwen2.5
+#   #   MNEMOZINE_EXTRACTION__API_KEY=not-needed
+#   docker compose -f deploy/docker-compose.ingest.yml up -d --build
+#
+# On the homelab itself, instead set MNEMOZINE_RUN__INGEST=false on the all-in-one
+# `mnemozine` service (deploy/docker-compose.yml) so this remote box owns ingest.
+#
+# Unlike the main stack, this file does NOT override the connection env under
+# `environment:` — the whole point is that the REMOTE endpoints come straight
+# from the repo-root .env (MNEMOZINE_FALKORDB__URL / EMBEDDING__BASE_URL /
+# EXTRACTION__*). Only the in-container transcript path is set here.
+
+x-mnemozine-image: &mnemozine-image
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: ${MNEMOZINE_IMAGE:-mnemozine:local}
+
+services:
+  # -------------------------------------------------------------------------
+  # Ingestion daemon — Claude Code watcher + hooks (FR-ING-*), pointed at a
+  # REMOTE store. Mounts the host ~/.claude read-only so the watcher can tail
+  # JSONL transcripts (FR-ING-2). Override the host path with
+  # HOST_CLAUDE_CONFIG_DIR (defaults to $HOME/.claude).
+  # -------------------------------------------------------------------------
+  mnemozine-ingest:
+    <<: *mnemozine-image
+    restart: unless-stopped
+    command: ["mnemozine-ingest"]
+    # Remote endpoints come from the repo-root .env (NOT overridden here).
+    env_file:
+      - ../.env
+    environment:
+      # Inside the container the transcripts live at /claude (mounted below).
+      MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR: /claude
+    volumes:
+      - ${HOST_CLAUDE_CONFIG_DIR:-${HOME}/.claude}:/claude:ro
+    healthcheck:
+      # No HTTP surface; liveness = the watcher process is still running.
+      test: ["CMD-SHELL", "pgrep -f mnemozine-ingest >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

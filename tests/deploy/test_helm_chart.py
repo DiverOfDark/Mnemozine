@@ -73,6 +73,35 @@ def test_values_expose_images_endpoints_and_tuning() -> None:
         assert k in values["endpoints"]["external"], f"endpoints.external.{k} missing"
 
 
+def test_values_consolidation_defaults() -> None:
+    """Compose-consolidation defaults: ingest on, qwen/litellm OFF (optional),
+    extraction model targets the bundled Ollama."""
+    values = _load_yaml(VALUES_FILE)
+    # Ingest runs in-cluster by default; can be turned off for off-cluster ingest.
+    assert values["ingest"]["enabled"] is True
+    # Qwen + LiteLLM are now optional and default OFF (extraction via Ollama).
+    assert values["qwen"]["enabled"] is False
+    assert values["litellm"]["enabled"] is False
+    # The bundled extraction path runs on Ollama's OpenAI-compatible /v1 endpoint
+    # -> the LiteLLM id must be the `openai/` provider form. (LiteLLM's `ollama/`
+    # provider speaks Ollama's native /api/* surface and 404s against /v1 —
+    # verified live; the openai/ form treats /v1 as a plain OpenAI server.)
+    assert values["tuning"]["extraction"]["model"].startswith("openai/")
+    # Ollama stays enabled so it can serve BOTH embeddings and extraction.
+    assert values["ollama"]["enabled"] is True
+
+
+def test_values_expose_falkordb_external_access_option() -> None:
+    """A documented way to reach the cluster FalkorDB from an off-cluster ingest:
+    either flip falkordb.service.type or enable the dedicated external Service."""
+    values = _load_yaml(VALUES_FILE)
+    svc = values["falkordb"]["service"]
+    assert "type" in svc, "falkordb.service.type must be parameterized"
+    ext = values["falkordb"]["externalAccess"]
+    assert ext["enabled"] is False, "external access must default off"
+    assert ext["type"] in ("NodePort", "LoadBalancer")
+
+
 def test_values_cover_all_section_6_6_tuning_params() -> None:
     """PRD §6.6 tuning params must all be parameterized in values.tuning."""
     values = _load_yaml(VALUES_FILE)
@@ -195,10 +224,14 @@ def test_helm_template_default_renders_all_workloads() -> None:
         kinds[d["kind"]] = kinds.get(d["kind"], 0) + 1
     # FalkorDB is a StatefulSet (persistence); the rest are Deployments.
     assert kinds.get("StatefulSet", 0) == 1, "FalkorDB should be a StatefulSet"
+    # Consolidated default: ollama + mcp + ingest + maintenance Deployments
+    # (qwen/litellm are optional and OFF by default).
     assert kinds.get("Deployment", 0) >= 4, "expected the mnemozine + dependency Deployments"
     assert kinds.get("ConfigMap", 0) >= 1
     assert kinds.get("Secret", 0) >= 1
-    assert kinds.get("Service", 0) >= 4
+    # Core Services: falkordb + ollama + mcp (qwen/litellm Services only render
+    # when those optional backends are enabled).
+    assert kinds.get("Service", 0) >= 3
 
 
 @pytest.mark.skipif(HELM is None, reason="helm binary not available")
@@ -291,6 +324,125 @@ def test_helm_template_external_endpoints() -> None:
             assert data["MNEMOZINE_EXTRACTION__BASE_URL"] == "https://api.openai.com/v1"
             return
     pytest.fail("external endpoints not rendered")
+
+
+def _named_docs(out: str) -> dict[str, dict]:
+    """Map metadata.name -> rendered doc (last wins) for quick name lookups."""
+    docs: dict[str, dict] = {}
+    for d in yaml.safe_load_all(out):
+        if d and isinstance(d, dict) and "metadata" in d:
+            name = d["metadata"].get("name")
+            if name:
+                docs[f"{d.get('kind')}/{name}"] = d
+    return docs
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_extraction_defaults_to_ollama() -> None:
+    """Default (no overrides): extraction runs on the bundled in-cluster Ollama
+    OpenAI-compatible /v1 endpoint with an `openai/`-prefixed model id, and the
+    optional qwen/litellm workloads are NOT rendered."""
+    out = _helm_template()
+    cfg = None
+    for d in yaml.safe_load_all(out):
+        if d and d.get("kind") == "ConfigMap" and "MNEMOZINE_EXTRACTION__BASE_URL" in d.get(
+            "data", {}
+        ):
+            cfg = d
+            break
+    assert cfg is not None, "shared ConfigMap with extraction env not rendered"
+    data = cfg["data"]
+    base = data["MNEMOZINE_EXTRACTION__BASE_URL"]
+    assert "ollama" in base, f"extraction should default to the Ollama service: {base}"
+    assert base.endswith("/v1"), "Ollama OpenAI-compatible endpoint needs the /v1 suffix"
+    # Embeddings live on the same Ollama service (without /v1).
+    assert "ollama" in data["MNEMOZINE_EMBEDDING__BASE_URL"]
+    # The openai/ provider form hits Ollama's /v1 OpenAI path (ollama/ 404s there).
+    assert data["MNEMOZINE_EXTRACTION__MODEL"].startswith("openai/")
+    # qwen / litellm are optional and off by default -> no such workloads/services.
+    names = _named_docs(out)
+    assert not any("-qwen" in k for k in names), "qwen must not render by default"
+    assert not any("-litellm" in k for k in names), "litellm must not render by default"
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_litellm_optional_reenable() -> None:
+    """Enabling qwen+litellm restores the gateway path: extraction routes through
+    the in-cluster LiteLLM Service and the workloads render again."""
+    out = _helm_template("qwen.enabled=true", "litellm.enabled=true")
+    names = _named_docs(out)
+    assert any("Deployment/" in k and k.endswith("-litellm") for k in names)
+    assert any("Deployment/" in k and k.endswith("-qwen") for k in names)
+    for d in yaml.safe_load_all(out):
+        if d and d.get("kind") == "ConfigMap" and "MNEMOZINE_EXTRACTION__BASE_URL" in d.get(
+            "data", {}
+        ):
+            assert "litellm" in d["data"]["MNEMOZINE_EXTRACTION__BASE_URL"]
+            return
+    pytest.fail("extraction endpoint not rendered with litellm enabled")
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_ingest_enabled_gating() -> None:
+    """ingest.enabled gates the ingest Deployment so it can run OFF-cluster."""
+    # Default: ingest Deployment present.
+    on = _named_docs(_helm_template())
+    assert any(
+        k.startswith("Deployment/") and k.endswith("-ingest") for k in on
+    ), "ingest Deployment should render by default"
+    # Disabled: ingest Deployment gone, but the rest of the stack stays.
+    off = _named_docs(_helm_template("ingest.enabled=false"))
+    assert not any(
+        k.startswith("Deployment/") and k.endswith("-ingest") for k in off
+    ), "ingest.enabled=false must drop the ingest Deployment"
+    # mcp + maintenance remain separate workloads (k8s isolation, no all-in-one).
+    assert any(k.startswith("Deployment/") and k.endswith("-mcp") for k in off)
+    assert any(k.startswith("Deployment/") and k.endswith("-maintenance") for k in off)
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_falkordb_external_access_service() -> None:
+    """A remote (main-PC) ingest can reach the cluster FalkorDB via a dedicated
+    external Service rendered when falkordb.externalAccess.enabled=true, leaving
+    the internal ClusterIP Service intact."""
+    out = _helm_template(
+        "falkordb.externalAccess.enabled=true",
+        "falkordb.externalAccess.type=NodePort",
+        "falkordb.externalAccess.nodePort=31637",
+    )
+    falkordb_services = [
+        d
+        for d in yaml.safe_load_all(out)
+        if d and d.get("kind") == "Service" and "falkordb" in d["metadata"]["name"]
+    ]
+    # Internal ClusterIP Service + the dedicated external Service.
+    types = {d["metadata"]["name"]: d["spec"]["type"] for d in falkordb_services}
+    assert any(t == "ClusterIP" for t in types.values()), "internal Service must remain"
+    ext = next(
+        (d for d in falkordb_services if d["metadata"]["name"].endswith("-external")), None
+    )
+    assert ext is not None, "external FalkorDB Service not rendered"
+    assert ext["spec"]["type"] == "NodePort"
+    assert ext["spec"]["ports"][0]["nodePort"] == 31637
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_falkordb_nodeport_on_internal_service() -> None:
+    """The documented simpler option: just flip the internal Service to NodePort."""
+    out = _helm_template(
+        "falkordb.service.type=NodePort",
+        "falkordb.service.nodePort=30637",
+    )
+    for d in yaml.safe_load_all(out):
+        if (
+            d
+            and d.get("kind") == "Service"
+            and d["metadata"]["name"].endswith("-falkordb")
+        ):
+            assert d["spec"]["type"] == "NodePort"
+            assert d["spec"]["ports"][0]["nodePort"] == 30637
+            return
+    pytest.fail("falkordb NodePort Service not rendered")
 
 
 @pytest.mark.skipif(HELM is None, reason="helm binary not available")

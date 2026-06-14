@@ -410,6 +410,48 @@ class WebSettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Component run toggles (the all-in-one ``mnemozine`` entrypoint)
+# ---------------------------------------------------------------------------
+
+
+class RunSettings(BaseModel):
+    """Which components the all-in-one ``mnemozine`` entrypoint starts.
+
+    The ``mnemozine`` console script (``mnemozine.app:run_all``) builds the
+    :class:`~mnemozine.app.Container` **once** and concurrently runs every
+    *enabled* component under one event loop, so a default docker-compose collapses
+    to ~3 containers (app + FalkorDB + Ollama). Each flag is independently
+    toggleable so a component can still be split onto another machine: e.g.
+    ``MNEMOZINE_RUN__INGEST=true`` with the others ``false`` runs **only** the
+    ingest loop — equivalent to the standalone ``mnemozine-ingest`` script — pointed
+    at a remote ``MNEMOZINE_FALKORDB__URL`` plus remote embedding/extraction
+    endpoints. All default ``True`` (the single-box all-in-one default).
+
+    When both ``web`` and ``mcp`` are enabled, ``run_all`` serves the WebUI and the
+    MCP streamable-http app from **one** port (``web.port``, default 8765) by
+    mounting the MCP ASGI app under the FastAPI app at ``/mcp`` — which also resolves
+    the historical web/MCP 8765 port clash. A disabled component never starts.
+    """
+
+    mcp: bool = Field(
+        default=True,
+        description="Run the MCP server (FR-RET-1) in the all-in-one process.",
+    )
+    ingest: bool = Field(
+        default=True,
+        description="Run the ingest loop (FR-ING-*) in the all-in-one process.",
+    )
+    maintenance: bool = Field(
+        default=True,
+        description="Run the maintenance scheduler (FR-MNT-5) in the all-in-one process.",
+    )
+    web: bool = Field(
+        default=True,
+        description="Run the operator-console WebUI (WEBUI PRD) in the all-in-one process.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level settings
 # ---------------------------------------------------------------------------
 
@@ -439,6 +481,7 @@ class Settings(BaseSettings):
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     web: WebSettings = Field(default_factory=WebSettings)
+    run: RunSettings = Field(default_factory=RunSettings)
 
     # MCP server bind settings (FR-RET-1).
     mcp_host: str = Field(default="127.0.0.1", description="MCP server bind host.")

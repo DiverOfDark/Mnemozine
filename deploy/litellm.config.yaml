@@ -1,13 +1,20 @@
-# LiteLLM gateway config (FR-ING-3).
+# LiteLLM gateway config (FR-ING-3) — OPTIONAL, used by the `gateway` profile.
+#
+# The default compose stack serves extraction directly from Ollama, so this
+# gateway is NOT required for normal operation. Start it only for gateway/Hermes
+# INGESTION capture:
+#   docker compose -f deploy/docker-compose.yml --profile gateway --profile qwen-llamacpp up -d
 #
 # The gateway fronts the operator's repointable agents behind one OpenAI-format
-# base_url and proxies to the local Qwen extraction LLM (PRD §5.5). A custom
-# logging callback (mnemozine's ingestion layer) captures each turn and emits
-# common-schema events into the ingestion path — that callback is registered at
-# runtime by the ingestion service / app wiring, not here.
+# base_url and proxies to the upstream extraction LLM (the llama.cpp `qwen`
+# service by default; point QWEN_API_BASE at http://ollama:11434/v1 to front the
+# ollama-served model instead). A custom logging callback (mnemozine's ingestion
+# layer) captures each turn and emits common-schema events into the ingestion
+# path — that callback is registered at runtime by the ingestion service / app
+# wiring, not here.
 #
-# To use a CLOUD extraction model instead of local Qwen, replace the
-# `api_base`/`api_key`/`model` below (or add another model entry) and repoint
+# To use a CLOUD extraction model instead, replace the `api_base`/`api_key`/
+# `model` below (or add another model entry) and repoint
 # MNEMOZINE_EXTRACTION__MODEL at it. The system still runs end-to-end on local
 # models with no cloud dependency (PRD §3 exception).
 

@@ -116,14 +116,29 @@ http://{{ include "mnemozine.ollama.fullname" . }}:{{ .Values.ollama.service.por
 {{- end -}}
 
 {{/*
-Extraction LLM base_url: the in-cluster LiteLLM gateway when enabled, else the
-external override.
+Extraction LLM base_url. Resolution order:
+  1. The in-cluster LiteLLM gateway when litellm.enabled (explicit gateway path).
+  2. An explicit endpoints.external.extractionBaseUrl override (cloud / external).
+  3. The bundled in-cluster Ollama service's OpenAI-compatible /v1 endpoint when
+     ollama.enabled — the default for the consolidated stack: extraction runs on
+     the same Ollama that serves embeddings (use an `openai/<tag>` extraction
+     model, e.g. tuning.extraction.model=openai/qwen2.5 — the `openai/` LiteLLM
+     provider hits the /v1 OpenAI path; `ollama/` would 404 on /api/*). The
+     trailing /v1 is required (Ollama's OpenAI-compatible surface).
+A non-empty endpoints.external.extractionBaseUrl always wins over the Ollama
+default, so you can still point extraction at a cloud endpoint with everything
+else bundled. If litellm and ollama are both disabled and no external URL is
+given, rendering fails with a clear message.
 */}}
 {{- define "mnemozine.extractionBaseUrl" -}}
 {{- if .Values.litellm.enabled -}}
 http://{{ include "mnemozine.litellm.fullname" . }}:{{ .Values.litellm.service.port }}/v1
+{{- else if .Values.endpoints.external.extractionBaseUrl -}}
+{{- .Values.endpoints.external.extractionBaseUrl -}}
+{{- else if .Values.ollama.enabled -}}
+http://{{ include "mnemozine.ollama.fullname" . }}:{{ .Values.ollama.service.port }}/v1
 {{- else -}}
-{{- required "endpoints.external.extractionBaseUrl is required when litellm.enabled=false" .Values.endpoints.external.extractionBaseUrl -}}
+{{- required "endpoints.external.extractionBaseUrl is required when both litellm.enabled=false and ollama.enabled=false" .Values.endpoints.external.extractionBaseUrl -}}
 {{- end -}}
 {{- end -}}
 

@@ -99,6 +99,7 @@ def build_mcp_server(
     retriever: ScopedRetriever,
     *,
     settings: Settings | None = None,
+    streamable_http_path: str | None = None,
 ) -> Any:
     """Build the FastMCP server exposing the ``recall`` tool (FR-RET-1/4).
 
@@ -120,6 +121,13 @@ def build_mcp_server(
     from mcp.server.fastmcp import FastMCP
 
     cfg = settings or get_settings()
+    # When mounting the streamable-HTTP app into another ASGI app (the all-in-one
+    # ``run_all`` path), the sub-app's own route should be at "/" and the *mount*
+    # supplies the "/mcp" prefix — otherwise the route lands at "/mcp/mcp". For the
+    # standalone HTTP server the default "/mcp" is correct, so this is opt-in.
+    extra: dict[str, Any] = {}
+    if streamable_http_path is not None:
+        extra["streamable_http_path"] = streamable_http_path
     server = FastMCP(
         name="mnemozine",
         instructions=(
@@ -131,6 +139,7 @@ def build_mcp_server(
         ),
         host=cfg.mcp_host,
         port=cfg.mcp_port,
+        **extra,
     )
 
     @server.tool(
@@ -198,6 +207,37 @@ def build_mcp_server(
     return server
 
 
+def build_mcp_http_app(
+    retriever: ScopedRetriever,
+    *,
+    settings: Settings | None = None,
+    streamable_http_path: str | None = None,
+) -> tuple[Any, Any]:
+    """Build the FastMCP server + its streamable-HTTP ASGI app for mounting.
+
+    Returns ``(server, asgi_app)`` where ``asgi_app`` is the Starlette app
+    produced by ``FastMCP.streamable_http_app()``. Its single route is the server's
+    ``streamable_http_path`` (``/mcp`` by default for the standalone HTTP server;
+    pass ``streamable_http_path="/"`` so the route is at the sub-app root and the
+    parent ``Mount("/mcp", ...)`` supplies the prefix — the seam the all-in-one
+    ``run_all`` uses to serve the WebUI + MCP from one port, resolving the 8765
+    web/MCP clash).
+
+    Calling ``streamable_http_app()`` also lazily constructs the server's
+    ``StreamableHTTPSessionManager``; that manager must be *run* for the transport
+    to work. When mounting into another app, the caller must drive
+    ``server.session_manager.run()`` for the lifetime of the parent app (see
+    :func:`mnemozine.app._build_web_app`), because the mounted sub-app's own
+    lifespan is not invoked by a Starlette ``Mount``.
+    """
+
+    server = build_mcp_server(
+        retriever, settings=settings, streamable_http_path=streamable_http_path
+    )
+    asgi_app = server.streamable_http_app()
+    return server, asgi_app
+
+
 def run(
     retriever: ScopedRetriever,
     *,
@@ -219,6 +259,7 @@ def run(
 __all__ = [
     "RecalledMemory",
     "build_mcp_server",
+    "build_mcp_http_app",
     "run",
     "detect_context",
 ]
