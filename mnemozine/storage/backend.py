@@ -46,6 +46,7 @@ from mnemozine.interfaces import (
     WriteDecision,
     WriteResult,
 )
+from mnemozine.migrations import CURRENT_DATA_VERSION, record_data_version
 from mnemozine.schema.models import (
     DEFAULT_CATEGORY,
     Edge,
@@ -259,6 +260,9 @@ class GraphitiStorageBackend:
             "tier": memory.tier.value,
             "last_accessed": _to_iso(memory.last_accessed),
             "access_count": int(memory.access_count),
+            # Data-versioning (mnemozine.migrations): stamp the data-model version
+            # at write time so min_data_version()/migrations can select on it.
+            "data_version": int(memory.data_version),
             "embedding": embedding,
         }
 
@@ -289,6 +293,10 @@ class GraphitiStorageBackend:
             tier=Tier(props.get("tier", Tier.HOT.value)),
             last_accessed=_from_iso(props.get("last_accessed")),
             access_count=int(props.get("access_count", 0)),
+            # Data-versioning: legacy nodes written before this feature have no
+            # `data_version` property; record_data_version() maps that to 0 so a
+            # migration always picks them up.
+            data_version=record_data_version(props.get("data_version")),
         )
 
     async def _node_to_memory(self, node: Any) -> MemoryUnit:
@@ -981,6 +989,8 @@ class GraphitiStorageBackend:
             "raw_path": chunk.raw_path,
             "memory_ids": list(chunk.memory_ids),
             "ingested_at": _to_iso(chunk.ingested_at),
+            # Data-versioning (mnemozine.migrations): stamped at write/re-extract.
+            "data_version": int(chunk.data_version),
         }
 
     @staticmethod
@@ -1001,6 +1011,8 @@ class GraphitiStorageBackend:
             raw_path=props.get("raw_path"),
             memory_ids=list(props.get("memory_ids") or []),
             ingested_at=_from_iso(props.get("ingested_at")) or datetime.now(UTC),
+            # Legacy chunks (pre-feature) have no `data_version`; map to 0.
+            data_version=record_data_version(props.get("data_version")),
         )
 
     async def persist_raw_chunk(self, chunk: RawChunk) -> RawChunk:
@@ -1097,6 +1109,13 @@ class GraphitiStorageBackend:
             if callable(extract_text):
                 for memory in await extract_text(chunk.content, scope=chunk.scope):
                     await self.upsert_memory(memory)
+            # DATA-VERSION STAMP CONTRACT (mnemozine.migrations): re-stamp the
+            # re-processed chunk to the current version so a re-extract migration
+            # is idempotent. Fresh memories are stamped via their field default in
+            # upsert_memory's write path.
+            if record_data_version(chunk.data_version) != CURRENT_DATA_VERSION:
+                chunk.data_version = CURRENT_DATA_VERSION
+                await self.persist_raw_chunk(chunk)
             report.re_extracted += 1
         return report
 
@@ -1122,6 +1141,12 @@ class GraphitiStorageBackend:
             raise KeyError(memory_id)
         sets: list[str] = []
         params: dict[str, Any] = {"id": memory_id}
+        # DATA-VERSION STAMP CONTRACT (mnemozine.migrations): a reclassify always
+        # re-stamps the touched memory up to the current version, so the cheap
+        # migration path is idempotent (a re-run finds nothing below the version).
+        memory.data_version = CURRENT_DATA_VERSION
+        sets.append("m.data_version = $data_version")
+        params["data_version"] = CURRENT_DATA_VERSION
         if scope is not None:
             memory.scope = scope
             sets.append("m.scope = $scope")
@@ -1180,6 +1205,122 @@ class GraphitiStorageBackend:
             "SET m.category = $tgt RETURN count(m) AS n",
             src=src,
             tgt=tgt,
+        )
+        if not rows:
+            return 0
+        return int(rows[0][0])
+
+    # -- data-versioning / in-place migration (mnemozine.migrations) ----------
+
+    async def min_data_version(self) -> int:
+        """Lowest ``data_version`` across all stored memories AND raw chunks.
+
+        Drives the migration runner / startup hook (compared against
+        :data:`~mnemozine.migrations.CURRENT_DATA_VERSION`). Legacy nodes with no
+        ``data_version`` property are coalesced to 0 (``coalesce(x.data_version,
+        0)``), so any unstamped/version-0 record makes this return 0. An empty
+        store returns ``CURRENT_DATA_VERSION`` (nothing to migrate).
+        """
+
+        mem_rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "RETURN min(coalesce(m.data_version, 0)) AS v"
+        )
+        chunk_rows = await self._query(
+            f"MATCH (c:{RAW_CHUNK_LABEL}) "
+            "RETURN min(coalesce(c.data_version, 0)) AS v"
+        )
+        versions: list[int] = []
+        for rows in (mem_rows, chunk_rows):
+            if rows and rows[0] and rows[0][0] is not None:
+                versions.append(record_data_version(rows[0][0]))
+        if not versions:
+            return CURRENT_DATA_VERSION
+        return min(versions)
+
+    async def iter_memories_below_version(
+        self, version: int
+    ) -> AsyncIterator[MemoryUnit]:
+        """Stream memory units whose ``data_version`` is below ``version``.
+
+        The selection seam a :class:`~mnemozine.migrations.Migration` uses to find
+        the records it must touch (unstamped/legacy nodes count as 0 via
+        ``coalesce``). Async generator: iterate, do not ``await``.
+        """
+
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "WHERE coalesce(m.data_version, 0) < $version RETURN m",
+            version=int(version),
+        )
+        for row in rows:
+            yield self._row_to_memory(self._props(row[0]))
+
+    async def set_data_version(self, ids: Sequence[str], version: int) -> int:
+        """Stamp ``data_version = version`` onto the given memory ids in place.
+
+        The explicit stamp a migration uses after migrating a batch of MEMORIES (the
+        implicit paths are :meth:`reclassify_memory` /
+        :meth:`re_extract_from_raw_chunks`; the raw-chunk analogue is
+        :meth:`set_chunk_data_version`). Idempotent; returns the number of records
+        updated.
+        """
+
+        id_list = list(ids)
+        if not id_list:
+            return 0
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) WHERE m.id IN $ids "
+            "SET m.data_version = $version RETURN count(m) AS n",
+            ids=id_list,
+            version=int(version),
+        )
+        if not rows:
+            return 0
+        return int(rows[0][0])
+
+    async def iter_chunks_below_version(
+        self, version: int
+    ) -> AsyncIterator[RawChunk]:
+        """Stream raw chunks whose ``data_version`` is below ``version``.
+
+        The raw-chunk analogue of :meth:`iter_memories_below_version`: the selection
+        seam a migration uses to find the stale chunks it must re-stamp (legacy
+        nodes count as 0 via ``coalesce``). Because :meth:`min_data_version` mins
+        over the chunk tier too, even the cheap reclassify path must select and
+        stamp these (via :meth:`set_chunk_data_version`). Async generator: iterate,
+        do not ``await``.
+        """
+
+        rows = await self._query(
+            f"MATCH (c:{RAW_CHUNK_LABEL}) "
+            "WHERE coalesce(c.data_version, 0) < $version RETURN c",
+            version=int(version),
+        )
+        for row in rows:
+            yield self._row_to_raw_chunk(self._props(row[0]))
+
+    async def set_chunk_data_version(
+        self, content_hashes: Sequence[str], version: int
+    ) -> int:
+        """Stamp ``data_version = version`` onto the given raw chunks in place.
+
+        The raw-chunk analogue of :meth:`set_data_version`: the explicit stamp a
+        cheap migration uses to advance the chunks it selected via
+        :meth:`iter_chunks_below_version` WITHOUT re-extracting them. Chunks are
+        keyed by their FR-ING-5 ``content_hash`` (the implicit path is
+        :meth:`re_extract_from_raw_chunks`). Idempotent; returns the number of
+        chunks updated.
+        """
+
+        hash_list = list(content_hashes)
+        if not hash_list:
+            return 0
+        rows = await self._query(
+            f"MATCH (c:{RAW_CHUNK_LABEL}) WHERE c.content_hash IN $hashes "
+            "SET c.data_version = $version RETURN count(c) AS n",
+            hashes=hash_list,
+            version=int(version),
         )
         if not rows:
             return 0

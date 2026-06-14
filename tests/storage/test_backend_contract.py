@@ -19,6 +19,7 @@ import pytest
 
 from mnemozine.config import MaintenanceSettings, RetrievalSettings
 from mnemozine.interfaces import StorageBackend, WriteDecision
+from mnemozine.migrations import CURRENT_DATA_VERSION, UNSTAMPED_DATA_VERSION
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
     Edge,
@@ -817,3 +818,195 @@ async def test_merge_categories_relabels_and_is_idempotent() -> None:
     assert "gotchas" not in counts
     # Idempotent: re-running relabels nothing.
     assert await store.merge_categories("gotchas", "gotcha") == 0
+
+
+# ---------------------------------------------------------------------------
+# Data-versioning / in-place migration (mnemozine.migrations)
+# ---------------------------------------------------------------------------
+
+
+async def test_memory_write_stamps_current_data_version() -> None:
+    """A memory write persists data_version (default CURRENT) and reads it back."""
+
+    store = _backend()
+    m = _memory(content="versioned fact", entities=["rust"])
+    await store.upsert_memory(m)
+
+    # Persisted as a scalar prop on the node...
+    stored = store._client.driver.memories[m.id]  # type: ignore[attr-defined]
+    assert stored["data_version"] == CURRENT_DATA_VERSION
+    # ...and read back through the full rehydrate path.
+    reread = await store.get_memory(m.id)
+    assert reread is not None
+    assert reread.data_version == CURRENT_DATA_VERSION
+
+
+async def test_raw_chunk_write_stamps_current_data_version() -> None:
+    """A raw-chunk write persists data_version (default CURRENT) and reads it back."""
+
+    store = _backend()
+    await store.persist_raw_chunk(_raw_chunk(content_hash="v1"))
+
+    stored = store._client.driver.raw_chunks["v1"]  # type: ignore[attr-defined]
+    assert stored["data_version"] == CURRENT_DATA_VERSION
+    read = [c async for c in store.iter_raw_chunks()]
+    assert read[0].data_version == CURRENT_DATA_VERSION
+
+
+async def test_legacy_record_read_back_as_version_zero() -> None:
+    """A node written with no data_version prop reads back as 0 (legacy/unstamped)."""
+
+    store = _backend()
+    m = _memory(content="legacy fact", entities=["rust"])
+    await store.upsert_memory(m)
+    # Simulate a pre-feature node: strip the property the migration introduced.
+    del store._client.driver.memories[m.id]["data_version"]  # type: ignore[attr-defined]
+
+    reread = await store.get_memory(m.id)
+    assert reread is not None
+    assert reread.data_version == UNSTAMPED_DATA_VERSION == 0
+
+
+async def test_min_data_version_empty_store_returns_current() -> None:
+    """An empty store has nothing to migrate -> min is CURRENT_DATA_VERSION."""
+
+    store = _backend()
+    assert await store.min_data_version() == CURRENT_DATA_VERSION
+
+
+async def test_min_data_version_mins_over_both_tiers() -> None:
+    """min_data_version takes the min across BOTH memories and raw chunks."""
+
+    store = _backend()
+    m = _memory(content="a fact", entities=["rust"])
+    await store.upsert_memory(m)
+    await store.persist_raw_chunk(_raw_chunk(content_hash="c1"))
+    # Both freshly written at CURRENT.
+    assert await store.min_data_version() == CURRENT_DATA_VERSION
+
+    # A single unstamped/legacy memory drags the whole-store min down to 0.
+    del store._client.driver.memories[m.id]["data_version"]  # type: ignore[attr-defined]
+    assert await store.min_data_version() == 0
+
+
+async def test_min_data_version_legacy_chunk_pulls_min_to_zero() -> None:
+    """Any unstamped raw chunk makes min_data_version 0 (the chunk tier counts)."""
+
+    store = _backend()
+    await store.upsert_memory(_memory(content="ok", entities=["rust"]))
+    await store.persist_raw_chunk(_raw_chunk(content_hash="legacy"))
+    # Strip the chunk's version prop -> coalesces to 0.
+    del store._client.driver.raw_chunks["legacy"]["data_version"]  # type: ignore[attr-defined]
+    assert await store.min_data_version() == 0
+
+
+async def test_iter_memories_below_version_selects_only_stale() -> None:
+    """iter_memories_below_version yields exactly the memories under the target."""
+
+    store = _backend()
+    stale = _memory(content="stale", entities=["rust"], mid="stale-id")
+    current = _memory(content="current", entities=["go"], mid="current-id")
+    await store.upsert_memory(stale)
+    await store.upsert_memory(current)
+    # Demote one to a legacy/unstamped record (coalesces to 0).
+    del store._client.driver.memories["stale-id"]["data_version"]  # type: ignore[attr-defined]
+
+    below = [m.id async for m in store.iter_memories_below_version(CURRENT_DATA_VERSION)]
+    assert below == ["stale-id"]
+    # Nothing is below 0.
+    assert [m async for m in store.iter_memories_below_version(0)] == []
+
+
+async def test_set_data_version_stamps_and_is_idempotent() -> None:
+    """set_data_version stamps the given ids, returns the count, and is idempotent."""
+
+    store = _backend()
+    a = _memory(content="a", entities=["rust"], mid="a")
+    b = _memory(content="b", entities=["go"], mid="b")
+    await store.upsert_memory(a)
+    await store.upsert_memory(b)
+    # Pretend they are legacy/unstamped.
+    del store._client.driver.memories["a"]["data_version"]  # type: ignore[attr-defined]
+    del store._client.driver.memories["b"]["data_version"]  # type: ignore[attr-defined]
+
+    n = await store.set_data_version(["a", "b"], CURRENT_DATA_VERSION)
+    assert n == 2
+    assert store._client.driver.memories["a"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+    assert store._client.driver.memories["b"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+    # After stamping, none remain below the target.
+    assert [m async for m in store.iter_memories_below_version(CURRENT_DATA_VERSION)] == []
+    # Empty id list is a no-op.
+    assert await store.set_data_version([], CURRENT_DATA_VERSION) == 0
+
+
+async def test_iter_chunks_below_version_and_set_chunk_data_version() -> None:
+    """The raw-chunk tier has the symmetric below/set seam (cheap-migration path)."""
+
+    store = _backend()
+    await store.persist_raw_chunk(_raw_chunk(content_hash="stale"))
+    await store.persist_raw_chunk(_raw_chunk(content_hash="fresh"))
+    # Demote one chunk to legacy/unstamped.
+    del store._client.driver.raw_chunks["stale"]["data_version"]  # type: ignore[attr-defined]
+
+    below = [c.content_hash async for c in store.iter_chunks_below_version(CURRENT_DATA_VERSION)]
+    assert below == ["stale"]
+
+    n = await store.set_chunk_data_version(["stale"], CURRENT_DATA_VERSION)
+    assert n == 1
+    assert store._client.driver.raw_chunks["stale"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+    # Now nothing is below the target, so min reaches CURRENT across both tiers.
+    assert [c async for c in store.iter_chunks_below_version(CURRENT_DATA_VERSION)] == []
+    assert await store.min_data_version() == CURRENT_DATA_VERSION
+    # Empty hash list is a no-op.
+    assert await store.set_chunk_data_version([], CURRENT_DATA_VERSION) == 0
+
+
+async def test_reclassify_memory_bumps_data_version() -> None:
+    """reclassify_memory re-stamps the touched memory to CURRENT_DATA_VERSION."""
+
+    store = _backend()
+    m = _memory(content="will be reclassified", entities=["rust"], mid="rc")
+    await store.upsert_memory(m)
+    # Demote to a legacy/unstamped record so the bump is observable.
+    del store._client.driver.memories["rc"]["data_version"]  # type: ignore[attr-defined]
+    assert (await store.get_memory("rc")).data_version == 0  # type: ignore[union-attr]
+
+    updated = await store.reclassify_memory("rc", category="decision")
+    assert updated.data_version == CURRENT_DATA_VERSION
+    # Persisted: the stamp survives the write and a fresh read.
+    assert store._client.driver.memories["rc"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+    reread = await store.get_memory("rc")
+    assert reread is not None and reread.data_version == CURRENT_DATA_VERSION
+    # A reclassify that changes nothing else still bumps the version.
+    del store._client.driver.memories["rc"]["data_version"]  # type: ignore[attr-defined]
+    again = await store.reclassify_memory("rc")
+    assert again.data_version == CURRENT_DATA_VERSION
+    assert store._client.driver.memories["rc"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+
+
+async def test_re_extract_from_raw_chunks_bumps_chunk_data_version() -> None:
+    """re_extract_from_raw_chunks re-stamps each re-processed chunk to CURRENT."""
+
+    store = _backend()
+    await store.persist_raw_chunk(
+        _raw_chunk(content_hash="rx", scope=Scope.project("Mnemozine"))
+    )
+    # Demote to a legacy/unstamped chunk.
+    del store._client.driver.raw_chunks["rx"]["data_version"]  # type: ignore[attr-defined]
+
+    class _NoopExtractor:
+        async def extract(self, chunk):  # type: ignore[no-untyped-def]
+            return []
+
+        async def classify(self, statement, context):  # type: ignore[no-untyped-def]
+            raise NotImplementedError
+
+    report = await store.re_extract_from_raw_chunks(
+        _NoopExtractor(),  # type: ignore[arg-type]
+        scope=Scope.project("Mnemozine"),
+    )
+    assert report.re_extracted == 1
+    # The chunk was re-stamped up to the current version.
+    assert store._client.driver.raw_chunks["rx"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
+    reread = [c async for c in store.iter_raw_chunks()]
+    assert reread[0].data_version == CURRENT_DATA_VERSION

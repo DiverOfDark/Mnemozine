@@ -605,6 +605,13 @@ class StorageBackend(Protocol):
         a :class:`MaintenanceReport` summarizing the pass. Idempotent and safe to
         re-run (FR-MNT-5): an unchanged extractor re-produces equivalent units
         that reinforce rather than duplicate.
+
+        DATA-VERSION STAMP CONTRACT (mnemozine.migrations): every freshly produced
+        :class:`MemoryUnit` is stamped with
+        :data:`~mnemozine.migrations.CURRENT_DATA_VERSION` (its field default), and
+        each re-processed :class:`RawChunk` is re-stamped up to
+        ``CURRENT_DATA_VERSION`` as well. This is what lets a re-extract migration
+        be idempotent: a re-run finds the chunks already at the current version.
         """
         ...
 
@@ -627,6 +634,14 @@ class StorageBackend(Protocol):
         given; unset fields are left unchanged. Returns the updated unit. (To
         re-derive from raw input rather than just re-tag, use
         :meth:`re_extract_from_raw_chunks`.)
+
+        DATA-VERSION STAMP CONTRACT (mnemozine.migrations): a reclassify MUST
+        re-stamp the touched memory's ``data_version`` up to
+        :data:`~mnemozine.migrations.CURRENT_DATA_VERSION` (the same way it would be
+        stamped on a fresh write). This is the cheap migration path — a
+        :class:`~mnemozine.migrations.Migration` that re-derives classification
+        relies on this implicit stamp so it does not also have to call
+        :meth:`set_data_version` for the records it reclassifies.
         """
         ...
 
@@ -651,6 +666,97 @@ class StorageBackend(Protocol):
         :class:`~mnemozine.schema.models.MemoryUnit` category normalization.
         Idempotent. Returns the number of memories re-labeled. Driven by the
         :class:`CategoryMerger` maintenance job.
+        """
+        ...
+
+    # --- data-versioning / in-place migration (mnemozine.migrations) ---------
+
+    async def min_data_version(self) -> int:
+        """Lowest ``data_version`` across all stored memories AND raw chunks.
+
+        The driver for the migration runner / startup hook: it compares this
+        against :data:`~mnemozine.migrations.CURRENT_DATA_VERSION` to decide which
+        migrations are pending (see
+        :func:`~mnemozine.migrations.pending_migrations`). Records written before
+        the data-versioning feature have no ``data_version`` property and MUST be
+        counted as **0** (see :func:`~mnemozine.migrations.record_data_version`),
+        so the presence of *any* unstamped or version-0 record makes this return 0.
+        Returns :data:`~mnemozine.migrations.CURRENT_DATA_VERSION` for an empty
+        store (nothing to migrate).
+
+        Because this takes the min over BOTH tiers, a migration is only "reached"
+        (and therefore idempotent / a startup no-op, FR-MNT-5) once it has stamped
+        the records it selected in BOTH tiers up to its version: the memory tier
+        via :meth:`iter_memories_below_version` + :meth:`set_data_version` /
+        :meth:`reclassify_memory`, and the raw-chunk tier via
+        :meth:`iter_chunks_below_version` + :meth:`set_chunk_data_version` /
+        :meth:`re_extract_from_raw_chunks`. A cheap reclassify-only migration that
+        does not also advance a stale chunk would leave ``min_data_version`` below
+        its target and re-run on every boot — so it MUST stamp the chunks it
+        selected via :meth:`set_chunk_data_version` even on the cheap path.
+        """
+        ...
+
+    def iter_memories_below_version(self, version: int) -> AsyncIterator[MemoryUnit]:
+        """Stream stored memory units whose ``data_version`` is below ``version``.
+
+        The selection seam a :class:`~mnemozine.migrations.Migration` uses to find
+        exactly the records it must touch (those with ``data_version < version``,
+        unstamped/legacy records counting as 0). Async generator (declared ``def``
+        returning ``AsyncIterator``, same call convention as :meth:`iter_memories`):
+        iterate with ``async for m in storage.iter_memories_below_version(v)`` — do
+        not ``await`` it. Pages internally so memory stays bounded. A migration that
+        re-stamps as it goes (via :meth:`set_data_version` /
+        :meth:`reclassify_memory`) is therefore idempotent: a re-run finds nothing
+        below ``version``.
+        """
+        ...
+
+    async def set_data_version(self, ids: Sequence[str], version: int) -> int:
+        """Stamp ``data_version = version`` onto the given memory ids in place.
+
+        The explicit stamp used by a :class:`~mnemozine.migrations.Migration` after
+        it has migrated a batch of MEMORY records (the implicit-stamp paths are
+        :meth:`reclassify_memory` / :meth:`re_extract_from_raw_chunks`, which both
+        re-stamp the touched record to
+        :data:`~mnemozine.migrations.CURRENT_DATA_VERSION`). Operates on the memory
+        tier only; the raw-chunk analogue is :meth:`set_chunk_data_version`. Does
+        not change any other field. Idempotent. Returns the number of records
+        updated.
+        """
+        ...
+
+    def iter_chunks_below_version(self, version: int) -> AsyncIterator[RawChunk]:
+        """Stream stored raw chunks whose ``data_version`` is below ``version``.
+
+        The raw-chunk analogue of :meth:`iter_memories_below_version`: the
+        selection seam a :class:`~mnemozine.migrations.Migration` uses to find the
+        chunks it must re-stamp (those with ``data_version < version``,
+        unstamped/legacy chunks counting as 0). This closes the chunk-version seam
+        gap: because :meth:`min_data_version` mins over the raw-chunk tier too, even
+        a *cheap reclassify* migration must select and stamp its stale chunks, or
+        ``min_data_version`` never reaches its target and the migration re-runs on
+        every boot. Async generator (declared ``def`` returning ``AsyncIterator``,
+        same call convention as :meth:`iter_raw_chunks`): iterate with
+        ``async for c in storage.iter_chunks_below_version(v)`` — do not ``await``
+        it. Pages internally so memory stays bounded.
+        """
+        ...
+
+    async def set_chunk_data_version(
+        self, content_hashes: Sequence[str], version: int
+    ) -> int:
+        """Stamp ``data_version = version`` onto the given raw chunks in place.
+
+        The raw-chunk analogue of :meth:`set_data_version`: the explicit stamp a
+        :class:`~mnemozine.migrations.Migration` uses to advance the
+        ``data_version`` of the chunks it selected via
+        :meth:`iter_chunks_below_version` *without* re-extracting them (the cheap
+        path). Chunks are keyed by their FR-ING-5 ``content_hash``. The heavy
+        implicit-stamp analogue is :meth:`re_extract_from_raw_chunks`, which
+        re-stamps each re-processed chunk to
+        :data:`~mnemozine.migrations.CURRENT_DATA_VERSION`. Does not change any
+        other field. Idempotent. Returns the number of chunks updated.
         """
         ...
 

@@ -120,16 +120,44 @@ class FakeFalkorDriver:
                     n += 1
             return _Result([[n]])
 
-        # --- reclassify_memory: SET any subset of scope/category/cross_ref -----
+        # --- data-versioning: min over the memory tier (min_data_version) ------
+        # Emitted as ``MATCH (m:MnemozineMemory) RETURN min(coalesce(m.data_version,
+        # 0)) AS v``. Legacy nodes with no ``data_version`` prop coalesce to 0.
+        if "min(coalesce(m.data_version, 0))" in c:
+            if not self.memories:
+                return _Result([[None]])
+            lo = min(
+                int(m.get("data_version") or 0) for m in self.memories.values()
+            )
+            return _Result([[lo]])
+
+        # --- data-versioning: set_data_version (explicit stamp) ----------------
+        # ``MATCH (m:MnemozineMemory) WHERE m.id IN $ids SET m.data_version =
+        # $version RETURN count(m) AS n``.
+        if "WHERE m.id IN $ids" in c and "SET m.data_version = $version" in c:
+            n = 0
+            for mid in p.get("ids", []):
+                m = self.memories.get(mid)
+                if m is not None:
+                    m["data_version"] = p["version"]
+                    n += 1
+            return _Result([[n]])
+
+        # --- reclassify_memory: SET any subset of scope/category/cross_ref + the
+        # always-present data_version re-stamp ----------------------------------
         # Emitted as ``MATCH (m:MnemozineMemory {id: $id}) SET <fields> RETURN m``
-        # where <fields> is some subset of ``m.scope = $scope`` /
-        # ``m.category = $category`` / ``m.cross_ref_candidate = $cross_ref_candidate``.
+        # where <fields> always includes ``m.data_version = $data_version`` and a
+        # subset of ``m.scope = $scope`` / ``m.category = $category`` /
+        # ``m.cross_ref_candidate = $cross_ref_candidate``.
         if "{id: $id}" in c and "RETURN m" in c and "SET m." in c and (
-            "m.scope = $scope" in c
+            "m.data_version = $data_version" in c
+            or "m.scope = $scope" in c
             or "m.category = $category" in c
             or "m.cross_ref_candidate = $cross_ref_candidate" in c
         ):
             m = self.memories[p["id"]]
+            if "m.data_version = $data_version" in c:
+                m["data_version"] = p["data_version"]
             if "m.scope = $scope" in c:
                 m["scope"] = p["scope"]
             if "m.category = $category" in c:
@@ -225,6 +253,12 @@ class FakeFalkorDriver:
             la = m.get("last_accessed")
             if la is not None and not (str(la) < str(p.get("unused_since"))):
                 return False
+        # Data-versioning selection (iter_memories_below_version): legacy nodes
+        # with no ``data_version`` prop coalesce to 0, so they are always below a
+        # positive target version.
+        if "coalesce(m.data_version, 0) < $version" in c:
+            if int(m.get("data_version") or 0) >= int(p.get("version", 0)):
+                return False
         return True
 
     # -- raw chunk (the retained raw tier) ------------------------------------
@@ -245,6 +279,29 @@ class FakeFalkorDriver:
             self.raw_chunks[props["content_hash"]] = props
             return _Result([[props]])
 
+        # --- data-versioning: min over the raw-chunk tier (min_data_version) ---
+        # ``MATCH (c:MnemozineRawChunk) RETURN min(coalesce(c.data_version, 0)) AS
+        # v``. Legacy chunks with no ``data_version`` prop coalesce to 0.
+        if "min(coalesce(c.data_version, 0))" in c:
+            if not self.raw_chunks:
+                return _Result([[None]])
+            lo = min(
+                int(ch.get("data_version") or 0) for ch in self.raw_chunks.values()
+            )
+            return _Result([[lo]])
+
+        # --- data-versioning: set_chunk_data_version (explicit stamp) ----------
+        # ``MATCH (c:MnemozineRawChunk) WHERE c.content_hash IN $hashes SET
+        # c.data_version = $version RETURN count(c) AS n``.
+        if "WHERE c.content_hash IN $hashes" in c and "SET c.data_version = $version" in c:
+            n = 0
+            for h in p.get("hashes", []):
+                chunk = self.raw_chunks.get(h)
+                if chunk is not None:
+                    chunk["data_version"] = p["version"]
+                    n += 1
+            return _Result([[n]])
+
         # MATCH (c:MnemozineRawChunk)[ WHERE ...] RETURN c
         rows: list[list[Any]] = []
         for chunk in self.raw_chunks.values():
@@ -259,6 +316,12 @@ class FakeFalkorDriver:
             if "c.ingested_at >= $since" in c:
                 ing = chunk.get("ingested_at")
                 if ing is None or not (str(ing) >= str(p.get("since"))):
+                    continue
+            # Data-versioning selection (iter_chunks_below_version): legacy chunks
+            # with no ``data_version`` prop coalesce to 0 (always below a positive
+            # target).
+            if "coalesce(c.data_version, 0) < $version" in c:
+                if int(chunk.get("data_version") or 0) >= int(p.get("version", 0)):
                     continue
             rows.append([chunk])
         return _Result(rows)

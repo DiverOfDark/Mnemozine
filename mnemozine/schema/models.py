@@ -45,6 +45,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+# The single source of truth for the data-model version stamped on every record.
+# Imported from the migrations package (which is import-light and does NOT import
+# schema at module scope) so there is no import cycle: schema -> migrations only.
+from mnemozine.migrations import CURRENT_DATA_VERSION
+
 
 def _utcnow() -> datetime:
     """Timezone-aware UTC now, used as the default validity-window start."""
@@ -560,6 +565,18 @@ class MemoryUnit(BaseModel):
         description="Number of times retrieved, for decay ranking (FR-MNT-3).",
     )
 
+    # Data-versioning (in-place migration framework, mnemozine.migrations).
+    data_version: int = Field(
+        default=CURRENT_DATA_VERSION,
+        ge=0,
+        description=(
+            "Data-model version this record conforms to; stamped at write time "
+            "(defaults to mnemozine.migrations.CURRENT_DATA_VERSION). A migration "
+            "only touches records with data_version < its own version and stamps "
+            "them up. Records written before this feature read back as 0."
+        ),
+    )
+
     @field_validator("content")
     @classmethod
     def _content_nonempty(cls, v: str) -> str:
@@ -663,6 +680,19 @@ class RawChunk(BaseModel):
     ingested_at: datetime = Field(
         default_factory=_utcnow,
         description="When this raw chunk was persisted (retention bookkeeping).",
+    )
+    # Data-versioning (in-place migration framework, mnemozine.migrations). A
+    # chunk is re-stamped to CURRENT_DATA_VERSION on re-extraction; raw chunks
+    # written before this feature read back as 0.
+    data_version: int = Field(
+        default=CURRENT_DATA_VERSION,
+        ge=0,
+        description=(
+            "Data-model version this raw chunk conforms to; stamped at write time "
+            "(defaults to mnemozine.migrations.CURRENT_DATA_VERSION). Used by "
+            "min_data_version() and the re-extraction migration path. Records "
+            "written before this feature read back as 0."
+        ),
     )
 
 

@@ -27,6 +27,7 @@ from mnemozine.interfaces import (
     WriteDecision,
     WriteResult,
 )
+from mnemozine.migrations import CURRENT_DATA_VERSION, record_data_version
 from mnemozine.schema.models import (
     DEFAULT_CATEGORY,
     Edge,
@@ -230,10 +231,22 @@ class OfflineStorage:
         supersede_existing: bool = True,
     ) -> MaintenanceReport:
         # Minimal offline seam: the §9 metrics do not exercise re-extraction, so
-        # this satisfies the Protocol shape with a no-op pass over the raw tier.
+        # this satisfies the Protocol shape with a pass over the raw tier that
+        # exercises the supersede + version-stamp behaviour without re-parsing
+        # chunk.content back into events.
+        del extractor
         report = MaintenanceReport(job_name="re_extract_from_raw_chunks")
-        async for _chunk in self.iter_raw_chunks(scope=scope, session_id=session_id):
-            report.re_extracted += 0
+        async for chunk in self.iter_raw_chunks(scope=scope, session_id=session_id):
+            if supersede_existing:
+                for mid in chunk.memory_ids:
+                    m = self.memories.get(mid)
+                    if m is not None:
+                        m.supersede()
+            # DATA-VERSION STAMP CONTRACT (mnemozine.migrations): re-stamp the
+            # re-processed chunk to the current version so a re-extract migration
+            # is idempotent (a re-run finds it already at CURRENT_DATA_VERSION).
+            chunk.data_version = CURRENT_DATA_VERSION
+            report.re_extracted += 1
         return report
 
     async def reclassify_memory(
@@ -251,6 +264,10 @@ class OfflineStorage:
             m.category = category.strip().lower() or DEFAULT_CATEGORY
         if cross_ref_candidate is not None:
             m.cross_ref_candidate = cross_ref_candidate
+        # DATA-VERSION STAMP CONTRACT (mnemozine.migrations): a reclassify always
+        # re-stamps the touched memory up to the current version (the cheap
+        # migration path relies on this implicit stamp).
+        m.data_version = CURRENT_DATA_VERSION
         return m
 
     async def list_categories(self) -> list[tuple[str, int]]:
@@ -268,6 +285,53 @@ class OfflineStorage:
         for m in self.memories.values():
             if m.category == src:
                 m.category = tgt
+                n += 1
+        return n
+
+    # --- data-versioning / in-place migration (mnemozine.migrations) ---------
+
+    async def min_data_version(self) -> int:
+        versions = [
+            record_data_version(m.data_version) for m in self.memories.values()
+        ]
+        versions += [
+            record_data_version(c.data_version) for c in self.raw_chunks.values()
+        ]
+        if not versions:
+            return CURRENT_DATA_VERSION
+        return min(versions)
+
+    async def iter_memories_below_version(
+        self, version: int
+    ) -> AsyncIterator[MemoryUnit]:
+        for m in list(self.memories.values()):
+            if record_data_version(m.data_version) < version:
+                yield m
+
+    async def set_data_version(self, ids: Sequence[str], version: int) -> int:
+        n = 0
+        for mid in ids:
+            m = self.memories.get(mid)
+            if m is not None:
+                m.data_version = version
+                n += 1
+        return n
+
+    async def iter_chunks_below_version(
+        self, version: int
+    ) -> AsyncIterator[RawChunk]:
+        for c in list(self.raw_chunks.values()):
+            if record_data_version(c.data_version) < version:
+                yield c
+
+    async def set_chunk_data_version(
+        self, content_hashes: Sequence[str], version: int
+    ) -> int:
+        n = 0
+        for h in content_hashes:
+            c = self.raw_chunks.get(h)
+            if c is not None:
+                c.data_version = version
                 n += 1
         return n
 

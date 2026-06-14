@@ -481,6 +481,42 @@ class WebSettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Data-versioning + in-place migration (mnemozine.migrations)
+# ---------------------------------------------------------------------------
+
+
+class MigrateSettings(BaseModel):
+    """In-place data-migration settings (the :mod:`mnemozine.migrations` framework).
+
+    When the data model / extraction / scope-derivation changes, existing data is
+    migrated IN PLACE (cheap reclassify, or re-extract from retained raw chunks) —
+    never wiped and re-ingested. These knobs control whether the *cheap* pending
+    migrations run automatically at startup and whether a stale store is warned
+    about. The heavy re-extract migrations remain operator-triggered (the
+    ``re-extract`` subcommand), never run silently on a boot.
+    """
+
+    auto_on_startup: bool = Field(
+        default=False,
+        description=(
+            "When true, run the pending CHEAP migrations automatically at startup "
+            "(reclassify-style passes selected by min_data_version() < "
+            "CURRENT_DATA_VERSION). Off by default: a migration is normally an "
+            "explicit, operator-triggered step. Heavy re-extract migrations are "
+            "never auto-run regardless of this flag."
+        ),
+    )
+    warn_on_stale: bool = Field(
+        default=True,
+        description=(
+            "When true, log a warning at startup if the store has pending "
+            "migrations (min_data_version() < CURRENT_DATA_VERSION) and they are "
+            "not being auto-applied, so an operator notices stale data."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Component run toggles (the all-in-one ``mnemozine`` entrypoint)
 # ---------------------------------------------------------------------------
 
@@ -554,6 +590,7 @@ class Settings(BaseSettings):
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     web: WebSettings = Field(default_factory=WebSettings)
+    migrate: MigrateSettings = Field(default_factory=MigrateSettings)
     run: RunSettings = Field(default_factory=RunSettings)
 
     # MCP server bind settings (FR-RET-1).

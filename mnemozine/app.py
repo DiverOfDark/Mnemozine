@@ -508,6 +508,70 @@ def _maintenance_re_extract_cmd(
     _echo_report(report)
 
 
+async def _maintenance_migrate(container: Container, *, dry_run: bool) -> None:
+    """Run the in-place data-version migration runner over the live store (FR-MNT-5).
+
+    Drives :class:`~mnemozine.migrations.runner.MigrationRunner` over the
+    Container's storage: it reads
+    :meth:`~mnemozine.interfaces.StorageBackend.min_data_version`, selects the
+    pending migrations (version in ``(current, CURRENT_DATA_VERSION]``), and either
+    PLANS them (``dry_run`` — no writes) or APPLIES them in order, idempotently and
+    resumably. An extractor is wired in so a heavy re-extract migration could run if
+    one were registered; the cheap reclassify baseline ignores it. Prints the
+    aggregated report.
+    """
+
+    from mnemozine.migrations.runner import MigrationRunner
+
+    storage = await container.build_storage()
+    runner = MigrationRunner(storage, extractor=container.build_extractor())
+    report = (
+        await runner.plan() if dry_run else await runner.run()
+    )
+
+    header = "migrate (dry-run)" if dry_run else "migrate"
+    typer.echo(
+        f"[{header}] data_version {report.from_version} -> {report.to_version} "
+        f"(applied={report.applied}, migrated={report.migrated})"
+    )
+    for step in report.plan:
+        marker = "SKIP" if step.skipped else "PLAN"
+        line = f"    - {marker} v{step.version}: {step.description}"
+        if step.skip_reason:
+            line += f" ({step.skip_reason})"
+        typer.echo(line)
+    for run_step in report.steps:
+        typer.echo(f"    - [{run_step.job_name}] re_extracted={run_step.re_extracted}")
+        for note in run_step.notes:
+            typer.echo(f"        - {note}")
+    for note in report.notes:
+        typer.echo(f"    - {note}")
+
+
+@maintenance_app.command("migrate")
+def _maintenance_migrate_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report the migration plan (pending steps) without writing anything.",
+    ),
+) -> None:
+    """Run pending in-place data-version migrations over the store (FR-MNT-5).
+
+    The data-versioning runner (see :mod:`mnemozine.migrations`): finds the store's
+    ``min_data_version`` and applies every registered migration whose version is in
+    ``(current, CURRENT_DATA_VERSION]``, in order, idempotently and resumably (a
+    finished migration is a no-op). Existing data is upgraded IN PLACE — never wiped
+    and re-ingested. ``--dry-run`` prints the plan (which steps would run, and which
+    heavy re-extract steps are skipped) without touching the store.
+    """
+
+    container = Container.from_env()
+    asyncio.run(
+        _run_then_close(container, _maintenance_migrate(container, dry_run=dry_run))
+    )
+
+
 # ---------------------------------------------------------------------------
 # mnemozine-eval — the §9 eval harness
 # ---------------------------------------------------------------------------
@@ -798,6 +862,74 @@ def _select_components(
     return components
 
 
+async def _apply_startup_migrations(container: Container) -> None:
+    """Honor ``settings.migrate`` at startup: warn on / auto-apply pending migrations.
+
+    The data-versioning hook (see :mod:`mnemozine.migrations`). Compares the store's
+    :meth:`~mnemozine.interfaces.StorageBackend.min_data_version` against
+    :data:`~mnemozine.migrations.CURRENT_DATA_VERSION` to find pending migrations
+    (:func:`~mnemozine.migrations.pending_migrations`, which also enforces the
+    registry invariant). When ``migrate.auto_on_startup`` is set it runs the pending
+    CHEAP (reclassify) migrations in order, re-stamping records in place (never a
+    wipe + re-ingest), re-reading ``min_data_version`` between steps and SKIPPING any
+    HEAVY re-extract migration (``Migration.requires_reextract``) — those stay
+    operator-triggered regardless of the flag (see
+    :class:`~mnemozine.config.MigrateSettings`). Otherwise, when
+    ``migrate.warn_on_stale`` is set, it only logs that the store is stale. Failures
+    are caught and logged so a migration problem never blocks the rest of the
+    all-in-one from starting. A no-op when nothing is pending or the backend lacks
+    the data-versioning seam.
+    """
+
+    cfg = container.settings.migrate
+    if not (cfg.auto_on_startup or cfg.warn_on_stale):
+        return
+    # Importing the runner seeds the MIGRATIONS registry (it imports the concrete
+    # migrations, which self-register). CURRENT_DATA_VERSION is read for the log.
+    from mnemozine.migrations import CURRENT_DATA_VERSION
+    from mnemozine.migrations.runner import MigrationRunner
+
+    try:
+        storage = await container.build_storage()
+        runner = MigrationRunner(storage, extractor=container.build_extractor())
+        current = await storage.min_data_version()
+        pending = await runner.pending()
+        if not pending:
+            return
+        if cfg.auto_on_startup:
+            # The config contract: auto_on_startup runs CHEAP migrations only; heavy
+            # re-extract migrations are never auto-run regardless of this flag. The
+            # runner honors this via include_reextract=False (it skips + notes any
+            # heavy step) and re-reads min_data_version per step (resumable, no-op
+            # on a re-run).
+            logger.info(
+                "mnemozine: applying pending migration(s) "
+                "(data_version %d -> %d, cheap only)",
+                current,
+                CURRENT_DATA_VERSION,
+            )
+            report = await runner.run(include_reextract=False)
+            logger.info(
+                "mnemozine: startup migrations applied %d step(s) "
+                "(data_version %d -> %d); notes=%s",
+                report.applied,
+                report.from_version,
+                report.to_version,
+                report.notes,
+            )
+        elif cfg.warn_on_stale:
+            logger.warning(
+                "mnemozine: store has %d pending migration(s) (data_version %d < "
+                "%d); run: mnemozine-maintenance migrate "
+                "(or set MNEMOZINE_MIGRATE__AUTO_ON_STARTUP=true to apply at startup)",
+                len(pending),
+                current,
+                CURRENT_DATA_VERSION,
+            )
+    except Exception:  # noqa: BLE001 - a migration problem must not block startup
+        logger.exception("mnemozine: startup migration check failed")
+
+
 async def _run_all(container: Container) -> None:
     """Run every ENABLED component concurrently with graceful shutdown.
 
@@ -807,12 +939,18 @@ async def _run_all(container: Container) -> None:
     then ``container.close()`` releases the shared storage connection. Disabled
     components are never created, so this is a no-op-safe superset of every
     standalone script (e.g. ``run.ingest`` only == ``mnemozine-ingest``).
+
+    Before launching components it runs the data-versioning startup hook
+    (:func:`_apply_startup_migrations`) so a model/scope-derivation change can be
+    applied in place (or at least warned about) per ``settings.migrate``.
     """
 
     components = _select_components(container)
     if not components:
         logger.warning("mnemozine: no components enabled (settings.run.*); exiting")
         return
+
+    await _apply_startup_migrations(container)
 
     logger.info("mnemozine: starting components: %s", ", ".join(sorted(components)))
 

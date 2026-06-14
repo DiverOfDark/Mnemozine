@@ -31,6 +31,7 @@ from mnemozine.interfaces import (
     WriteDecision,
     WriteResult,
 )
+from mnemozine.migrations import CURRENT_DATA_VERSION, record_data_version
 from mnemozine.schema.events import IngestEvent, Role, Source
 from mnemozine.schema.models import (
     Edge,
@@ -492,6 +493,9 @@ class InMemoryStorage:
                 for mid in chunk.memory_ids:
                     if mid in self.memories:
                         self.memories[mid].supersede()
+            # DATA-VERSION STAMP CONTRACT: re-stamp the re-processed chunk to the
+            # current version so a re-extract migration is idempotent.
+            chunk.data_version = CURRENT_DATA_VERSION
             count += 1
         return MaintenanceReport(job_name="re_extract", re_extracted=count)
 
@@ -511,7 +515,57 @@ class InMemoryStorage:
             m.category = MemoryUnit(content=m.content, scope=m.scope, category=category).category
         if cross_ref_candidate is not None:
             m.cross_ref_candidate = cross_ref_candidate
+        # DATA-VERSION STAMP CONTRACT: a reclassify re-stamps to the current
+        # version (the cheap migration path relies on this implicit stamp).
+        m.data_version = CURRENT_DATA_VERSION
         return m
+
+    # --- data-versioning / in-place migration (mnemozine.migrations) -----
+
+    async def min_data_version(self) -> int:
+        versions = [
+            record_data_version(m.data_version) for m in self.memories.values()
+        ]
+        versions += [
+            record_data_version(c.data_version) for c in self.raw_chunks.values()
+        ]
+        if not versions:
+            return CURRENT_DATA_VERSION
+        return min(versions)
+
+    async def iter_memories_below_version(
+        self, version: int
+    ) -> AsyncIterator[MemoryUnit]:
+        for m in list(self.memories.values()):
+            if record_data_version(m.data_version) < version:
+                yield m
+
+    async def set_data_version(self, ids: Sequence[str], version: int) -> int:
+        n = 0
+        for mid in ids:
+            m = self.memories.get(mid)
+            if m is not None:
+                m.data_version = version
+                n += 1
+        return n
+
+    async def iter_chunks_below_version(
+        self, version: int
+    ) -> AsyncIterator[RawChunk]:
+        for c in list(self.raw_chunks.values()):
+            if record_data_version(c.data_version) < version:
+                yield c
+
+    async def set_chunk_data_version(
+        self, content_hashes: Sequence[str], version: int
+    ) -> int:
+        n = 0
+        for h in content_hashes:
+            c = self.raw_chunks.get(h)
+            if c is not None:
+                c.data_version = version
+                n += 1
+        return n
 
     # --- category registry (emergent-category list/merge) ----------------
 
