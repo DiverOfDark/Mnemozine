@@ -37,7 +37,7 @@ from mnemozine.interfaces import (
     StorageBackend,
 )
 from mnemozine.retrieval.budget import IndexParts, render_index
-from mnemozine.schema.models import MemoryType, Scope
+from mnemozine.schema.models import Scope, ScopeDecision
 
 
 def _truncate_snippet(content: str, *, max_chars: int = 160) -> str:
@@ -227,40 +227,48 @@ class ScopedRetriever:
             include_archived=False,
         )
 
-        preferences = [r for r in candidates if r.memory.type is MemoryType.PREFERENCE]
-        project_facts = [r for r in candidates if r.memory.type is MemoryType.PROJECT_FACT]
-        idea_seeds = [r for r in candidates if r.memory.type is MemoryType.IDEA_SEED]
+        # Core redesign: counts split on the controlled scope decision (global vs
+        # project) rather than the old MemoryType, and hints are driven by the
+        # cross_ref_candidate flag rather than the idea_seed type.
+        global_memories = [r for r in candidates if r.memory.scope_decision is ScopeDecision.GLOBAL]
+        project_memories = [
+            r for r in candidates if r.memory.scope_decision is ScopeDecision.PROJECT
+        ]
+        cross_ref_seeds = [r for r in candidates if r.memory.cross_ref_candidate]
 
-        # Top-preference snippets only (FR-RET-3 contract), best-first.
+        # Top global-scope snippets only (FR-RET-3 contract), best-first — these are
+        # the durable cross-project preferences that carry into every session.
         snippet_cap = self._settings.inject.max_preference_snippets
-        pref_snippets = [_truncate_snippet(r.memory.content) for r in preferences[:snippet_cap]]
+        global_snippets = [
+            _truncate_snippet(r.memory.content) for r in global_memories[:snippet_cap]
+        ]
 
-        # One-line idea-seed hints with their shared entity tags as the reason.
-        idea_hints: list[str] = []
-        for r in idea_seeds:
+        # One-line cross-reference hints with their shared entity tags as the reason.
+        cross_ref_hints: list[str] = []
+        for r in cross_ref_seeds:
             shared = sorted(set(e.lower() for e in r.memory.entities) & set(neighborhood))
             tag = f" (shares {', '.join(shared)})" if shared else ""
-            idea_hints.append(_truncate_snippet(r.memory.content, max_chars=80) + tag)
+            cross_ref_hints.append(_truncate_snippet(r.memory.content, max_chars=80) + tag)
 
         # Entity tags shown in the summary: the active context entities (seeds),
         # not the full expanded neighborhood, so the summary stays compact.
         entity_tags = list(dict.fromkeys(e.lower() for e in context.entities))[:6]
 
         parts = IndexParts(
-            preference_snippets=pref_snippets,
-            idea_seed_hints=idea_hints,
+            global_snippets=global_snippets,
+            cross_ref_hints=cross_ref_hints,
             entity_tags=entity_tags,
-            preference_count=len(preferences),
-            project_fact_count=len(project_facts),
+            global_count=len(global_memories),
+            project_count=len(project_memories),
         )
         text, est = render_index(parts, token_budget=budget)
 
         index = InjectionIndex(
             text=text,
             token_estimate=est,
-            preference_count=len(preferences),
-            project_fact_count=len(project_facts),
-            idea_seed_hints=idea_hints,
+            global_count=len(global_memories),
+            project_count=len(project_memories),
+            cross_ref_hints=cross_ref_hints,
             entity_tags=entity_tags,
         )
         self._emit_injection(context, candidates, index)
@@ -287,15 +295,15 @@ class ScopedRetriever:
                 session_id=None,
                 project=context.project,
                 summary=(
-                    f"injection index surfaced: {index.preference_count} preference(s), "
-                    f"{index.project_fact_count} project fact(s), "
-                    f"{len(index.idea_seed_hints)} idea hint(s) (~{index.token_estimate} tok)"
+                    f"injection index surfaced: {index.global_count} global memo(s), "
+                    f"{index.project_count} project memo(s), "
+                    f"{len(index.cross_ref_hints)} cross-ref hint(s) (~{index.token_estimate} tok)"
                 ),
                 ref_memory_ids=ref_ids,
                 detail={
-                    "preference_count": index.preference_count,
-                    "project_fact_count": index.project_fact_count,
-                    "idea_seed_hints": list(index.idea_seed_hints),
+                    "global_count": index.global_count,
+                    "project_count": index.project_count,
+                    "cross_ref_hints": list(index.cross_ref_hints),
                     "entity_tags": list(index.entity_tags),
                     "token_estimate": index.token_estimate,
                 },

@@ -46,13 +46,16 @@ export function BreakdownRow({
   total,
   /** Tailwind bg color class for the fill (e.g. "bg-type-preference"). */
   fillClass = "bg-accent",
-  /** Optional rich label node (e.g. a <TypeBadge/>) replacing the plain text label. */
+  /** Inline fill color (for runtime/free-form category colors); overrides fillClass. */
+  fillColor,
+  /** Optional rich label node (e.g. a <CategoryBadge/>) replacing the plain text label. */
   labelNode,
 }: {
   label: string;
   count: number;
   total: number;
   fillClass?: string;
+  fillColor?: string;
   labelNode?: ReactNode;
 }) {
   const pct = total > 0 ? (count / total) * 100 : 0;
@@ -67,8 +70,8 @@ export function BreakdownRow({
       </div>
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-bg-inset">
         <div
-          className={cn("h-full rounded-full transition-all duration-fast", fillClass)}
-          style={{ width: `${pct}%` }}
+          className={cn("h-full rounded-full transition-all duration-fast", !fillColor && fillClass)}
+          style={{ width: `${pct}%`, ...(fillColor ? { backgroundColor: fillColor } : {}) }}
         />
       </div>
       <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-text">{count.toLocaleString()}</span>

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from mnemozine.schema.models import MemoryType, Tier
+from mnemozine.schema.models import ScopeDecision, Tier
 from mnemozine.web.schemas import (
     MemoryDetail,
     MemoryListItem,
@@ -26,7 +26,9 @@ def sample_list_item() -> MemoryListItem:
 
     return MemoryListItem(
         id="sample-0001",
-        type=MemoryType.PREFERENCE,
+        category="preference",
+        cross_ref_candidate=False,
+        scope_decision=ScopeDecision.GLOBAL,
         content="Prefers thiserror over anyhow for Rust error handling.",
         scope="global",
         entities=["rust", "error-handling", "thiserror"],
@@ -46,7 +48,9 @@ def sample_detail() -> MemoryDetail:
 
     return MemoryDetail(
         id="sample-0001",
-        type=MemoryType.PREFERENCE,
+        category="preference",
+        cross_ref_candidate=False,
+        scope_decision=ScopeDecision.GLOBAL,
         content="Prefers thiserror over anyhow for Rust error handling.",
         scope="global",
         entities=["rust", "error-handling", "thiserror"],

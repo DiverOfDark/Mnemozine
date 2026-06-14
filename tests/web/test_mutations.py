@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 from mnemozine.activity import ActivityKind, InMemoryActivityLog
-from mnemozine.schema.models import MemoryType, Scope, Tier
+from mnemozine.schema.models import Scope, Tier
 from mnemozine.web.routes._bootstrap_state import bootstrap_store
 from tests.conftest import InMemoryStorage
 
@@ -52,21 +52,34 @@ async def _events(log: InMemoryActivityLog) -> list:
 # ---------------------------------------------------------------------------
 
 
-def test_patch_reclassify(client, storage: InMemoryStorage, activity_log) -> None:
-    resp = client.patch("/api/memories/mem-pref-current", json={"type": "idea_seed"})
+def test_patch_recategorize(client, storage: InMemoryStorage, activity_log) -> None:
+    # Re-label the free-form category (replaces the old type reclassify).
+    resp = client.patch("/api/memories/mem-pref-current", json={"category": "gotcha"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    assert body["changed"] == ["type"]
-    assert body["memory"]["type"] == "idea_seed"
-    # Persisted through the backend.
-    assert storage.memories["mem-pref-current"].type is MemoryType.IDEA_SEED
+    assert body["changed"] == ["category"]
+    assert body["memory"]["category"] == "gotcha"
+    # Persisted through the backend (normalized lowercased/trimmed).
+    assert storage.memories["mem-pref-current"].category == "gotcha"
     # Recorded on the activity feed.
     events = asyncio.run(_events(activity_log))
     assert any(
         e.kind is ActivityKind.EXTRACT_DECISION and "mem-pref-current" in e.ref_memory_ids
         for e in events
     )
+
+
+def test_patch_toggle_cross_ref_candidate(client, storage: InMemoryStorage) -> None:
+    # The old idea_seed type is now the cross_ref_candidate boolean flag (FR-RET-6).
+    resp = client.patch(
+        "/api/memories/mem-pref-current", json={"cross_ref_candidate": True}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed"] == ["cross_ref_candidate"]
+    assert body["memory"]["cross_ref_candidate"] is True
+    assert storage.memories["mem-pref-current"].cross_ref_candidate is True
 
 
 def test_patch_rescope_bare_project_id(client, storage: InMemoryStorage) -> None:
@@ -101,13 +114,13 @@ def test_patch_archive_then_restore(client, storage: InMemoryStorage) -> None:
 def test_patch_combined_fields(client, storage: InMemoryStorage) -> None:
     resp = client.patch(
         "/api/memories/mem-pref-current",
-        json={"type": "project_fact", "scope": "rust-cli", "tier": "archive"},
+        json={"category": "decision", "scope": "rust-cli", "tier": "archive"},
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert set(body["changed"]) == {"type", "scope", "tier"}
+    assert set(body["changed"]) == {"category", "scope", "tier"}
     m = storage.memories["mem-pref-current"]
-    assert m.type is MemoryType.PROJECT_FACT
+    assert m.category == "decision"
     assert m.scope == Scope.project("rust-cli")
     assert m.tier is Tier.ARCHIVE
 
@@ -133,7 +146,8 @@ def test_patch_does_not_edit_content(client, storage: InMemoryStorage) -> None:
     # the MemoryPatchRequest schema, and the stored content is unchanged.
     before = storage.memories["mem-pref-current"].content
     resp = client.patch(
-        "/api/memories/mem-pref-current", json={"type": "idea_seed", "content": "HACKED"}
+        "/api/memories/mem-pref-current",
+        json={"category": "gotcha", "content": "HACKED"},
     )
     assert resp.status_code == 200
     assert storage.memories["mem-pref-current"].content == before

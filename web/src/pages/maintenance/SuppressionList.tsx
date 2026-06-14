@@ -20,7 +20,7 @@ import {
   useSuppressCrossRef,
   type CrossRefItem,
 } from "@/api";
-import { Badge, Button, DataTable, ScoreBar, TypeBadge, type Column } from "@/components";
+import { Badge, Button, CategoryBadge, DataTable, ScoreBar, type Column } from "@/components";
 import { useScope } from "@/state/scope";
 import { parseScope, shortId } from "@/lib/format";
 
@@ -59,10 +59,10 @@ export function SuppressionList() {
       ),
     },
     {
-      id: "type",
-      header: "Type",
-      width: 116,
-      cell: (row) => <TypeBadge type={row.memory.type} />,
+      id: "category",
+      header: "Category",
+      width: 140,
+      cell: (row) => <CategoryBadge category={row.memory.category} />,
     },
     {
       id: "reason",

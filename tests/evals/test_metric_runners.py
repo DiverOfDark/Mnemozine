@@ -25,7 +25,7 @@ from mnemozine.evals.harness_adapters import (
     KeywordExtractor,
     StorageBackedRetriever,
 )
-from mnemozine.schema.models import MemoryType
+from mnemozine.schema.models import ScopeDecision
 from tests.conftest import InMemoryStorage
 
 
@@ -60,7 +60,7 @@ async def test_injection_precision_fails_when_distractor_marked_relevant() -> No
         memories=[
             GoldMemory(
                 gold_id="a",
-                type=MemoryType.PREFERENCE,
+                category="preference",
                 content="prefers tabs over spaces",
                 scope="global",
                 entities=["style"],
@@ -87,9 +87,7 @@ async def test_injection_precision_fails_when_distractor_marked_relevant() -> No
 
 async def test_changed_preference_passes_when_stale_superseded(gold: GoldSet) -> None:
     store = await _seed(gold)
-    result = await metrics.changed_preference_correctness(
-        StorageBackedRetriever(store), gold
-    )
+    result = await metrics.changed_preference_correctness(StorageBackedRetriever(store), gold)
     assert result.passed
     assert result.score == pytest.approx(1.0)
 
@@ -101,7 +99,7 @@ async def test_changed_preference_fails_when_stale_still_active() -> None:
         memories=[
             GoldMemory(
                 gold_id="cur",
-                type=MemoryType.PREFERENCE,
+                category="preference",
                 content="prefers thiserror error handling",
                 scope="global",
                 entities=["rust", "errors"],
@@ -109,7 +107,7 @@ async def test_changed_preference_fails_when_stale_still_active() -> None:
             ),
             GoldMemory(
                 gold_id="old",
-                type=MemoryType.PREFERENCE,
+                category="preference",
                 content="prefers anyhow error handling",
                 scope="global",
                 entities=["rust", "errors"],
@@ -130,9 +128,7 @@ async def test_changed_preference_fails_when_stale_still_active() -> None:
         ],
     )
     store = await _seed(gs)
-    result = await metrics.changed_preference_correctness(
-        StorageBackedRetriever(store), gs
-    )
+    result = await metrics.changed_preference_correctness(StorageBackedRetriever(store), gs)
     assert not result.passed
     assert result.cases[0].detail["stale_suppressed"] is False
 
@@ -156,7 +152,8 @@ async def test_crossref_precision_fails_on_irrelevant_surface() -> None:
         memories=[
             GoldMemory(
                 gold_id="idea",
-                type=MemoryType.IDEA_SEED,
+                category="idea",
+                cross_ref_candidate=True,
                 content="idea: a thing about widgets",
                 scope="global",
                 entities=["widgets"],
@@ -183,7 +180,8 @@ async def test_crossref_suppression_excludes_dismissed() -> None:
         memories=[
             GoldMemory(
                 gold_id="idea",
-                type=MemoryType.IDEA_SEED,
+                category="idea",
+                cross_ref_candidate=True,
                 content="idea: widget thing",
                 scope="global",
                 entities=["widgets"],
@@ -225,14 +223,12 @@ async def test_classifier_accuracy_fails_below_threshold() -> None:
                 case_id="c1",
                 statement="totally ambiguous sentence with no markers",
                 project="proj",
-                expected_type=MemoryType.PROJECT_FACT,
+                expected_scope_decision=ScopeDecision.PROJECT,
             )
         ]
     )
-    result = await metrics.classifier_accuracy(
-        KeywordExtractor(), gs, threshold=0.9
-    )
-    # The heuristic defaults ambiguous -> preference, so this is wrong -> fail.
+    result = await metrics.classifier_accuracy(KeywordExtractor(), gs, threshold=0.9)
+    # The heuristic defaults ambiguous -> global, so this is wrong -> fail.
     assert not result.passed
     assert result.score == 0.0
 
@@ -275,7 +271,7 @@ async def test_no_leak_fails_when_project_fact_is_global() -> None:
         memories=[
             GoldMemory(
                 gold_id="leaky",
-                type=MemoryType.PROJECT_FACT,
+                category="fact",
                 content="secret pins tokio 1.38",
                 scope="global",  # bug: should be project:rust-cli
                 entities=["tokio"],

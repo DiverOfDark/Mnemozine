@@ -1,10 +1,13 @@
 """Offline tests for the single-statement classify path (FR-EXT-3, §9, R1).
 
 ``Extractor.classify`` is the independently-testable classifier the §9
-classifier-accuracy metric is measured on. These tests pin its contract: it
-returns a lightweight :class:`Classification` (no provenance/validity), derives
-scope from type, and degrades gracefully on bad model output — all offline with
-``FakeLLMProvider``.
+classifier-accuracy metric is measured on. These tests pin its CATEGORY-SPLIT
+contract (core data-model redesign): it returns a lightweight
+:class:`Classification` carrying the CONTROLLED ``scope_decision`` (``global`` vs
+``project``), the derived hierarchical ``scope``, a FREE-FORM ``category`` slug,
+and a ``cross_ref_candidate`` flag — no provenance/validity — deriving scope in
+Python from the decision (never the model's string) and degrading gracefully on
+bad model output. All offline with ``FakeLLMProvider``.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import pytest
 from mnemozine.config import Settings
 from mnemozine.extract import TypedExtractor
 from mnemozine.interfaces import Classification, RetrievalContext
-from mnemozine.schema.models import MemoryType, Scope
+from mnemozine.schema.models import Scope, ScopeDecision
 from tests.conftest import FakeLLMProvider
 
 
@@ -28,33 +31,35 @@ def make_extractor(
 
 
 @pytest.mark.asyncio
-async def test_classify_returns_lightweight_classification() -> None:
+async def test_classify_returns_category_split_classification() -> None:
     response = {
-        "type": "preference",
         "scope": "global",
+        "category": "preference",
+        "cross_ref": False,
         "entities": ["rust", "error-handling"],
         "confidence": 0.92,
     }
     extractor, _ = make_extractor(json_responses=[response])
     ctx = RetrievalContext(project="rust-cli")
-    result = await extractor.classify(
-        "I prefer thiserror over anyhow.", ctx
-    )
+    result = await extractor.classify("I prefer thiserror over anyhow.", ctx)
 
     assert isinstance(result, Classification)
-    assert result.type is MemoryType.PREFERENCE
+    assert result.scope_decision is ScopeDecision.GLOBAL
     assert result.scope.is_global
+    assert result.category == "preference"  # FREE-FORM, not an enum
+    assert result.cross_ref_candidate is False
     assert result.entities == ["rust", "error-handling"]
     assert result.confidence == 0.92
 
 
 @pytest.mark.asyncio
-async def test_classify_project_fact_scoped_to_context_project() -> None:
-    """FR-EXT-3: a project_fact classification is scoped to context.project."""
+async def test_classify_project_decision_scoped_to_context_project() -> None:
+    """FR-EXT-3: a project-decision classification is scoped to context.project."""
 
     response = {
-        "type": "project_fact",
-        "scope": "global",  # model is wrong; Python re-derives from type.
+        "scope": "project",
+        "category": "decision",
+        "cross_ref": False,
         "entities": ["tokio"],
         "confidence": 0.8,
     }
@@ -62,15 +67,16 @@ async def test_classify_project_fact_scoped_to_context_project() -> None:
     ctx = RetrievalContext(project="rust-cli")
     result = await extractor.classify("This project pins tokio 1.38.", ctx)
 
-    assert result.type is MemoryType.PROJECT_FACT
+    assert result.scope_decision is ScopeDecision.PROJECT
     assert result.scope == Scope.project("rust-cli")
 
 
 @pytest.mark.asyncio
-async def test_classify_idea_seed_is_global() -> None:
+async def test_classify_cross_ref_idea_is_global() -> None:
     response = {
-        "type": "idea_seed",
         "scope": "global",
+        "category": "idea",
+        "cross_ref": True,
         "entities": ["cli", "sql"],
         "confidence": 0.6,
     }
@@ -78,7 +84,29 @@ async def test_classify_idea_seed_is_global() -> None:
     result = await extractor.classify(
         "Idea: a CLI that diffs SQL schemas.", RetrievalContext(project="x")
     )
-    assert result.type is MemoryType.IDEA_SEED
+    assert result.scope_decision is ScopeDecision.GLOBAL
+    assert result.scope.is_global
+    assert result.cross_ref_candidate is True
+    assert result.category == "idea"
+
+
+@pytest.mark.asyncio
+async def test_classify_never_trusts_model_scope_string() -> None:
+    """Even if the model emits a bogus scope path, Python derives from the decision."""
+
+    response = {
+        # A well-behaved model emits only the decision, but assert that a stray
+        # path-shaped value in the decision field is rejected (not trusted).
+        "scope": "project:some-other-project",
+        "category": "fact",
+        "cross_ref": False,
+        "entities": ["a"],
+        "confidence": 0.7,
+    }
+    extractor, _ = make_extractor(json_responses=[response])
+    result = await extractor.classify("x", RetrievalContext(project="rust-cli"))
+    # Unparseable decision -> droppable global fallback, never the leaked project.
+    assert result.confidence == 0.0
     assert result.scope.is_global
 
 
@@ -89,6 +117,7 @@ async def test_classify_unparseable_response_is_droppable() -> None:
     extractor, _ = make_extractor(json_responses=[{}])  # empty object
     result = await extractor.classify("???", RetrievalContext(project="x"))
     assert result.confidence == 0.0  # droppable
+    assert result.scope_decision is ScopeDecision.GLOBAL
     assert isinstance(result, Classification)
 
 
@@ -99,8 +128,9 @@ async def test_classify_passes_project_and_context_to_prompt() -> None:
     def responder(prompt: str, system: str | None) -> dict[str, Any]:
         captured["prompt"] = prompt
         return {
-            "type": "project_fact",
-            "scope": "project:proj-x",
+            "scope": "project",
+            "category": "decision",
+            "cross_ref": False,
             "entities": ["a"],
             "confidence": 0.7,
         }
@@ -120,15 +150,17 @@ async def test_classify_routing_is_deterministic_by_prompt() -> None:
     def responder(prompt: str, system: str | None) -> dict[str, Any] | None:
         if "thiserror" in prompt:
             return {
-                "type": "preference",
                 "scope": "global",
+                "category": "preference",
+                "cross_ref": False,
                 "entities": ["rust"],
                 "confidence": 0.9,
             }
         if "tokio 1.38" in prompt:
             return {
-                "type": "project_fact",
-                "scope": "project:rust-cli",
+                "scope": "project",
+                "category": "decision",
+                "cross_ref": False,
                 "entities": ["tokio"],
                 "confidence": 0.8,
             }
@@ -140,6 +172,6 @@ async def test_classify_routing_is_deterministic_by_prompt() -> None:
     pref = await extractor.classify("I prefer thiserror.", ctx)
     fact = await extractor.classify("This project pins tokio 1.38.", ctx)
 
-    assert pref.type is MemoryType.PREFERENCE and pref.scope.is_global
-    assert fact.type is MemoryType.PROJECT_FACT
+    assert pref.scope_decision is ScopeDecision.GLOBAL and pref.scope.is_global
+    assert fact.scope_decision is ScopeDecision.PROJECT
     assert fact.scope == Scope.project("rust-cli")

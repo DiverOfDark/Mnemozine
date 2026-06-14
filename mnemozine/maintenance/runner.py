@@ -40,10 +40,13 @@ from mnemozine.interfaces import (
     StorageBackend,
 )
 from mnemozine.maintenance.audit import AuditJob
+from mnemozine.maintenance.category_merge import CategoryMergeJob
 from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob
+from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
+from mnemozine.schema.models import Scope
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +61,23 @@ def build_default_jobs(
     """Construct the standard maintenance job set in a deterministic run order.
 
     Order matters for a single pass: consolidate first (collapses duplicate
-    facts), resolve entities next (the merged graph), then decay/archive (demote
-    the now-quiet hot tier), and finally audit (report on the settled state).
+    facts), resolve entities next (the merged graph), then merge near-duplicate
+    emergent categories (the category analogue of entity resolution), then
+    decay/archive (demote the now-quiet hot tier), and finally audit (report on
+    the settled state).
+
+    The re-extract / reclassify passes are intentionally **not** in this default
+    scheduled set: re-running the extractor/classifier over the whole store is an
+    explicit, operator-triggered offline migration (applied after a model/prompt
+    change), exposed as the ``re-extract`` / ``reclassify`` subcommands rather
+    than run on every cron tick.
     """
 
     settings = settings or get_settings()
     return [
         ConsolidationJob(storage, llm, embeddings, settings=settings),
         EntityResolutionJob(storage, llm=llm, settings=settings),
+        CategoryMergeJob(storage, embeddings=embeddings, settings=settings),
         DecayJob(storage, settings=settings),
         AuditJob(storage, settings=settings),
     ]
@@ -113,10 +125,13 @@ class MaintenanceRunner:
                 )
             reports.append(report)
             logger.info(
-                "maintenance job %s: consolidated=%d merged=%d archived=%d pruned=%d",
+                "maintenance job %s: consolidated=%d merged=%d cat_merged=%d "
+                "re_extracted=%d archived=%d pruned=%d",
                 report.job_name,
                 report.consolidated,
                 report.entities_merged,
+                report.categories_merged,
+                report.re_extracted,
                 report.archived,
                 report.edges_pruned,
             )
@@ -129,11 +144,15 @@ class MaintenanceRunner:
                     summary=(
                         f"maintenance {report.job_name}: "
                         f"consolidated={report.consolidated} merged={report.entities_merged} "
+                        f"cat_merged={report.categories_merged} "
+                        f"re_extracted={report.re_extracted} "
                         f"archived={report.archived} pruned={report.edges_pruned}"
                     ),
                     detail={
                         "consolidated": report.consolidated,
                         "entities_merged": report.entities_merged,
+                        "categories_merged": report.categories_merged,
+                        "re_extracted": report.re_extracted,
                         "archived": report.archived,
                         "edges_pruned": report.edges_pruned,
                         "notes": list(report.notes),
@@ -219,12 +238,19 @@ def _cmd_run() -> None:
     runner = _build_runner_from_env()
     reports = asyncio.run(runner.run_once())
     for r in reports:
-        typer.echo(
-            f"[{r.job_name}] consolidated={r.consolidated} merged={r.entities_merged} "
-            f"archived={r.archived} pruned={r.edges_pruned}"
-        )
-        for note in r.notes:
-            typer.echo(f"    - {note}")
+        _echo_report(r)
+
+
+def _echo_report(r: MaintenanceReport) -> None:
+    """Print a one-line summary of a report plus its notes (shared by subcommands)."""
+
+    typer.echo(
+        f"[{r.job_name}] consolidated={r.consolidated} merged={r.entities_merged} "
+        f"cat_merged={r.categories_merged} re_extracted={r.re_extracted} "
+        f"archived={r.archived} pruned={r.edges_pruned}"
+    )
+    for note in r.notes:
+        typer.echo(f"    - {note}")
 
 
 @maintenance_cli.command("serve")
@@ -292,6 +318,196 @@ def _cmd_migrate_index(
     typer.echo(f"[{report.job_name}] reembedded={report.consolidated}")
     for note in report.notes:
         typer.echo(f"    - {note}")
+
+
+# ---------------------------------------------------------------------------
+# Category merge (mnemozine-maintenance merge-categories)
+# ---------------------------------------------------------------------------
+
+
+async def _run_merge_categories(*, dry_run: bool = False) -> MaintenanceReport:
+    """Build the wired :class:`CategoryMergeJob` from the live container and run it.
+
+    The category-merge job needs only the storage backend (the category registry)
+    and the embedding provider (to compare category *names*). When ``dry_run`` is
+    set, the read-only :meth:`CategoryMergeJob.propose_merges` proposals are folded
+    into a report's notes without applying any merge — the CLI preview of what the
+    pass would do. Lazily imports the composition root to keep tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    embeddings = container.build_embedding_provider()
+    job = CategoryMergeJob(storage, embeddings=embeddings, settings=settings)
+    try:
+        if dry_run:
+            proposals = await job.propose_merges()
+            report = MaintenanceReport(job_name=job.name)
+            for source, target in proposals:
+                report.notes.append(f"would merge category '{source}' -> '{target}'")
+            report.notes.append(f"dry-run: {len(proposals)} proposed merge(s)")
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("merge-categories")
+def _cmd_merge_categories(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only print the proposed (source -> canonical) merges; apply nothing.",
+    ),
+) -> None:
+    """Merge near-duplicate emergent categories into a canonical one (FR-MNT-2/4).
+
+    The category analogue of entity resolution: clusters the free-form
+    ``MemoryUnit.category`` registry by name/embedding similarity above
+    ``category.merge_similarity_threshold`` and folds each cluster into its
+    highest-count canonical category. Idempotent: a re-run finds nothing left to
+    merge. Use ``--dry-run`` to review the proposals first.
+    """
+
+    report = asyncio.run(_run_merge_categories(dry_run=dry_run))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Reclassify (mnemozine-maintenance reclassify) — re-tag from stored content
+# ---------------------------------------------------------------------------
+
+
+async def _run_reclassify(*, scope: str | None = None) -> MaintenanceReport:
+    """Build the wired :class:`ReclassifyJob` and re-tag stored memories (R1).
+
+    Re-scopes + re-categorizes existing memories from their stored content +
+    provenance through the *current* classifier — no raw transcript needed, so it
+    works after Claude's 30-day cleanup (R4). An optional ``scope`` string
+    (canonical form, e.g. ``project:Mnemozine``) narrows the pass to one scope.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    extractor = container.build_extractor()
+    scope_obj = Scope.parse(scope, settings.scope.delimiter) if scope else None
+    job = ReclassifyJob(storage, extractor, scope=scope_obj, settings=settings)
+    try:
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("reclassify")
+def _cmd_reclassify(
+    scope: str | None = typer.Option(
+        None,
+        "--scope",
+        help=(
+            "Restrict to one scope (canonical form, e.g. 'global' or "
+            "'project:Mnemozine'); default: all scopes."
+        ),
+    ),
+) -> None:
+    """Re-scope + re-categorize stored memories with the current classifier (R1).
+
+    Reads each memory's already-stored content + provenance (no raw transcript)
+    and re-applies the current scope/category/cross-ref decision, writing only the
+    fields that drifted. Idempotent: a memory already matching the classifier is
+    left untouched. Use this to apply a classifier prompt/model change to
+    historical data offline.
+    """
+
+    report = asyncio.run(_run_reclassify(scope=scope))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Re-extract (mnemozine-maintenance re-extract) — re-run extractor over raw tier
+# ---------------------------------------------------------------------------
+
+
+async def _run_re_extract(
+    *,
+    scope: str | None = None,
+    session_id: str | None = None,
+    supersede_existing: bool = True,
+) -> MaintenanceReport:
+    """Build the wired :class:`ReExtractJob` and re-run extraction over the raw tier.
+
+    Re-processes the retained :class:`~mnemozine.schema.models.RawChunk` tier
+    through the *current* extractor (applies a model/prompt change offline). The
+    raw tier survives Claude's 30-day cleanup (R4). Optional ``scope`` /
+    ``session_id`` narrow the sweep (EXACT scope — a re-extraction must not widen).
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    extractor = container.build_extractor()
+    scope_obj = Scope.parse(scope, settings.scope.delimiter) if scope else None
+    job = ReExtractJob(
+        storage,
+        extractor,
+        scope=scope_obj,
+        session_id=session_id,
+        supersede_existing=supersede_existing,
+        settings=settings,
+    )
+    try:
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("re-extract")
+def _cmd_re_extract(
+    scope: str | None = typer.Option(
+        None,
+        "--scope",
+        help="Restrict to one EXACT scope (e.g. 'project:Mnemozine'); default: all.",
+    ),
+    session_id: str | None = typer.Option(
+        None,
+        "--session-id",
+        help="Restrict to one originating session id; default: all sessions.",
+    ),
+    keep_existing: bool = typer.Option(
+        False,
+        "--keep-existing",
+        help=(
+            "Do NOT close the validity windows of the memories each chunk "
+            "previously produced (default: supersede them so the new extraction "
+            "replaces the old)."
+        ),
+    ),
+) -> None:
+    """Re-run the current extractor over the retained raw tier (offline reindex).
+
+    Re-processes stored RawChunks through the current extractor/classifier to
+    apply a model or prompt change to already-ingested data, without the original
+    transcript. By default the memories each chunk previously produced are
+    superseded so the new extraction replaces the old; ``--keep-existing`` leaves
+    them active. Idempotent: an unchanged extractor reinforces rather than
+    duplicates.
+    """
+
+    report = asyncio.run(
+        _run_re_extract(
+            scope=scope,
+            session_id=session_id,
+            supersede_existing=not keep_existing,
+        )
+    )
+    _echo_report(report)
 
 
 def run_maintenance() -> None:

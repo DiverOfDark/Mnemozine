@@ -24,14 +24,16 @@ Why iterate rather than key-read for detail/counts? The
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 
 from mnemozine.interfaces import StorageBackend
-from mnemozine.schema.models import MemoryUnit, Scope
+from mnemozine.schema.models import GLOBAL_SCOPE, MemoryUnit, Scope
 from mnemozine.web.schemas import (
     MemoryDetail,
     MemoryListItem,
     Provenance,
+    ScopeTreeNode,
     SupersessionLink,
     ValidityWindow,
 )
@@ -73,7 +75,9 @@ def memory_to_list_item(memory: MemoryUnit) -> MemoryListItem:
 
     return MemoryListItem(
         id=memory.id,
-        type=memory.type,
+        category=memory.category,
+        cross_ref_candidate=memory.cross_ref_candidate,
+        scope_decision=memory.scope_decision,
         content=memory.content,
         scope=memory.scope.as_str(),
         entities=list(memory.entities),
@@ -129,7 +133,7 @@ def derive_supersession_chain(
         for m in universe
         if m.id != memory.id
         and m.scope.as_str() == scope
-        and m.type == memory.type
+        and m.category == memory.category
         and _overlaps(m.entities, memory.entities)
     ]
 
@@ -173,7 +177,9 @@ def memory_to_detail(
     supersedes, superseded_by = derive_supersession_chain(memory, universe)
     return MemoryDetail(
         id=memory.id,
-        type=memory.type,
+        category=memory.category,
+        cross_ref_candidate=memory.cross_ref_candidate,
+        scope_decision=memory.scope_decision,
         content=memory.content,
         scope=memory.scope.as_str(),
         entities=list(memory.entities),
@@ -195,6 +201,65 @@ def memory_to_detail(
         last_accessed=memory.last_accessed,
         access_count=memory.access_count,
     )
+
+
+def build_scope_tree(memories: Iterable[MemoryUnit]) -> ScopeTreeNode:
+    """Build the hierarchical project/sub-scope tree with per-node counts.
+
+    Walks every memory's stored :class:`~mnemozine.schema.models.Scope` path and
+    materializes the ordered-segment hierarchy as a tree rooted at ``global``.
+    Each :class:`~mnemozine.web.schemas.ScopeTreeNode` records:
+
+    * ``count``       — memories stored *exactly* at that scope, and
+    * ``total_count`` — that node plus every descendant (the ancestor-composed
+      roll-up a query at that scope sees from this subtree).
+
+    Intermediate nodes are synthesized even when no memory is stored exactly
+    there (a memory at ``project:P/auth/api`` creates the ``project:P`` and
+    ``project:P/auth`` nodes with ``count=0``), so the navigator can always drill
+    the full path. Children are sorted by descending roll-up then segment name.
+    """
+
+    # A mutable scratch tree keyed by full scope-path string.
+    @dataclass
+    class _N:
+        segment: str
+        path: str
+        depth: int
+        count: int = 0
+        children: dict[str, _N] = field(default_factory=dict)
+
+    root = _N(segment=GLOBAL_SCOPE, path=GLOBAL_SCOPE, depth=0)
+
+    for mem in memories:
+        segments = mem.scope.segments
+        node = root
+        if not segments:
+            node.count += 1
+            continue
+        for i, seg in enumerate(segments):
+            child = node.children.get(seg)
+            if child is None:
+                path = Scope(segments=segments[: i + 1]).as_str()
+                child = _N(segment=seg, path=path, depth=i + 1)
+                node.children[seg] = child
+            node = child
+        node.count += 1
+
+    def _to_node(scratch: _N) -> ScopeTreeNode:
+        children = [_to_node(c) for c in scratch.children.values()]
+        total = scratch.count + sum(c.total_count for c in children)
+        children.sort(key=lambda c: (-c.total_count, c.segment))
+        return ScopeTreeNode(
+            segment=scratch.segment,
+            path=scratch.path,
+            depth=scratch.depth,
+            count=scratch.count,
+            total_count=total,
+            children=children,
+        )
+
+    return _to_node(root)
 
 
 async def collect_memories(
@@ -220,5 +285,6 @@ __all__ = [
     "memory_to_list_item",
     "memory_to_detail",
     "derive_supersession_chain",
+    "build_scope_tree",
     "collect_memories",
 ]

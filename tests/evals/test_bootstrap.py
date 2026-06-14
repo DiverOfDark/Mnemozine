@@ -21,6 +21,7 @@ from mnemozine.schema.models import (
     MemoryUnit,
     Provenance,
     Scope,
+    ScopeDecision,
 )
 
 
@@ -37,12 +38,19 @@ class _ScriptedExtractor:
         return out
 
     async def classify(self, statement: str, context: RetrievalContext) -> Classification:
-        return Classification(type=MemoryType.PREFERENCE, scope=Scope.global_())
+        return Classification(
+            scope_decision=ScopeDecision.GLOBAL,
+            scope=Scope.global_(),
+            category="preference",
+        )
 
 
 def _unit(content: str, mtype: MemoryType, scope: Scope) -> MemoryUnit:
+    # The bootstrap review sheet still speaks the legacy MemoryType, so the
+    # helper takes one and reverse-maps it onto the category-split MemoryUnit.
     return MemoryUnit(
-        type=mtype,
+        category=mtype.category,
+        cross_ref_candidate=mtype.is_cross_ref,
         content=content,
         scope=scope,
         entities=["rust"],
@@ -152,9 +160,7 @@ def test_operator_type_correction_is_captured() -> None:
     ]
     md = render_review_markdown(cands)
     # Operator ticks keep AND fixes the type to project_fact.
-    md = md.replace("- [ ] keep", "- [x] keep").replace(
-        "type: preference", "type: project_fact"
-    )
+    md = md.replace("- [ ] keep", "- [x] keep").replace("type: preference", "type: project_fact")
     parsed = parse_review_markdown(md)
     assert parsed[0].final_type is MemoryType.PROJECT_FACT
     assert parsed[0].corrected_type is MemoryType.PROJECT_FACT
@@ -184,7 +190,7 @@ def test_candidates_to_gold_set_only_keeps_kept() -> None:
     assert gs.memories[0].gold_id == "c0"
     # Each kept candidate yields a classifier case (R1 metric).
     assert len(gs.classifier_cases) == 1
-    assert gs.classifier_cases[0].expected_type is MemoryType.PREFERENCE
+    assert gs.classifier_cases[0].expected_scope_decision is ScopeDecision.GLOBAL
 
 
 def test_candidates_to_gold_set_project_scope_sets_case_project() -> None:
@@ -200,7 +206,7 @@ def test_candidates_to_gold_set_project_scope_sets_case_project() -> None:
     ]
     gs = candidates_to_gold_set(cands)
     assert gs.classifier_cases[0].project == "rust-cli"
-    assert gs.classifier_cases[0].expected_type is MemoryType.PROJECT_FACT
+    assert gs.classifier_cases[0].expected_scope_decision is ScopeDecision.PROJECT
 
 
 def test_review_stats_counts() -> None:
@@ -244,4 +250,4 @@ def test_kept_gold_set_runs_classifier_metric() -> None:
     ]
     gs = candidates_to_gold_set(cands)
     assert gs.classifier_cases
-    assert gs.memory_by_gold_id("c0").type is MemoryType.PREFERENCE
+    assert gs.memory_by_gold_id("c0").category == "preference"

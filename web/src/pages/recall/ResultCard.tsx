@@ -1,19 +1,26 @@
 /**
  * ResultCard (FE-B / PRD §4.5) — one ranked recall hit: rank index, the relevance
- * <ScoreBar>, type/tier/status badges (color-by-type, struck/greyed if superseded),
- * the content snippet, the **why-it-surfaced** note, and a link into the memory
- * detail. Keyboard-focusable; the parent list drives j/k selection by setting
- * `selected` + scrolling it into view.
+ * <ScoreBar>, category/tier/status badges (color-by-category, struck/greyed if
+ * superseded), the scope path, the content snippet, the **why-it-surfaced** note,
+ * and a link into the memory detail. Keyboard-focusable; the parent list drives j/k
+ * selection by setting `selected` + scrolling it into view.
  */
 
 import { forwardRef } from "react";
 import { Link } from "react-router-dom";
-import { ScoreBar, StatusBadge, TierBadge, TypeBadge } from "@/components/index";
+import {
+  CategoryBadge,
+  CrossRefBadge,
+  ScopePath,
+  ScoreBar,
+  StatusBadge,
+  TierBadge,
+} from "@/components/index";
 import type { ScoredMemory } from "@/api";
 import { PATHS } from "@/routes";
 import { cn } from "@/lib/cn";
 import { shortId } from "@/lib/format";
-import { HEX } from "@/theme/tokens";
+import { categoryColor } from "@/theme/tokens";
 
 interface ResultCardProps {
   rank: number;
@@ -37,7 +44,7 @@ export const ResultCard = forwardRef<HTMLDivElement, ResultCardProps>(function R
         "rounded-md border bg-bg-raised transition-colors",
         selected ? "border-accent bg-bg-hover" : "border-border hover:border-border-strong",
       )}
-      style={{ borderLeftWidth: 3, borderLeftColor: HEX.type[memory.type] }}
+      style={{ borderLeftWidth: 3, borderLeftColor: categoryColor(memory.category).fg }}
     >
       <div className="flex items-start gap-3 p-3">
         <span className="mt-0.5 w-6 shrink-0 text-right font-mono text-2xs tabular-nums text-text-faint">
@@ -46,7 +53,9 @@ export const ResultCard = forwardRef<HTMLDivElement, ResultCardProps>(function R
         <div className="min-w-0 flex-1">
           {/* badges + score row */}
           <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
-            <TypeBadge type={memory.type} />
+            <CategoryBadge category={memory.category} />
+            {memory.cross_ref_candidate && <CrossRefBadge />}
+            <ScopePath scope={memory.scope} />
             <TierBadge tier={memory.tier} />
             <StatusBadge active={active} />
             <span className="ml-auto flex items-center gap-2">

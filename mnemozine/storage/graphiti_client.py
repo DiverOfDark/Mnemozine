@@ -64,6 +64,9 @@ MEMORY_LABEL = "MnemozineMemory"
 ENTITY_LABEL = "MnemozineEntity"
 SESSION_LABEL = "MnemozineSession"
 SUPPRESSION_LABEL = "MnemozineSuppression"
+# Label for the retained RawChunk nodes (the raw tier: normalized extraction
+# input, kept for offline re-extraction/reindex; survives the 30-day cleanup, R4).
+RAW_CHUNK_LABEL = "MnemozineRawChunk"
 # Relationship type for the weighted, temporal entity-entity edges (§7 Edge).
 RELATES_TYPE = "MNEMOZINE_RELATES"
 

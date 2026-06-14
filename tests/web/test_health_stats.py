@@ -27,12 +27,16 @@ def test_health_falkordb_in_memory_backend_ok(client: TestClient) -> None:
     assert components["falkordb"]["status"] == "ok"
 
 
-def test_stats_counts_by_type_tier_source(client: TestClient) -> None:
+def test_stats_counts_by_category_scope_tier_source(client: TestClient) -> None:
     resp = client.get("/api/stats")
     assert resp.status_code == 200
     body = resp.json()
     assert body["total_memories"] == 4
-    assert body["by_type"] == {"preference": 2, "project_fact": 1, "idea_seed": 1}
+    # Free-form categories replace the old fixed type enum (counts over all rows,
+    # so the superseded 'preference' is included here).
+    assert body["by_category"] == {"preference": 2, "decision": 1, "idea": 1}
+    # The controlled scope decision is derived from the hierarchical scope.
+    assert body["by_scope_decision"] == {"global": 3, "project": 1}
     assert body["by_tier"] == {"hot": 3, "archive": 1}
     assert body["by_source"] == {"claude_code": 2, "openai": 1, "hermes": 1}
 

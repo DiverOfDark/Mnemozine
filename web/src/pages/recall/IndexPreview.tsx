@@ -2,8 +2,12 @@
  * IndexPreview (FE-B / PRD §4.5, FR-RET-3) — a live preview of the ~500-token
  * SessionStart injection index that recall would emit. Shows a token-budget meter
  * (estimate / budget, turning warn→danger as it approaches/exceeds budget), the
- * preference / project_fact counts, the idea-seed hints + entity tags, and the raw
- * index text in a mono panel (the actual bytes that would be injected).
+ * global / project SCOPE counts, the cross-reference hints + entity tags, and the
+ * raw index text in a mono panel (the actual bytes that would be injected).
+ *
+ * The core data-model redesign renamed the counts: preference→global,
+ * project_fact→project, idea_seed_hints→cross_ref_hints (the index now reports by
+ * the controlled scope decision, not the old type enum).
  *
  * This is the precision-debugging payload — the operator reads exactly what the
  * model would see at SessionStart.
@@ -12,7 +16,6 @@
 import { Badge } from "@/components/index";
 import type { InjectionIndexPreview } from "@/api";
 import { cn } from "@/lib/cn";
-import { TYPE_BADGE } from "@/theme/tokens";
 
 export function IndexPreview({ preview }: { preview: InjectionIndexPreview }) {
   const { token_estimate, token_budget } = preview;
@@ -41,31 +44,28 @@ export function IndexPreview({ preview }: { preview: InjectionIndexPreview }) {
         </div>
       </div>
 
-      {/* counts ------------------------------------------------------------- */}
+      {/* scope counts ------------------------------------------------------- */}
       <div className="flex flex-wrap items-center gap-1.5">
-        <Badge textClass={TYPE_BADGE.preference.text} bgClass={TYPE_BADGE.preference.bg} dotClass={TYPE_BADGE.preference.dot}>
-          {preview.preference_count} preferences
+        <Badge textClass="text-info" bgClass="bg-bg-inset" dotClass="bg-info">
+          {preview.global_count} global
         </Badge>
-        <Badge
-          textClass={TYPE_BADGE.project_fact.text}
-          bgClass={TYPE_BADGE.project_fact.bg}
-          dotClass={TYPE_BADGE.project_fact.dot}
-        >
-          {preview.project_fact_count} project_facts
+        <Badge textClass="text-accent" bgClass="bg-accent-muted" dotClass="bg-accent">
+          {preview.project_count} project
         </Badge>
       </div>
 
-      {/* idea-seed hints ---------------------------------------------------- */}
-      {preview.idea_seed_hints.length > 0 && (
+      {/* cross-reference hints ---------------------------------------------- */}
+      {preview.cross_ref_hints.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <span className="text-2xs uppercase tracking-wide text-text-faint">idea-seed hints</span>
+          <span className="text-2xs uppercase tracking-wide text-text-faint">
+            cross-reference hints
+          </span>
           <div className="flex flex-wrap gap-1.5">
-            {preview.idea_seed_hints.map((hint, i) => (
+            {preview.cross_ref_hints.map((hint, i) => (
               <Badge
                 key={i}
-                textClass={TYPE_BADGE.idea_seed.text}
-                bgClass={TYPE_BADGE.idea_seed.bg}
-                dotClass={TYPE_BADGE.idea_seed.dot}
+                outline
+                style={{ color: "#fb7185" }}
                 className="normal-case"
               >
                 {hint}

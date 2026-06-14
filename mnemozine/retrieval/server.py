@@ -45,12 +45,13 @@ class RecalledMemory:
 
     The MCP wire surface is plain JSON, so we project the rich
     :class:`~mnemozine.schema.models.MemoryUnit` down to the fields an agent
-    actually needs: the distilled content, its type/scope, the relevance score,
-    the linked entities, confidence, and a provenance pointer for auditing.
+    actually needs: the distilled content, its category/scope, the relevance
+    score, the linked entities, confidence, and a provenance pointer for auditing.
     """
 
     id: str
-    type: str
+    category: str
+    cross_ref_candidate: bool
     content: str
     scope: str
     score: float
@@ -64,7 +65,8 @@ class RecalledMemory:
         m = retrieved.memory
         return cls(
             id=m.id,
-            type=m.type.value,
+            category=m.category,
+            cross_ref_candidate=m.cross_ref_candidate,
             content=m.content,
             scope=m.scope.as_str(),
             score=round(retrieved.score, 6),
@@ -179,9 +181,9 @@ def build_mcp_server(
         return {
             "text": index.text,
             "token_estimate": index.token_estimate,
-            "preference_count": index.preference_count,
-            "project_fact_count": index.project_fact_count,
-            "idea_seed_hints": index.idea_seed_hints,
+            "global_count": index.global_count,
+            "project_count": index.project_count,
+            "cross_ref_hints": index.cross_ref_hints,
             "entity_tags": index.entity_tags,
         }
 
@@ -198,9 +200,9 @@ def build_mcp_server(
         return {
             "text": index.text,
             "token_estimate": index.token_estimate,
-            "preference_count": index.preference_count,
-            "project_fact_count": index.project_fact_count,
-            "idea_seed_hints": index.idea_seed_hints,
+            "global_count": index.global_count,
+            "project_count": index.project_count,
+            "cross_ref_hints": index.cross_ref_hints,
             "entity_tags": index.entity_tags,
         }
 

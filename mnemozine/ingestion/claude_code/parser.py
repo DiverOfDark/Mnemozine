@@ -27,9 +27,13 @@ import json
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mnemozine.schema.events import IngestEvent, Role, Source
+from mnemozine.schema.models import Scope
+
+if TYPE_CHECKING:
+    from mnemozine.config import Settings
 
 # Claude Code transcript line ``type`` values that carry a conversational turn.
 _CONVERSATIONAL_TYPES = frozenset({"user", "assistant"})
@@ -85,6 +89,123 @@ def derive_project(path: str | Path, *, cwd: str | None = None) -> str:
     # last separator is the leaf working-directory name.
     leaf = encoded.rstrip("-").rsplit("-", 1)[-1]
     return leaf or encoded
+
+
+# Subdirectory under a session dir that holds subagent / workflow transcripts.
+# A transcript living under …/<encoded-cwd>/<session>/subagents/… is a subagent
+# or workflow run of that parent session and MUST roll up to the parent project
+# (FR-EXT-3 no opaque project:agent-XXXX scope).
+_SUBAGENTS_DIRNAME = "subagents"
+# A workflow segment id prefix (…/subagents/workflows/wf_<id>/agent-<id>.jsonl).
+_WORKFLOW_SEGMENT_PREFIX = "wf_"
+
+
+def decode_project_dirname(encoded: str) -> str:
+    """Decode a Claude Code path-encoded project dir to a friendly project name.
+
+    Claude Code names each per-project transcript dir by replacing the path
+    separators of the working directory with ``-`` (e.g.
+    ``-var-home-op-Projects-rust-cli`` for ``/var/home/op/Projects/rust-cli``).
+    The friendly project name is the *last path component* of the decoded cwd —
+    here ``rust-cli``.
+
+    Because both the path separator and a literal hyphen inside a directory name
+    both encode to ``-``, the decoding is lossy and the leaf cannot always be
+    recovered exactly; this returns the trailing ``-``-separated segment, which
+    is the best available label and matches what :func:`derive_project` produced.
+    """
+
+    leaf = encoded.strip("-").rsplit("-", 1)[-1]
+    return leaf or encoded.strip("-") or encoded
+
+
+def _project_dir_for_transcript(path: Path, projects_dirname: str) -> Path | None:
+    """Return the top-level ``<projects>/<encoded-cwd>`` dir for a transcript.
+
+    Walks up from the transcript file to find the ``<projects_dirname>`` ancestor
+    and returns the immediate child of it on the path — the encoded-cwd project
+    dir — regardless of how deep the transcript lives (a top-level session
+    ``…/<encoded-cwd>/<session>.jsonl`` or a subagent
+    ``…/<encoded-cwd>/<session>/subagents/…/agent-*.jsonl`` both resolve to the
+    same ``<encoded-cwd>`` dir). Returns ``None`` if no ``projects`` ancestor is
+    on the path.
+    """
+
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part == projects_dirname and i + 1 < len(parts):
+            return Path(*parts[: i + 2])
+    return None
+
+
+def derive_scope_from_transcript(
+    path: str | Path,
+    settings: Settings | None = None,
+    *,
+    cwd: str | None = None,
+) -> Scope:
+    """Map a Claude Code transcript path to its hierarchical :class:`Scope` (FR-EXT-3).
+
+    The parent PROJECT is the top-level ``$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>``
+    directory, DECODED to a friendly name (the last path component of the encoded
+    cwd). The literal ``cwd`` from the transcript line is preferred when given
+    (it is the real working directory, not the lossy encoded form).
+
+    SUBAGENT / WORKFLOW transcripts live UNDER a session's dir
+    (``…/<encoded-cwd>/<session>/subagents/…``) and ROLL UP to that same parent
+    project — they never get an opaque ``project:agent-XXXX`` scope. A
+    workflow segment (``…/subagents/workflows/wf_<id>/…``) is rolled up as an
+    optional sub-segment (``project:<name>/wf_<id>``) when
+    ``ScopeSettings.subagent_subsegments`` is enabled (default off → roll up to
+    the bare ``project:<name>``), so subagent memories compose with the project
+    via the ancestor chain (no-leak: still under the project, never a sibling).
+    """
+
+    from mnemozine.config import get_settings  # local import to avoid a cycle
+
+    resolved = settings or get_settings()
+    scope_cfg = resolved.scope
+    p = Path(path)
+
+    # 1. Find the encoded-cwd project dir (the immediate child of `projects/`).
+    project_dir = _project_dir_for_transcript(p, PROJECTS_DIRNAME)
+
+    # 2. Project name: the literal cwd leaf wins; else decode the encoded dir.
+    project_name: str | None = None
+    if cwd:
+        leaf = Path(cwd).name
+        if leaf:
+            project_name = leaf
+    if project_name is None and project_dir is not None:
+        project_name = decode_project_dirname(project_dir.name)
+    if project_name is None:
+        # No projects/ ancestor and no cwd — fall back to the parent dir name.
+        project_name = decode_project_dirname(p.parent.name) if p.parent.name else p.stem
+
+    scope = Scope.project(project_name)
+
+    # 3. Roll a subagent/workflow transcript up under the same project. When
+    #    sub-segmenting is enabled, attach the workflow id as a sub-segment so it
+    #    composes with (and never leaks across) the project via the ancestor chain.
+    if scope_cfg.subagent_subsegments and project_dir is not None:
+        rel = p.relative_to(project_dir).parts if _is_relative_to(p, project_dir) else ()
+        if _SUBAGENTS_DIRNAME in rel:
+            wf = next(
+                (seg for seg in rel if seg.startswith(_WORKFLOW_SEGMENT_PREFIX)), None
+            )
+            if wf:
+                scope = scope.child(wf)
+    return scope
+
+
+def _is_relative_to(path: Path, other: Path) -> bool:
+    """``Path.is_relative_to`` shim (stable across the supported Python range)."""
+
+    try:
+        path.relative_to(other)
+        return True
+    except ValueError:
+        return False
 
 
 def _parse_timestamp(value: Any) -> datetime:

@@ -17,7 +17,7 @@ from mnemozine.interfaces import (
     WriteDecision,
 )
 from mnemozine.schema.events import IngestEvent, content_hash
-from mnemozine.schema.models import MemoryType, MemoryUnit, Scope, Tier
+from mnemozine.schema.models import MemoryUnit, RawChunk, Scope, ScopeDecision, Tier
 from tests.conftest import FakeEmbeddingProvider, FakeLLMProvider, InMemoryStorage
 
 
@@ -44,6 +44,76 @@ def test_scope_roundtrip() -> None:
     assert Scope.project("rust-cli").as_str() == "project:rust-cli"
     assert Scope.parse("project:rust-cli").project_id == "rust-cli"
     assert Scope.parse("global").is_global
+
+
+def test_scope_hierarchical_roundtrip() -> None:
+    # A sub-scope round-trips through the canonical string form.
+    sub = Scope.project("Mnemozine", "auth")
+    assert sub.as_str() == "project:Mnemozine/auth"
+    assert Scope.parse("project:Mnemozine/auth").segments == ["Mnemozine", "auth"]
+    assert sub.project_id == "Mnemozine"  # the project segment, not the leaf
+    assert sub.leaf == "auth"
+    # child() is the constructor for going one level deeper.
+    assert Scope.project("Mnemozine").child("auth").as_str() == "project:Mnemozine/auth"
+
+
+def test_scope_ancestors_compose_chain() -> None:
+    # ancestors() yields [global, project:P, project:P/sub] (root first, self last).
+    chain = [s.as_str() for s in Scope.project("Mnemozine", "auth").ancestors()]
+    assert chain == ["global", "project:Mnemozine", "project:Mnemozine/auth"]
+    assert [s.as_str() for s in Scope.global_().ancestors()] == ["global"]
+
+
+def test_scope_no_leak_ancestor_or_self() -> None:
+    g = Scope.global_()
+    proj = Scope.project("Mnemozine")
+    auth = Scope.project("Mnemozine", "auth")
+    db = Scope.project("Mnemozine", "db")
+    other = Scope.project("Other")
+
+    # A query at auth sees ancestor-or-self: global, project, auth itself.
+    assert g.contains(auth)
+    assert proj.contains(auth)
+    assert auth.contains(auth)
+    # Siblings never leak into each other.
+    assert not db.contains(auth)
+    assert not auth.contains(db)
+    # A different project never leaks.
+    assert not other.contains(auth)
+    # is_descendant_of is the symmetric view.
+    assert auth.is_descendant_of(proj)
+    assert auth.is_descendant_of(g)
+    assert not auth.is_descendant_of(db)
+
+
+def test_memory_unit_category_split() -> None:
+    # The 3-value MemoryType is gone: scope decision is controlled, category free-form.
+    m = MemoryUnit(
+        content="Prefers thiserror over anyhow.",
+        scope=Scope.global_(),
+        category="Preference",  # normalized to a lowercased slug
+        cross_ref_candidate=False,
+    )
+    assert m.category == "preference"
+    assert m.scope_decision is ScopeDecision.GLOBAL
+    proj = MemoryUnit(content="pins tokio 1.38", scope=Scope.project("rust-cli"))
+    assert proj.scope_decision is ScopeDecision.PROJECT
+    assert proj.category == "fact"  # DEFAULT_CATEGORY
+
+
+def test_raw_chunk_retains_normalized_input() -> None:
+    chunk = RawChunk(
+        content_hash="deadbeef",
+        content="user:I prefer thiserror.",
+        source="claude_code",
+        session_id="sess-1",
+        scope=Scope.project("rust-cli"),
+        project="rust-cli",
+        event_count=1,
+        memory_ids=["m1"],
+    )
+    assert chunk.scope.as_str() == "project:rust-cli"
+    assert chunk.memory_ids == ["m1"]
 
 
 def test_content_hash_is_offset_invariant() -> None:
@@ -84,13 +154,13 @@ async def test_inmemory_write_decisions(sample_memory: MemoryUnit) -> None:
     r2 = await store.upsert_memory(dup)
     assert r2.decision is WriteDecision.REINFORCE
 
-    # supersede: a contradicting preference flips the window
+    # supersede: a contradicting global-decision memory flips the window
     store2 = InMemoryStorage(contradicts=lambda new, existing: True)
     await store2.upsert_memory(sample_memory)
     new_pref = MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content="Prefers anyhow over thiserror now.",
         scope=Scope.global_(),
+        category="preference",
         entities=["rust", "error-handling"],
         confidence=0.9,
         provenance=sample_memory.provenance,

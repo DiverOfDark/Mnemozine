@@ -28,7 +28,7 @@ from mnemozine.interfaces import (
     StorageBackend,
 )
 from mnemozine.schema.events import IngestEvent
-from mnemozine.schema.models import MemoryType, MemoryUnit, Scope
+from mnemozine.schema.models import MemoryType, MemoryUnit, Scope, ScopeDecision
 
 
 class StorageBackedRetriever:
@@ -76,14 +76,16 @@ class StorageBackedRetriever:
             entities=list(context.entities) or None,
             top_k=10,
         )
-        prefs = [r for r in results if r.memory.type is MemoryType.PREFERENCE]
-        text = "; ".join(r.memory.content for r in prefs[:3])
+        # Category-split contract: "preferences" are global-scope memories; the
+        # counts key on the controlled scope decision rather than the old type.
+        globals_ = [r for r in results if r.memory.scope_decision is ScopeDecision.GLOBAL]
+        text = "; ".join(r.memory.content for r in globals_[:3])
         return InjectionIndex(
             text=text,
             token_estimate=len(text.split()),
-            preference_count=len(prefs),
-            project_fact_count=sum(
-                1 for r in results if r.memory.type is MemoryType.PROJECT_FACT
+            global_count=len(globals_),
+            project_count=sum(
+                1 for r in results if r.memory.scope_decision is ScopeDecision.PROJECT
             ),
             entity_tags=list(context.entities),
         )
@@ -111,7 +113,7 @@ class GraphCrossReferencer:
         context_key = context.project or "global"
         out: list[CrossReference] = []
         async for m in self._storage.iter_memories(active_only=True):
-            if m.type is not MemoryType.IDEA_SEED:
+            if not m.cross_ref_candidate:
                 continue
             shared = sorted({e for e in m.entities if e.lower() in ctx_entities})
             if not shared:
@@ -168,27 +170,20 @@ class KeywordExtractor:
     )
 
     async def extract(self, chunk: Sequence[IngestEvent]) -> list[MemoryUnit]:
-        raise NotImplementedError(
-            "KeywordExtractor only supports classify() for the eval path"
-        )
+        raise NotImplementedError("KeywordExtractor only supports classify() for the eval path")
 
-    async def classify(
-        self, statement: str, context: RetrievalContext
-    ) -> Classification:
+    async def classify(self, statement: str, context: RetrievalContext) -> Classification:
         low = statement.lower()
         is_fact = any(m in low for m in self._FACT_MARKERS)
         is_pref = any(m in low for m in self._PREF_MARKERS)
         # A version pin or a named project + concrete tech reads as a fact even
         # if phrased with "I use ...".
-        if is_fact and not (is_pref and not any(
-            m in low for m in ("this project", "the project", " pins ", "datastore")
-        )):
+        if is_fact and not (
+            is_pref
+            and not any(m in low for m in ("this project", "the project", " pins ", "datastore"))
+        ):
             mtype = MemoryType.PROJECT_FACT
-            scope = (
-                Scope.project(context.project)
-                if context.project
-                else Scope.global_()
-            )
+            scope = Scope.project(context.project) if context.project else Scope.global_()
         elif is_pref:
             mtype = MemoryType.PREFERENCE
             scope = Scope.global_()
@@ -199,12 +194,15 @@ class KeywordExtractor:
             scope = Scope.global_()
         # Cheap entity guess: alpha tokens longer than 3 chars, de-duped.
         entities = sorted(
-            {
-                t.strip(".,:;()")
-                for t in low.split()
-                if t.strip(".,:;()").isalpha() and len(t) > 3
-            }
+            {t.strip(".,:;()") for t in low.split() if t.strip(".,:;()").isalpha() and len(t) > 3}
         )[:6]
+        # Map the heuristic's legacy type onto the category-split contract via the
+        # documented MemoryType migration helpers.
         return Classification(
-            type=mtype, scope=scope, entities=entities, confidence=0.7
+            scope_decision=mtype.scope_decision,
+            scope=scope,
+            category=mtype.category,
+            cross_ref_candidate=mtype.is_cross_ref,
+            entities=entities,
+            confidence=0.7,
         )

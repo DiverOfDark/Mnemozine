@@ -98,9 +98,9 @@ async def run_recall(
             text=index.text,
             token_estimate=index.token_estimate,
             token_budget=settings.inject.token_budget,
-            preference_count=index.preference_count,
-            project_fact_count=index.project_fact_count,
-            idea_seed_hints=list(index.idea_seed_hints),
+            global_count=index.global_count,
+            project_count=index.project_count,
+            cross_ref_hints=list(index.cross_ref_hints),
             entity_tags=list(index.entity_tags),
         )
 

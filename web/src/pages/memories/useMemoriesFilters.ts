@@ -1,19 +1,23 @@
 /**
  * useMemoriesFilters — the Memories screen's URL-backed filter + pagination state
- * (PRD §4.2). All table filters (type / tier / entity / source / active-vs-superseded
- * / free-text q) and the limit/offset window live in the URL search params so a
- * filtered view is shareable and survives reload / the browser back button. The
- * top-bar global search writes `?q=` and the top-bar scope is layered in from
- * ScopeContext (useScope) — this hook merges all of that into the typed MemoriesQuery
- * the useMemories hook consumes verbatim.
+ * (PRD §4.2). All table filters (category / tier / entity / source /
+ * active-vs-superseded / free-text q) and the limit/offset window live in the URL
+ * search params so a filtered view is shareable and survives reload / the browser
+ * back button. The top-bar global search writes `?q=` and the top-bar scope is
+ * layered in from ScopeContext (useScope) — this hook merges all of that into the
+ * typed MemoriesQuery the useMemories hook consumes verbatim.
+ *
+ * The old fixed `type` enum filter is now a FREE-FORM `category` filter: it is an
+ * arbitrary string (the value of a discovered category facet chip), not a member
+ * of a closed enum, so there is no allowlist to validate against.
  *
  * Page-local to the Memories screen.
  */
 
 import { useCallback, useMemo } from "react";
 import { useSearchParams } from "react-router-dom";
-import type { MemoriesQuery, MemoryType, Tier } from "@/api/types";
-import { MEMORY_TYPES, TIERS } from "@/api/types";
+import type { MemoriesQuery, Tier } from "@/api/types";
+import { TIERS } from "@/api/types";
 
 export const PAGE_SIZE = 50;
 
@@ -21,7 +25,8 @@ export const PAGE_SIZE = 50;
 export type ActiveFilter = "all" | "active" | "superseded";
 
 export interface MemoriesFilters {
-  type: MemoryType | "";
+  /** Free-form category filter ("" = all categories). */
+  category: string;
   tier: Tier | "";
   entity: string;
   source: string;
@@ -30,9 +35,6 @@ export interface MemoriesFilters {
   offset: number;
 }
 
-function readType(v: string | null): MemoryType | "" {
-  return v && (MEMORY_TYPES as readonly string[]).includes(v) ? (v as MemoryType) : "";
-}
 function readTier(v: string | null): Tier | "" {
   return v && (TIERS as readonly string[]).includes(v) ? (v as Tier) : "";
 }
@@ -59,7 +61,7 @@ export function useMemoriesFilters(scope: string | null): UseMemoriesFiltersResu
   const filters = useMemo<MemoriesFilters>(() => {
     const offsetRaw = Number(params.get("offset"));
     return {
-      type: readType(params.get("type")),
+      category: params.get("category") ?? "",
       tier: readTier(params.get("tier")),
       entity: params.get("entity") ?? "",
       source: params.get("source") ?? "",
@@ -78,7 +80,7 @@ export function useMemoriesFilters(scope: string | null): UseMemoriesFiltersResu
             if (value === undefined || value === "") next.delete(key);
             else next.set(key, value);
           };
-          if ("type" in patch) apply("type", patch.type);
+          if ("category" in patch) apply("category", patch.category);
           if ("tier" in patch) apply("tier", patch.tier);
           if ("entity" in patch) apply("entity", patch.entity);
           if ("source" in patch) apply("source", patch.source);
@@ -106,7 +108,7 @@ export function useMemoriesFilters(scope: string | null): UseMemoriesFiltersResu
 
   const query = useMemo<MemoriesQuery>(() => {
     const q: MemoriesQuery = { limit: PAGE_SIZE, offset: filters.offset };
-    if (filters.type) q.type = filters.type;
+    if (filters.category.trim()) q.category = filters.category.trim();
     if (filters.tier) q.tier = filters.tier;
     if (filters.entity.trim()) q.entity = filters.entity.trim();
     if (filters.source.trim()) q.source = filters.source.trim();
@@ -119,7 +121,7 @@ export function useMemoriesFilters(scope: string | null): UseMemoriesFiltersResu
   }, [filters, scope]);
 
   const hasActiveFilters =
-    filters.type !== "" ||
+    filters.category.trim() !== "" ||
     filters.tier !== "" ||
     filters.entity.trim() !== "" ||
     filters.source.trim() !== "" ||

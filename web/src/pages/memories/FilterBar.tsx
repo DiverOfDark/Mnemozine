@@ -1,14 +1,19 @@
 /**
  * FilterBar — the Memories table's filter toolbar (PRD §4.2). Drives the URL-backed
- * filters from useMemoriesFilters: type, tier, active-vs-superseded, entity, source,
- * and free-text (q). The top-bar scope filter (ScopeContext) is shown read-only here
- * since it is owned by the global TopBar. Text filters are debounced so typing
- * doesn't refetch on every keystroke. Page-local to the Memories screen.
+ * filters from useMemoriesFilters: category, tier, active-vs-superseded, entity,
+ * source, and free-text (q). The top-bar scope filter (ScopeContext) is shown
+ * read-only here since it is owned by the global TopBar. Text filters are debounced
+ * so typing doesn't refetch on every keystroke. Page-local to the Memories screen.
+ *
+ * The old fixed `type` enum dropdown is now a DYNAMIC CATEGORY facet: it lists the
+ * categories actually discovered in the store (with counts) from the
+ * /memories/facets/categories endpoint — categories are open-ended, so there is no
+ * hard-coded option list.
  */
 
 import { useEffect, useRef, useState } from "react";
 import { Field, Select, Input, Button } from "@/components/primitives";
-import { MEMORY_TYPES, TIERS } from "@/api/types";
+import { TIERS, type CategoryFacet } from "@/api/types";
 import type { ActiveFilter, MemoriesFilters } from "@/pages/memories/useMemoriesFilters";
 import { parseScope } from "@/lib/format";
 
@@ -74,10 +79,25 @@ interface FilterBarProps {
   hasActiveFilters: boolean;
   /** Total rows matching the current filters (for the result count chip). */
   total?: number;
+  /** Discovered category facets (category + count) for the dynamic CATEGORY filter. */
+  categoryFacets?: CategoryFacet[];
 }
 
-export function FilterBar({ filters, scope, setFilters, clearAll, hasActiveFilters, total }: FilterBarProps) {
+export function FilterBar({
+  filters,
+  scope,
+  setFilters,
+  clearAll,
+  hasActiveFilters,
+  total,
+  categoryFacets = [],
+}: FilterBarProps) {
   const scopeLabel = scope ? parseScope(scope).label : "all";
+  // If the active category isn't in the discovered set (e.g. a stale URL filter or
+  // a just-emptied store), still show it as an option so the value round-trips.
+  const knownCategories = categoryFacets.map((f) => f.category);
+  const showActiveAsExtra =
+    filters.category !== "" && !knownCategories.includes(filters.category);
 
   return (
     <div className="flex flex-wrap items-end gap-3">
@@ -89,14 +109,21 @@ export function FilterBar({ filters, scope, setFilters, clearAll, hasActiveFilte
         widthClass="w-48"
       />
 
-      <Field label="type">
-        <Select value={filters.type} onChange={(e) => setFilters({ type: e.target.value as MemoriesFilters["type"] })}>
-          <option value="">all</option>
-          {MEMORY_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
+      <Field label="category">
+        <Select
+          value={filters.category}
+          onChange={(e) => setFilters({ category: e.target.value })}
+          title="Filter by discovered free-form category"
+        >
+          <option value="">all categories</option>
+          {categoryFacets.map((f) => (
+            <option key={f.category} value={f.category}>
+              {f.category} ({f.count})
             </option>
           ))}
+          {showActiveAsExtra && (
+            <option value={filters.category}>{filters.category}</option>
+          )}
         </Select>
       </Field>
 

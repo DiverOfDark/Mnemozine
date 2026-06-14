@@ -23,14 +23,16 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Page } from "@/components/AppShell";
 import {
   Button,
+  CategoryBadge,
+  CrossRefBadge,
   ErrorState,
   KeyboardHints,
   Loading,
   Panel,
+  ScopePath,
   StatusBadge,
   SupersessionChain,
   TierBadge,
-  TypeBadge,
   ValidityTimeline,
   type KeyHint,
 } from "@/components/index";
@@ -38,7 +40,7 @@ import { useMemory } from "@/api";
 import type { MemoryDetail as MemoryDetailType } from "@/api";
 import { PATHS } from "@/routes";
 import { cn } from "@/lib/cn";
-import { HEX } from "@/theme/tokens";
+import { categoryColor } from "@/theme/tokens";
 
 import {
   AccessStats,
@@ -116,7 +118,7 @@ export default function MemoryDetail() {
         <span className="flex items-center gap-2.5">
           <span
             className="h-2.5 w-2.5 shrink-0 rounded-full"
-            style={{ backgroundColor: HEX.type[memory.type] }}
+            style={{ backgroundColor: categoryColor(memory.category).fg }}
             aria-hidden="true"
           />
           Memory
@@ -147,7 +149,9 @@ function Body({
         title="Content"
         actions={
           <div className="flex items-center gap-1.5">
-            <TypeBadge type={memory.type} />
+            <CategoryBadge category={memory.category} />
+            {memory.cross_ref_candidate && <CrossRefBadge />}
+            <ScopePath scope={memory.scope} />
             <TierBadge tier={memory.tier} />
             <StatusBadge active={active} />
           </div>

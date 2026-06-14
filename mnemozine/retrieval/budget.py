@@ -9,11 +9,16 @@ owns:
   *over*-estimates slightly so the real injected payload never exceeds the model's
   budget — truncating a little early is safe, overflowing is not.
 * :func:`render_index` — render the compact-index injection text from ranked
-  preference snippets, idea-seed hints, counts and entity tags, **dropping the
-  lowest-ranked snippets until the rendered text fits the budget** (FR-RET-3:
+  global-scope snippets, cross-reference hints, counts and entity tags, **dropping
+  the lowest-ranked snippets until the rendered text fits the budget** (FR-RET-3:
   "truncate to budget rather than overflow"). The structure is a clearly-delimited
-  advisory block (counts + entity tags + 1-line idea-seed hints + top-preference
-  snippets only) so the model treats it as background, not a directive.
+  advisory block (counts + entity tags + 1-line cross-ref hints + top
+  global-scope snippets only) so the model treats it as background, not a directive.
+
+Core redesign: the counts split on the controlled ``ScopeDecision`` (global vs
+project) rather than the old ``MemoryType`` (preference / project_fact), and the
+1-line hints are driven by the ``MemoryUnit.cross_ref_candidate`` flag rather than
+the dropped ``idea_seed`` type.
 
 Nothing here does I/O; it is pure rendering/estimation so it is trivially unit
 testable (the §9 budget-enforcement assertion runs against it).
@@ -59,29 +64,35 @@ def estimate_tokens(text: str) -> int:
 class IndexParts:
     """The structured ingredients of an injection index, pre-render/pre-truncate.
 
-    ``preference_snippets`` are ordered best-first; :func:`render_index` drops
-    from the tail to fit the budget. ``idea_seed_hints`` are 1-line strings; the
+    ``global_snippets`` are ordered best-first; :func:`render_index` drops from
+    the tail to fit the budget. ``cross_ref_hints`` are 1-line strings; the
     summary line (counts + entity tags) is always retained as the highest-value,
     smallest payload so the index never renders empty when anything matched.
+
+    Core redesign: ``global_count`` / ``project_count`` are the counts by the
+    controlled :class:`~mnemozine.schema.models.ScopeDecision` (replacing the old
+    ``preference_count`` / ``project_fact_count`` which keyed off ``MemoryType``);
+    ``cross_ref_hints`` is driven by the ``cross_ref_candidate`` flag (replacing
+    the old ``idea_seed_hints``).
     """
 
-    preference_snippets: list[str]
-    idea_seed_hints: list[str]
+    global_snippets: list[str]
+    cross_ref_hints: list[str]
     entity_tags: list[str]
-    preference_count: int
-    project_fact_count: int
+    global_count: int
+    project_count: int
 
 
 def _summary_line(parts: IndexParts) -> str:
     """The always-kept one-line summary: counts + entity tags (FR-RET-3 shape)."""
 
     bits: list[str] = []
-    if parts.preference_count:
-        bits.append(f"{parts.preference_count} preference(s)")
-    if parts.project_fact_count:
-        bits.append(f"{parts.project_fact_count} project-fact(s)")
-    if parts.idea_seed_hints:
-        bits.append(f"{len(parts.idea_seed_hints)} related idea(s)")
+    if parts.global_count:
+        bits.append(f"{parts.global_count} global memo(s)")
+    if parts.project_count:
+        bits.append(f"{parts.project_count} project memo(s)")
+    if parts.cross_ref_hints:
+        bits.append(f"{len(parts.cross_ref_hints)} related idea(s)")
     counts = ", ".join(bits) if bits else "no relevant memory"
     if parts.entity_tags:
         tags = ", ".join(parts.entity_tags)
@@ -121,8 +132,8 @@ def render_index(
     at or under ``token_budget`` whenever that is at all achievable. Truncation
     order (drop lowest value first, per the FR-RET-3 contract):
 
-    1. drop the trailing (lowest-ranked) preference snippet,
-    2. once snippets are gone, drop the trailing idea-seed hint,
+    1. drop the trailing (lowest-ranked) global-scope snippet,
+    2. once snippets are gone, drop the trailing cross-reference hint,
     3. the summary line (counts + entity tags) and delimiters are always kept —
        it is the smallest, highest-value payload — even if that single line
        nominally exceeds a pathologically tiny budget (we never return an empty
@@ -133,8 +144,8 @@ def render_index(
     """
 
     summary = _summary_line(parts)
-    snippets = list(parts.preference_snippets)
-    hints = list(parts.idea_seed_hints)
+    snippets = list(parts.global_snippets)
+    hints = list(parts.cross_ref_hints)
     hint_on = include_recall_hint
 
     while True:

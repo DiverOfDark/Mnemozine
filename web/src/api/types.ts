@@ -17,15 +17,25 @@
 // Enums (string-literal unions — they serialize as their string values)
 // ---------------------------------------------------------------------------
 
+/**
+ * DEPRECATED legacy 3-value classification. The MemoryUnit `type` enum was split
+ * into a FREE-FORM `category` string + a `cross_ref_candidate` boolean (see the
+ * core data-model redesign). `MemoryType` survives ONLY for the eval-bootstrap
+ * `proposed_type`/`corrected_type` path, whose Python `Candidate` still carries
+ * the legacy enum. New code must NOT branch on it for memories.
+ */
 export type MemoryType = "preference" | "project_fact" | "idea_seed";
 export type Tier = "hot" | "archive";
 export type ActivityKind = "ingest" | "extract_decision" | "maintenance" | "injection";
 export type WriteDecision = "add" | "reinforce" | "supersede" | "no-op";
+/** The controlled scope decision derived from a memory's hierarchical scope. */
+export type ScopeDecision = "global" | "project";
 export type ScopeKind = "global" | "project";
 
 /** ISO-8601 datetime string (e.g. "2026-06-14T09:30:00Z"). */
 export type ISODateTime = string;
 
+/** Legacy eval-bootstrap enum only — NOT a memory facet (categories are free-form). */
 export const MEMORY_TYPES: readonly MemoryType[] = ["preference", "project_fact", "idea_seed"];
 export const TIERS: readonly Tier[] = ["hot", "archive"];
 export const ACTIVITY_KINDS: readonly ActivityKind[] = [
@@ -72,8 +82,14 @@ export interface SupersessionLink {
 
 export interface MemoryListItem {
   id: string;
-  type: MemoryType;
+  /** Free-form, emergent category (e.g. "preference", "decision", "gotcha"). */
+  category: string;
+  /** True if flagged as a cross-reference seed (replaces the old idea_seed type). */
+  cross_ref_candidate: boolean;
+  /** Controlled scope decision implied by the scope: "global" | "project". */
+  scope_decision: ScopeDecision;
   content: string;
+  /** Persisted hierarchical scope path: "global" | "project:<P>[/<sub>...]". */
   scope: string;
   entities: string[];
   confidence: number;
@@ -88,7 +104,9 @@ export interface MemoryListItem {
 
 export interface MemoryDetail {
   id: string;
-  type: MemoryType;
+  category: string;
+  cross_ref_candidate: boolean;
+  scope_decision: ScopeDecision;
   content: string;
   scope: string;
   entities: string[];
@@ -105,6 +123,38 @@ export interface MemoryDetail {
 export interface MemoryListResponse {
   items: MemoryListItem[];
   page: Page;
+}
+
+// ---------------------------------------------------------------------------
+// Category facets + scope tree (the discovery surface for the open-ended model)
+// ---------------------------------------------------------------------------
+
+export interface CategoryFacet {
+  category: string;
+  count: number;
+}
+
+export interface CategoryFacetsResponse {
+  facets: CategoryFacet[];
+  total: number;
+}
+
+export interface ScopeTreeNode {
+  /** This node's own segment label ("global" for the root). */
+  segment: string;
+  /** Canonical scope string for this node ("global"/"project:<P>"/...). */
+  path: string;
+  /** Path depth (0 = global root). */
+  depth: number;
+  /** Memories stored exactly at this scope. */
+  count: number;
+  /** Memories at this scope plus all descendant sub-scopes (rolled up). */
+  total_count: number;
+  children: ScopeTreeNode[];
+}
+
+export interface ScopeTreeResponse {
+  root: ScopeTreeNode;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,9 +208,12 @@ export interface InjectionIndexPreview {
   text: string;
   token_estimate: number;
   token_budget: number;
-  preference_count: number;
-  project_fact_count: number;
-  idea_seed_hints: string[];
+  /** Global-scope memories in the index (renamed from preference_count). */
+  global_count: number;
+  /** Project-scope memories in the index (renamed from project_fact_count). */
+  project_count: number;
+  /** Cross-reference seed hints (renamed from idea_seed_hints). */
+  cross_ref_hints: string[];
   entity_tags: string[];
 }
 
@@ -319,7 +372,10 @@ export interface BootstrapLabelRequest {
 // ---------------------------------------------------------------------------
 
 export interface MemoryPatchRequest {
-  type?: MemoryType | null;
+  /** Re-label the free-form category (R1 HITL). */
+  category?: string | null;
+  /** Toggle the cross-reference seed flag (FR-RET-6). */
+  cross_ref_candidate?: boolean | null;
   scope?: string | null;
   tier?: Tier | null;
 }
@@ -359,7 +415,10 @@ export interface HealthResponse {
 
 export interface StoreStatsResponse {
   total_memories: number;
-  by_type: Record<string, number>;
+  /** Count per free-form category (replaces the old fixed by_type). */
+  by_category: Record<string, number>;
+  /** Count per controlled scope decision ("global" | "project"). */
+  by_scope_decision: Record<string, number>;
   by_tier: Record<string, number>;
   by_source: Record<string, number>;
   active_count: number;
@@ -372,7 +431,8 @@ export interface StoreStatsResponse {
 // ---------------------------------------------------------------------------
 
 export interface MemoriesQuery {
-  type?: MemoryType;
+  /** Free-form category filter (replaces the old fixed type enum filter). */
+  category?: string;
   scope?: string;
   tier?: Tier;
   entity?: string;

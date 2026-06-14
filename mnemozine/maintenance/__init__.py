@@ -15,6 +15,17 @@ module's concrete code):
   by recency + access frequency; sink + archive, **never hard-delete**.
 * :class:`~mnemozine.maintenance.entity_resolution.EntityResolutionJob` —
   FR-MNT-4 duplicate-entity merge + low-weight edge pruning + node-degree cap.
+* :class:`~mnemozine.maintenance.category_merge.CategoryMergeJob` — the category
+  analogue of entity resolution: clusters near-duplicate emergent
+  ``MemoryUnit.category`` strings (by name/embedding similarity) and folds each
+  cluster into one canonical category (the ``merge-categories`` subcommand). Also
+  satisfies the :class:`~mnemozine.interfaces.CategoryMerger` Protocol.
+* :class:`~mnemozine.maintenance.reclassify.ReExtractJob` /
+  :class:`~mnemozine.maintenance.reclassify.ReclassifyJob` — offline migration
+  passes that re-apply the current extractor/classifier to already-ingested data:
+  re-extract over the retained raw tier (``re-extract``) or re-tag stored
+  memories from their content+provenance (``reclassify``). Operator-triggered, not
+  in the default scheduled set.
 * :class:`~mnemozine.maintenance.migrate_index.MigrateIndexJob` — OQ3 vector
   index/re-embed migration on an embedding-dimension change (the
   ``mnemozine-maintenance migrate-index`` subcommand); not in the default
@@ -30,11 +41,17 @@ Each job implements :class:`mnemozine.interfaces.MaintenanceJob`.
 from __future__ import annotations
 
 from mnemozine.maintenance.audit import AuditJob
+from mnemozine.maintenance.category_merge import (
+    CategoryMergeJob,
+    name_similarity,
+    normalize_category,
+)
 from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob, decay_score, rank_by_decay
 from mnemozine.maintenance.decision import WriteDecider, WriteDecisionConfig
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob, needs_migration
+from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
 from mnemozine.maintenance.runner import (
     MaintenanceRunner,
     build_default_jobs,
@@ -44,17 +61,22 @@ from mnemozine.maintenance.runner import (
 
 __all__ = [
     "AuditJob",
+    "CategoryMergeJob",
     "ConsolidationJob",
     "DecayJob",
     "EntityResolutionJob",
     "MaintenanceRunner",
     "MigrateIndexJob",
+    "ReExtractJob",
+    "ReclassifyJob",
     "WriteDecider",
     "WriteDecisionConfig",
     "build_default_jobs",
     "decay_score",
     "maintenance_cli",
+    "name_similarity",
     "needs_migration",
+    "normalize_category",
     "rank_by_decay",
     "run_maintenance",
 ]

@@ -20,15 +20,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 from mnemozine.interfaces import (
+    Extractor,
+    MaintenanceReport,
     Neighbor,
     RetrievedMemory,
     WriteDecision,
     WriteResult,
 )
 from mnemozine.schema.models import (
+    DEFAULT_CATEGORY,
     Edge,
     Entity,
     MemoryUnit,
+    RawChunk,
     Scope,
     SourceSession,
     Tier,
@@ -48,6 +52,7 @@ class OfflineStorage:
         self.edges: dict[str, Edge] = {}
         self.sessions: list[SourceSession] = []
         self.suppressions: set[tuple[str, str]] = set()
+        self.raw_chunks: dict[str, RawChunk] = {}
 
     async def upsert_memory(self, memory: MemoryUnit) -> WriteResult:
         # Reinforce on exact-content match within scope+entities; else add.
@@ -71,8 +76,16 @@ class OfflineStorage:
         entities: Sequence[str] | None = None,
         top_k: int = 10,
         include_archived: bool = False,
+        compose_ancestors: bool = True,
     ) -> list[RetrievedMemory]:
-        scope_strs = {s.as_str() for s in scopes}
+        # Ancestor-composition / no-leak (FR-STO-3): expand each query scope to
+        # its ancestor-or-self chain when composing (the default), else match the
+        # exact scope strings only. Siblings/descendants are never on an ancestor
+        # chain, so they can never leak.
+        if compose_ancestors:
+            scope_strs = {anc.as_str() for s in scopes for anc in s.ancestors()}
+        else:
+            scope_strs = {s.as_str() for s in scopes}
         q_words = set(query.lower().split())
         results: list[RetrievedMemory] = []
         for m in self.memories.values():
@@ -92,9 +105,7 @@ class OfflineStorage:
         results.sort(key=lambda r: r.score, reverse=True)
         return results[:top_k]
 
-    async def close_validity_window(
-        self, memory_id: str, *, at: Any | None = None
-    ) -> MemoryUnit:
+    async def close_validity_window(self, memory_id: str, *, at: Any | None = None) -> MemoryUnit:
         m = self.memories[memory_id]
         m.supersede(at)
         return m
@@ -165,9 +176,7 @@ class OfflineStorage:
         self.edges[edge.id] = edge
         return edge
 
-    async def edges_for_entity(
-        self, entity: str, *, active_only: bool = True
-    ) -> list[Edge]:
+    async def edges_for_entity(self, entity: str, *, active_only: bool = True) -> list[Edge]:
         return []
 
     async def prune_edge(self, edge_id: str, *, at: datetime | None = None) -> Edge:
@@ -183,6 +192,84 @@ class OfflineStorage:
 
     async def record_session(self, session: SourceSession) -> None:
         self.sessions.append(session)
+
+    # --- raw tier (R4) -------------------------------------------------------
+
+    async def persist_raw_chunk(self, chunk: RawChunk) -> RawChunk:
+        # Idempotent on content_hash (the FR-ING-5 key): re-persisting the same
+        # chunk updates its memory_ids rather than duplicating.
+        self.raw_chunks[chunk.content_hash] = chunk
+        return chunk
+
+    async def iter_raw_chunks(
+        self,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        since: datetime | None = None,
+    ) -> AsyncIterator[RawChunk]:
+        scope_str = scope.as_str() if scope is not None else None
+        for c in list(self.raw_chunks.values()):
+            if scope_str is not None and c.scope.as_str() != scope_str:
+                continue
+            if session_id is not None and c.session_id != session_id:
+                continue
+            if source is not None and c.source != source:
+                continue
+            if since is not None and c.ingested_at < since:
+                continue
+            yield c
+
+    async def re_extract_from_raw_chunks(
+        self,
+        extractor: Extractor,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        supersede_existing: bool = True,
+    ) -> MaintenanceReport:
+        # Minimal offline seam: the §9 metrics do not exercise re-extraction, so
+        # this satisfies the Protocol shape with a no-op pass over the raw tier.
+        report = MaintenanceReport(job_name="re_extract_from_raw_chunks")
+        async for _chunk in self.iter_raw_chunks(scope=scope, session_id=session_id):
+            report.re_extracted += 0
+        return report
+
+    async def reclassify_memory(
+        self,
+        memory_id: str,
+        *,
+        scope: Scope | None = None,
+        category: str | None = None,
+        cross_ref_candidate: bool | None = None,
+    ) -> MemoryUnit:
+        m = self.memories[memory_id]
+        if scope is not None:
+            m.scope = scope
+        if category is not None:
+            m.category = category.strip().lower() or DEFAULT_CATEGORY
+        if cross_ref_candidate is not None:
+            m.cross_ref_candidate = cross_ref_candidate
+        return m
+
+    async def list_categories(self) -> list[tuple[str, int]]:
+        counts: dict[str, int] = {}
+        for m in self.memories.values():
+            if not m.is_active:
+                continue
+            counts[m.category] = counts.get(m.category, 0) + 1
+        return list(counts.items())
+
+    async def merge_categories(self, source: str, target: str) -> int:
+        src = source.strip().lower()
+        tgt = target.strip().lower()
+        n = 0
+        for m in self.memories.values():
+            if m.category == src:
+                m.category = tgt
+                n += 1
+        return n
 
     async def close(self) -> None:
         return None

@@ -2,11 +2,12 @@
 
 Backs :meth:`mnemozine.interfaces.Extractor.extract`: given a whole chunk of
 :class:`~mnemozine.schema.events.IngestEvent`s (one Graphiti episode, FR-ING-6),
-the model returns a list of memory objects. Each object is classified into one
-:class:`~mnemozine.schema.models.MemoryType` (FR-EXT-1), scoped at extraction
-time (FR-EXT-3), entity- and relationship-linked (FR-EXT-2), and carries a
-confidence (FR-EXT-4 — provenance is attached by the Python orchestration from
-the chunk's source session, not invented by the model).
+the model returns a list of memory objects. Each object carries the category-split
+signals — the CONTROLLED ``scope`` decision (``global`` vs ``project``, FR-EXT-3),
+a FREE-FORM ``category`` slug (FR-EXT-1), and a ``cross_ref`` flag (FR-RET-6) —
+plus entity tags and a confidence (FR-EXT-4). The final hierarchical
+:class:`~mnemozine.schema.models.Scope` is derived in Python from the decision +
+the chunk's provenance project, never trusted from the model (no-leak).
 
 The relationships the model returns become weighted, temporal
 :class:`~mnemozine.schema.models.Edge`s in the graph (FR-EXT-2): a triple of
@@ -17,7 +18,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from mnemozine.extract.prompts.taxonomy import ALLOWED_TYPES, TAXONOMY_RUBRIC
+from mnemozine.extract.prompts.taxonomy import (
+    ALLOWED_SCOPE_DECISIONS,
+    SUGGESTED_CATEGORIES,
+    TAXONOMY_RUBRIC,
+)
 from mnemozine.schema.events import IngestEvent
 
 EXTRACT_SYSTEM_PROMPT = f"""\
@@ -38,8 +43,9 @@ e.g. {{"subject": "project-a", "relation": "pins", "object": "tokio"}} or
 Respond with a SINGLE JSON object (no prose, no code fence):
   {{"memories": [
      {{"content": <one concise sentence stating the memory in the third person>,
-       "type": <one of {list(ALLOWED_TYPES)}>,
-       "scope": "global" | "project:<project_id>",
+       "scope": <one of {list(ALLOWED_SCOPE_DECISIONS)}>,
+       "category": <a short lowercase slug, e.g. one of {list(SUGGESTED_CATEGORIES)}>,
+       "cross_ref": <true|false>,
        "entities": [<lowercase-hyphenated tags>],
        "confidence": <float 0..1>}}
    ],
@@ -49,13 +55,15 @@ Respond with a SINGLE JSON object (no prose, no code fence):
 
 Rewrite each memory's content as a standalone third-person statement (e.g.
 "Prefers thiserror over anyhow for Rust error handling."), not a quote of the
-turn. Use scope "global" for preference/idea_seed and
-"project:<project_id>" for project_fact, using the project id given below.
+turn. Emit just the two-value "scope" decision ("global" or "project") — never a
+scope path; the system derives the exact scope from the project id given below.
 Return {{"memories": [], "relationships": []}} if nothing is durable.
 """
 
 # JSON schema for LLMProvider.complete_json. The model returns memories +
-# relationships; provenance/validity are stamped by Python afterwards.
+# relationships; the hierarchical scope, provenance and validity are stamped by
+# Python afterwards. `scope` is the CONTROLLED two-value decision; `category` is a
+# free-form string (not enum-constrained — emergent).
 EXTRACT_JSON_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
@@ -65,8 +73,12 @@ EXTRACT_JSON_SCHEMA: dict[str, object] = {
                 "type": "object",
                 "properties": {
                     "content": {"type": "string"},
-                    "type": {"type": "string", "enum": list(ALLOWED_TYPES)},
-                    "scope": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": list(ALLOWED_SCOPE_DECISIONS),
+                    },
+                    "category": {"type": "string"},
+                    "cross_ref": {"type": "boolean"},
                     "entities": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -77,7 +89,14 @@ EXTRACT_JSON_SCHEMA: dict[str, object] = {
                         "maximum": 1.0,
                     },
                 },
-                "required": ["content", "type", "scope", "entities", "confidence"],
+                "required": [
+                    "content",
+                    "scope",
+                    "category",
+                    "cross_ref",
+                    "entities",
+                    "confidence",
+                ],
                 "additionalProperties": False,
             },
         },
@@ -121,9 +140,11 @@ def render_chunk(events: Sequence[IngestEvent]) -> str:
 def build_extract_prompt(events: Sequence[IngestEvent], *, project: str) -> str:
     """Build the user prompt for chunk extraction (FR-EXT-1..4).
 
-    ``project`` is the chunk's project id — the scope base for any
-    ``project_fact`` extracted, decided here at extraction time (FR-EXT-3) so a
-    project fact can never leak into another project.
+    ``project`` is the chunk's project id — shown so the model can decide whether
+    a memory is specific to THIS project (scope "project") or cross-project (scope
+    "global"). The final hierarchical scope is derived in Python from the decision
+    + this project at extraction time (FR-EXT-3) so a project memory can never
+    leak into another project.
     """
 
     transcript = render_chunk(events)
@@ -132,5 +153,6 @@ def build_extract_prompt(events: Sequence[IngestEvent], *, project: str) -> str:
         "Conversation chunk:\n"
         f"{transcript}\n\n"
         "Extract the durable memories and relationships as the JSON object. "
-        f'For any project_fact use scope "project:{project}".'
+        'Use scope "project" only for memories specific to this project '
+        f'("{project}"); use "global" otherwise.'
     )

@@ -133,6 +133,65 @@ class InjectionSettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Hierarchical scope (FR-EXT-3, FR-STO-3, no-leak; core data-model redesign)
+# ---------------------------------------------------------------------------
+
+
+class ScopeSettings(BaseModel):
+    """Hierarchical-scope formatting + transcript-derivation settings (FR-EXT-3).
+
+    Backs :class:`~mnemozine.schema.models.Scope` (the path of segments rooted at
+    ``global``) and
+    :func:`~mnemozine.ingestion.claude_code.parser.derive_scope_from_transcript`.
+    """
+
+    delimiter: str = Field(
+        default="/",
+        description=(
+            "Delimiter between scope segments in the canonical string form "
+            "(e.g. 'project:Mnemozine/auth'). Mirrors schema.models.SCOPE_DELIMITER."
+        ),
+    )
+    subagent_subsegments: bool = Field(
+        default=False,
+        description=(
+            "If true, roll a subagent/workflow transcript up under its project "
+            "as a sub-segment (e.g. project:Mnemozine/wf_<id>) rather than the "
+            "bare project scope. Off by default: subagents collapse to the "
+            "project scope. Either way they NEVER get an opaque project:agent-XXXX "
+            "scope (FR-EXT-3 roll-up)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Free-form category registry + merge (FR-MNT-*; core data-model redesign)
+# ---------------------------------------------------------------------------
+
+
+class CategorySettings(BaseModel):
+    """Emergent-category merge/normalization tuning (FR-MNT-2/4 maintenance).
+
+    The classifier emits a FREE-FORM ``MemoryUnit.category`` string (no enum);
+    the category-merge maintenance job (CategoryMerger) consolidates near-duplicate
+    categories (e.g. 'gotcha' / 'gotchas' / 'pitfall') so the registry does not
+    fragment. These are §6.6-style "config, not constants" knobs.
+    """
+
+    merge_similarity_threshold: float = Field(
+        default=0.85,
+        description=(
+            "Cosine/string-similarity threshold above which two free-form "
+            "categories are merged into one canonical category (CategoryMerger)."
+        ),
+    )
+    default_category: str = Field(
+        default="fact",
+        description="Fallback category when the classifier emits none (DEFAULT_CATEGORY).",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cross-reference engine (FR-RET-6)
 # ---------------------------------------------------------------------------
 
@@ -190,13 +249,14 @@ class MaintenanceSettings(BaseModel):
         default=64,
         description="Cap on node degree to keep graph traversal bounded.",
     )
-    # FR-MNT-1 contradiction-candidate cap — how many `type=preference`
-    # candidates in the same scope/entity neighborhood are fed to the single
-    # cheap contradiction LLM call. Bounds cost/latency of the supersede check.
+    # FR-MNT-1 contradiction-candidate cap — how many global-decision
+    # (ScopeDecision.GLOBAL) candidates in the same scope/entity neighborhood are
+    # fed to the single cheap contradiction LLM call. Bounds cost/latency of the
+    # supersede check.
     contradiction_candidate_cap: int = Field(
         default=5,
         description=(
-            "Max type=preference candidates fed to the FR-MNT-1 cheap "
+            "Max global-decision candidates fed to the FR-MNT-1 cheap "
             "contradiction LLM call per write."
         ),
     )
@@ -305,6 +365,17 @@ class IngestSettings(BaseModel):
     strip_tool_calls: bool = Field(
         default=True,
         description="Strip tool_calls and tool results from events on ingest (FR-ING-7).",
+    )
+    # Core data-model redesign: persist the normalized extraction-input chunk as
+    # a first-class RawChunk (the raw tier) so the store can re-extract / reindex
+    # offline and survive Claude's 30-day local cleanup (R4). On by default.
+    raw_retention_enabled: bool = Field(
+        default=True,
+        description=(
+            "Persist the normalized extraction-input chunk as a RawChunk (the raw "
+            "tier) for offline re-extraction/reindex; survives the 30-day cleanup "
+            "(R4). On by default."
+        ),
     )
 
 
@@ -476,6 +547,8 @@ class Settings(BaseSettings):
     extraction: ExtractionLLMSettings = Field(default_factory=ExtractionLLMSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     inject: InjectionSettings = Field(default_factory=InjectionSettings)
+    scope: ScopeSettings = Field(default_factory=ScopeSettings)
+    category: CategorySettings = Field(default_factory=CategorySettings)
     crossref: CrossRefSettings = Field(default_factory=CrossRefSettings)
     maintenance: MaintenanceSettings = Field(default_factory=MaintenanceSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)

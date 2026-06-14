@@ -46,15 +46,22 @@ from mnemozine.interfaces import (
 )
 from mnemozine.schema.models import (
     Edge,
-    MemoryType,
+    MemoryUnit,
     Scope,
+    ScopeDecision,
 )
 
-# Memory types eligible to surface as a cross-reference (FR-RET-6 / UC-3):
-# only candidate ideas and project-scoped facts power "this reminds me of…".
-_CROSSREF_TYPES: frozenset[MemoryType] = frozenset(
-    {MemoryType.IDEA_SEED, MemoryType.PROJECT_FACT}
-)
+
+def _is_crossref_candidate(memory: MemoryUnit) -> bool:
+    """True if a memory is eligible to surface as a cross-reference (FR-RET-6 / UC-3).
+
+    Replaces the old ``_CROSSREF_TYPES = {idea_seed, project_fact}`` type set with
+    the category-split contract: a memory powers "this reminds me of…" when it is a
+    cross-reference seed (the old ``idea_seed`` behavior, now the
+    ``cross_ref_candidate`` flag) or a project-scoped fact (``ScopeDecision.PROJECT``).
+    """
+
+    return memory.cross_ref_candidate or memory.scope_decision is ScopeDecision.PROJECT
 
 
 def context_key_for(context: RetrievalContext) -> str:
@@ -153,9 +160,7 @@ class CrossReferenceEngine:
 
     # -- graph traversal path ---------------------------------------------
 
-    async def _graph_candidates(
-        self, context: RetrievalContext
-    ) -> list[CrossReference]:
+    async def _graph_candidates(self, context: RetrievalContext) -> list[CrossReference]:
         """Collect candidate cross-references via shared-entity graph traversal.
 
         Expands the context entities one hop (collecting the connecting edges
@@ -173,14 +178,12 @@ class CrossReferenceEngine:
         expanded, edges_by_entity = await self._expand_neighborhood(ctx_entities)
 
         scopes = self._scopes(context)
-        candidates = await self._retrieve_candidates(
-            context, scopes, expanded
-        )
+        candidates = await self._retrieve_candidates(context, scopes, expanded)
 
         hits: list[CrossReference] = []
         for cand in candidates:
             mem = cand.memory
-            if mem.type not in _CROSSREF_TYPES:
+            if not _is_crossref_candidate(mem):
                 continue
             shared = self._shared_entities(mem.entities, expanded)
             if not shared:
@@ -301,7 +304,7 @@ class CrossReferenceEngine:
         cand_memories = [
             c.memory
             for c in candidates
-            if c.memory.type in _CROSSREF_TYPES and c.memory.id not in excluded_ids
+            if _is_crossref_candidate(c.memory) and c.memory.id not in excluded_ids
         ]
         if not cand_memories:
             return []

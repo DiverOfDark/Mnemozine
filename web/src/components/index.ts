@@ -6,7 +6,8 @@
  *   Sidebar / TopBar              — nav chrome (wired by App.tsx; rarely imported directly)
  *   DataTable                     — dense, keyboard-nav table
  *   DetailDrawer / DrawerSection  — right slide-in detail panel
- *   Badge / TypeBadge / TierBadge / StatusBadge — type/tier/state chips
+ *   Badge / CategoryBadge / CrossRefBadge / TierBadge / StatusBadge / ScopePath
+ *                                  — category/cross-ref/tier/state/scope chips
  *   ValidityTimeline              — signature validity window
  *   SupersessionChain             — supersedes / superseded-by chain
  *   ScoreBar                      — relevance/confidence bar
@@ -22,7 +23,16 @@ export { Sidebar } from "@/components/Sidebar";
 export { TopBar } from "@/components/TopBar";
 export { DataTable, type Column } from "@/components/DataTable";
 export { DetailDrawer, DrawerSection } from "@/components/DetailDrawer";
-export { Badge, TypeBadge, TierBadge, StatusBadge } from "@/components/Badge";
+export {
+  Badge,
+  CategoryBadge,
+  CrossRefBadge,
+  TypeBadge,
+  TierBadge,
+  StatusBadge,
+  ScopePath,
+  scopeSegments,
+} from "@/components/Badge";
 export { ValidityTimeline } from "@/components/ValidityTimeline";
 export { SupersessionChain } from "@/components/SupersessionChain";
 export { ScoreBar } from "@/components/ScoreBar";

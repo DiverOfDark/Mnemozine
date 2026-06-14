@@ -33,7 +33,7 @@ from mnemozine.ingestion.claude_code.chunker import ChunkAccumulator
 from mnemozine.ingestion.loop import build_ingest_sources, run_ingest_loop
 from mnemozine.interfaces import IngestSource
 from mnemozine.schema.events import Source
-from mnemozine.schema.models import MemoryType, Scope
+from mnemozine.schema.models import Scope, ScopeDecision
 from mnemozine.services import MnemozineIngestService
 from tests.conftest import FakeLLMProvider, InMemoryStorage
 
@@ -123,7 +123,9 @@ def _routing_llm() -> FakeLLMProvider:
                 "memories": [
                     {
                         "content": "Prefers ruff over flake8 for Python linting.",
-                        "type": "preference",
+                        "scope": "global",
+                        "category": "preference",
+                        "cross_ref": False,
                         "entities": ["python", "ruff", "linting"],
                         "confidence": 0.9,
                     }
@@ -135,7 +137,9 @@ def _routing_llm() -> FakeLLMProvider:
                 "memories": [
                     {
                         "content": "Idea seed: a graph-backed memory CLI.",
-                        "type": "idea_seed",
+                        "scope": "global",
+                        "category": "idea",
+                        "cross_ref": True,
                         "entities": ["cli", "graph", "memory"],
                         "confidence": 0.8,
                     }
@@ -273,9 +277,10 @@ async def test_backfill_drains_hermes_recorded_into_storage() -> None:
         run_ingest_loop(built, accumulator, service, backfill=True), timeout=5.0
     )
 
-    idea_seeds = [m for m in storage.memories.values() if m.type is MemoryType.IDEA_SEED]
+    idea_seeds = [m for m in storage.memories.values() if m.cross_ref_candidate]
     assert len(idea_seeds) == 1
     assert idea_seeds[0].content == "Idea seed: a graph-backed memory CLI."
+    assert idea_seeds[0].category == "idea"
     # FR-ING-7: the stripped tool secret never reached extraction/storage.
     assert all("HERMES_SECRET" not in m.content for m in storage.memories.values())
 
@@ -350,13 +355,14 @@ async def test_stream_drains_injected_gateway_and_hermes_into_storage() -> None:
     # Gateway path: the OpenAI-source preference was extracted + stored.
     assert "Prefers ruff over flake8 for Python linting." in by_content
     pref = by_content["Prefers ruff over flake8 for Python linting."]
-    assert pref.type is MemoryType.PREFERENCE
+    assert pref.scope_decision is ScopeDecision.GLOBAL
+    assert pref.category == "preference"
     assert pref.scope.as_str() == Scope.global_().as_str()
 
-    # Hermes path: the idea_seed was extracted + stored.
+    # Hermes path: the cross-ref idea seed was extracted + stored.
     assert "Idea seed: a graph-backed memory CLI." in by_content
     seed = by_content["Idea seed: a graph-backed memory CLI."]
-    assert seed.type is MemoryType.IDEA_SEED
+    assert seed.cross_ref_candidate is True
 
     # BOTH sources flowed through — the whole point of the wiring.
     assert len(storage.memories) == 2

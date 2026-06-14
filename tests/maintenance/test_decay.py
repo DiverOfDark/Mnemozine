@@ -13,7 +13,7 @@ import pytest
 
 from mnemozine.config import Settings
 from mnemozine.maintenance.decay import DecayJob, decay_score, rank_by_decay
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope, Tier
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope, Tier
 from tests.conftest import InMemoryStorage
 
 NOW = datetime(2026, 6, 13, 12, 0, 0, tzinfo=UTC)
@@ -28,9 +28,9 @@ def _mem(
     tier: Tier = Tier.HOT,
 ) -> MemoryUnit:
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content=content,
         scope=Scope.global_(),
+        category="preference",
         entities=["rust"],
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),

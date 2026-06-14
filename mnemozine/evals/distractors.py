@@ -219,8 +219,8 @@ class DistractorGenerator:
             "real developer preferences, project facts, or project ideas, but be "
             "unrelated to these topics/projects (do NOT mention any of them): "
             f"{', '.join(avoid)}.\n"
-            f"Return JSON: {{\"items\": [{{\"type\": \"preference|project_fact|"
-            "idea_seed\", \"content\": str, \"entities\": [str], \"project\": "
+            f'Return JSON: {{"items": [{{"type": "preference|project_fact|'
+            'idea_seed", "content": str, "entities": [str], "project": '
             "str|null}}, ...]}}. "
             f"Produce {count} items."
         )
@@ -259,9 +259,7 @@ class DistractorGenerator:
             content = item.get("content")
             if not isinstance(content, str) or not content.strip():
                 continue
-            entities = [
-                str(e) for e in item.get("entities", []) if isinstance(e, (str, int))
-            ]
+            entities = [str(e) for e in item.get("entities", []) if isinstance(e, (str, int))]
             project = item.get("project")
             project = project if isinstance(project, str) and project else None
             if _collides(entities, project, self._block):

@@ -9,7 +9,6 @@ from mnemozine.evals.goldset import (
     load_gold_set,
 )
 from mnemozine.evals.runner import EvalRunner, default_inmemory_runner
-from mnemozine.schema.models import MemoryType
 from tests.conftest import InMemoryStorage
 
 
@@ -83,7 +82,7 @@ async def test_report_render_lists_failures() -> None:
         memories=[
             GoldMemory(
                 gold_id="a",
-                type=MemoryType.PREFERENCE,
+                category="preference",
                 content="prefers tabs",
                 scope="global",
                 entities=["style"],

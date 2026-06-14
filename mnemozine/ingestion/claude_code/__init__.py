@@ -35,7 +35,9 @@ from __future__ import annotations
 
 from mnemozine.ingestion.claude_code.chunker import Chunk, ChunkAccumulator
 from mnemozine.ingestion.claude_code.parser import (
+    decode_project_dirname,
     derive_project,
+    derive_scope_from_transcript,
     parse_transcript_line,
     parse_transcript_lines,
     session_id_from_path,
@@ -46,7 +48,9 @@ __all__ = [
     "Chunk",
     "ChunkAccumulator",
     "ClaudeCodeSource",
+    "decode_project_dirname",
     "derive_project",
+    "derive_scope_from_transcript",
     "parse_transcript_line",
     "parse_transcript_lines",
     "session_id_from_path",

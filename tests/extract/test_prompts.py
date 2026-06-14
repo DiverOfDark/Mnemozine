@@ -2,8 +2,10 @@
 
 The PRD requires the prompts to be kept in a ``prompts/`` module so they are
 independently evaluable (R1). These tests assert the prompts are well-formed,
-embed the shared rubric, and faithfully carry the project id + statement the
-model needs to assign scope at extraction time.
+embed the shared rubric, encode the CATEGORY-SPLIT contract (controlled scope
+decision + free-form category + cross_ref flag — core data-model redesign), and
+faithfully carry the project id + statement the model needs to assign scope at
+extraction time.
 """
 
 from __future__ import annotations
@@ -19,32 +21,54 @@ from mnemozine.extract.prompts import (
     build_extract_prompt,
 )
 from mnemozine.extract.prompts.extract import render_chunk
-from mnemozine.extract.prompts.taxonomy import ALLOWED_TYPES, TAXONOMY_RUBRIC
+from mnemozine.extract.prompts.taxonomy import (
+    ALLOWED_SCOPE_DECISIONS,
+    TAXONOMY_RUBRIC,
+)
 from mnemozine.schema.events import IngestEvent, Role, Source
 
 
-def test_allowed_types_match_schema_enums() -> None:
-    # Prompt taxonomy and JSON schema must agree on the type set (FR-EXT-1).
-    assert set(ALLOWED_TYPES) == {"preference", "project_fact", "idea_seed"}
-    classify_enum = CLASSIFY_JSON_SCHEMA["properties"]["type"]["enum"]  # type: ignore[index]
-    assert set(classify_enum) == set(ALLOWED_TYPES)
+def test_allowed_scope_decisions_match_schema_enums() -> None:
+    # Prompt taxonomy and JSON schema must agree on the controlled scope decision
+    # set — the two-value global/project enum (FR-EXT-3), NOT the old 3-type enum.
+    assert set(ALLOWED_SCOPE_DECISIONS) == {"global", "project"}
+    classify_enum = CLASSIFY_JSON_SCHEMA["properties"]["scope"]["enum"]  # type: ignore[index]
+    assert set(classify_enum) == set(ALLOWED_SCOPE_DECISIONS)
     mem_props = EXTRACT_JSON_SCHEMA["properties"]["memories"]["items"]["properties"]  # type: ignore[index]
-    assert set(mem_props["type"]["enum"]) == set(ALLOWED_TYPES)
+    assert set(mem_props["scope"]["enum"]) == set(ALLOWED_SCOPE_DECISIONS)
+
+
+def test_category_is_free_form_not_enum_constrained() -> None:
+    # The category split: category is a FREE-FORM string with NO enum constraint
+    # in either schema (emergent categories converge via the merge job, FR-MNT-2/4).
+    classify_cat = CLASSIFY_JSON_SCHEMA["properties"]["category"]  # type: ignore[index]
+    assert classify_cat["type"] == "string"
+    assert "enum" not in classify_cat
+    mem_props = EXTRACT_JSON_SCHEMA["properties"]["memories"]["items"]["properties"]  # type: ignore[index]
+    assert mem_props["category"]["type"] == "string"
+    assert "enum" not in mem_props["category"]
+    # cross_ref is a boolean flag in both schemas (the old idea_seed behavior).
+    assert mem_props["cross_ref"]["type"] == "boolean"
+    assert CLASSIFY_JSON_SCHEMA["properties"]["cross_ref"]["type"] == "boolean"  # type: ignore[index]
 
 
 def test_both_prompts_embed_the_shared_rubric() -> None:
-    # Single source of truth for the make-or-break definition (FR-EXT-3).
-    snippet = "preference vs project_fact"
+    # Single source of truth for the make-or-break definition (FR-EXT-3): the
+    # global-vs-project scope disambiguation.
+    snippet = "global vs project"
     assert snippet in TAXONOMY_RUBRIC
     assert snippet in CLASSIFY_SYSTEM_PROMPT
     assert snippet in EXTRACT_SYSTEM_PROMPT
 
 
-def test_system_prompts_state_scope_rule() -> None:
-    # FR-EXT-3: scope decided at extraction time, derived from type.
+def test_system_prompts_state_the_controlled_scope_decision() -> None:
+    # FR-EXT-3: scope decided at extraction time as a controlled two-value decision.
     for prompt in (CLASSIFY_SYSTEM_PROMPT, EXTRACT_SYSTEM_PROMPT):
-        assert "global" in prompt
-        assert "project:<project_id>" in prompt
+        assert '"global"' in prompt
+        assert '"project"' in prompt
+        # The prompt must instruct the model NOT to emit a scope path (no-leak:
+        # Python derives the hierarchical scope from the decision + project).
+        assert "scope path" in prompt
 
 
 def test_build_classify_prompt_carries_project_and_statement() -> None:
@@ -56,7 +80,6 @@ def test_build_classify_prompt_carries_project_and_statement() -> None:
     assert "rust-cli" in prompt
     assert "This project pins tokio 1.38." in prompt
     assert "async runtimes" in prompt  # recent_text included as advisory context
-    assert "project:rust-cli" in prompt
 
 
 def test_build_classify_prompt_without_project() -> None:

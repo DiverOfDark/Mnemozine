@@ -1,20 +1,22 @@
 /**
- * Page-local hook (FE-B / PRD §4.3) wrapping the three HITL corrections on a memory
- * — reclassify (`type`), re-scope (`scope`), archive/restore (`tier`) — over the
- * shared `usePatchMemory` mutation. It tracks which field is "in flight" so the
- * controls can show per-control spinners, and surfaces the last `changed[]` echo +
- * any error for an inline status line.
+ * Page-local hook (FE-B / PRD §4.3) wrapping the HITL corrections on a memory —
+ * re-label (`category`), toggle the cross-ref seed flag (`cross_ref_candidate`),
+ * re-scope (`scope`), archive/restore (`tier`) — over the shared `usePatchMemory`
+ * mutation. It tracks which field is "in flight" so the controls can show
+ * per-control spinners, and surfaces the last `changed[]` echo + any error for an
+ * inline status line.
  *
- * The page owns these UI ergonomics; the actual write goes through the shared,
- * cache-invalidating mutation hook in @/api (we consume it, never re-implement it).
+ * The old fixed-enum `type` reclassify is now a FREE-FORM `category` re-label plus
+ * the `cross_ref_candidate` flag toggle (the core data-model redesign). The actual
+ * write goes through the shared, cache-invalidating mutation hook in @/api.
  */
 
 import { useCallback, useState } from "react";
 import { usePatchMemory } from "@/api";
-import type { MemoryDetail, MemoryPatchRequest, MemoryType, Tier } from "@/api";
+import type { MemoryDetail, MemoryPatchRequest, Tier } from "@/api";
 
 /** Which control triggered the in-flight write (for per-control spinners). */
-export type PatchField = "type" | "scope" | "tier" | null;
+export type PatchField = "category" | "cross_ref_candidate" | "scope" | "tier" | null;
 
 export interface PatchControls {
   /** True while any patch is in flight. */
@@ -25,7 +27,10 @@ export interface PatchControls {
   lastChanged: string[];
   /** Error from the most recent patch, if it failed. */
   error: Error | null;
-  reclassify: (type: MemoryType) => void;
+  /** Re-label the free-form category. */
+  recategorize: (category: string) => void;
+  /** Toggle the cross-reference seed flag. */
+  setCrossRef: (value: boolean) => void;
   rescope: (scope: string) => void;
   /** Archive (tier=archive) ⇄ restore (tier=hot). */
   setTier: (tier: Tier) => void;
@@ -54,9 +59,19 @@ export function usePatchControls(memory: MemoryDetail | undefined): PatchControl
     [memory, mutation],
   );
 
-  const reclassify = useCallback(
-    (type: MemoryType) => {
-      if (memory && type !== memory.type) run("type", { type });
+  const recategorize = useCallback(
+    (category: string) => {
+      const next = category.trim().toLowerCase();
+      if (memory && next && next !== memory.category) run("category", { category: next });
+    },
+    [memory, run],
+  );
+
+  const setCrossRef = useCallback(
+    (value: boolean) => {
+      if (memory && value !== memory.cross_ref_candidate) {
+        run("cross_ref_candidate", { cross_ref_candidate: value });
+      }
     },
     [memory, run],
   );
@@ -86,7 +101,8 @@ export function usePatchControls(memory: MemoryDetail | undefined): PatchControl
     pendingField,
     lastChanged,
     error: mutation.error,
-    reclassify,
+    recategorize,
+    setCrossRef,
     rescope,
     setTier,
     toggleTier,

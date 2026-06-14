@@ -36,6 +36,7 @@ import type {
   BootstrapCandidate,
   BootstrapCandidatesResponse,
   BootstrapLabelRequest,
+  CategoryFacetsResponse,
   CrossRefResponse,
   CrossRefsQuery,
   EvalSummaryResponse,
@@ -53,6 +54,7 @@ import type {
   MutationResponse,
   RecallRequest,
   RecallResponse,
+  ScopeTreeResponse,
   StoreStatsResponse,
   SuppressRequest,
 } from "@/api/types";
@@ -99,6 +101,38 @@ export function useMemories(
   });
 }
 
+/**
+ * GET /api/memories/facets/categories → CategoryFacetsResponse. The discovered,
+ * open-ended categories (+ counts) that back the dynamic CATEGORY filter chips —
+ * categories are no longer a fixed enum, so the UI lists what the store contains.
+ */
+export function useCategoryFacets(
+  opts?: QueryOpts<CategoryFacetsResponse>,
+): UseQueryResult<CategoryFacetsResponse> {
+  return useQuery({
+    queryKey: queryKeys.memories.categoryFacets(),
+    queryFn: ({ signal }) =>
+      api.get<CategoryFacetsResponse>("/memories/facets/categories", undefined, signal),
+    ...opts,
+  });
+}
+
+/**
+ * GET /api/memories/facets/scope-tree → ScopeTreeResponse. The hierarchical
+ * project/sub-scope tree (+ per-node counts) that backs the SCOPE TREE navigator;
+ * selecting a node filters the table to that scope's ancestor-composed memories.
+ */
+export function useScopeTree(
+  opts?: QueryOpts<ScopeTreeResponse>,
+): UseQueryResult<ScopeTreeResponse> {
+  return useQuery({
+    queryKey: queryKeys.memories.scopeTree(),
+    queryFn: ({ signal }) =>
+      api.get<ScopeTreeResponse>("/memories/facets/scope-tree", undefined, signal),
+    ...opts,
+  });
+}
+
 /** GET /api/memories/{id} → MemoryDetail (content + provenance + validity + chain). */
 export function useMemory(
   id: string | undefined,
@@ -114,8 +148,10 @@ export function useMemory(
 
 /**
  * PATCH /api/memories/{id} → MutationResponse. The R1/R5 HITL correction:
- * reclassify (`type`), re-scope (`scope`), archive/restore (`tier`). On success it
- * invalidates that memory's detail, the memories lists and the stats counts.
+ * re-label (`category`), toggle the cross-ref seed flag (`cross_ref_candidate`),
+ * re-scope (`scope`), archive/restore (`tier`). On success it invalidates that
+ * memory's detail, the memories lists/facets/scope-tree and the stats counts (a
+ * re-label or re-scope shifts the category facets and the scope tree).
  */
 export function usePatchMemory(): UseMutationResult<
   MutationResponse,

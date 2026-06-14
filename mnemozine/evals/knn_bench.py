@@ -239,9 +239,7 @@ def _seed_corpus(
     rng = random.Random(f"{cfg.seed}:scope:{level}")
 
     out_of_scope: list[MemoryUnit] = [
-        m
-        for m in gold_set.materialize_memories()
-        if m.scope.as_str() != cfg.scope.as_str()
+        m for m in gold_set.materialize_memories() if m.scope.as_str() != cfg.scope.as_str()
     ]
     if level > 0:
         gen = DistractorGenerator(gold_set, seed=cfg.seed + level)
@@ -249,9 +247,7 @@ def _seed_corpus(
         # generate() is async; drive it synchronously via the deterministic
         # template path (no LLM) so this seeding stays sync + offline.
         distractors = _generate_sync(gen, target)
-        out_of_scope.extend(
-            m for m in distractors if m.scope.as_str() != cfg.scope.as_str()
-        )
+        out_of_scope.extend(m for m in distractors if m.scope.as_str() != cfg.scope.as_str())
 
     # Hold the in-scope fraction constant at the target: solve
     # in / (in + out) = frac  ->  in = frac * out / (1 - frac).
@@ -321,9 +317,7 @@ def _recall_for_level(
 
         # Exhaustive in-process baseline: true cosine top-k over IN-SCOPE only
         # (what an unbounded post-filter scan would return).
-        baseline = [
-            mid for mid, _ in scored if mid in in_scope_ids
-        ][: cfg.top_k]
+        baseline = [mid for mid, _ in scored if mid in in_scope_ids][: cfg.top_k]
         if not baseline:
             continue
 
@@ -375,9 +369,7 @@ def run_knn_overfetch_bench(
     config = config or KnnBenchConfig()
 
     ordered = sorted(set(int(x) for x in levels))
-    results = [
-        _recall_for_level(config, retrieval, lvl, gold_set) for lvl in ordered
-    ]
+    results = [_recall_for_level(config, retrieval, lvl, gold_set) for lvl in ordered]
     return KnnBenchReport(
         factor=retrieval.knn_overfetch_factor,
         cap=retrieval.knn_overfetch_cap,

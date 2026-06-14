@@ -26,7 +26,6 @@ from mnemozine.interfaces import RetrievalContext
 from mnemozine.schema.models import (
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -66,13 +65,24 @@ async def _add_idea(
     content: str,
     entities: list[str],
     scope: Scope | None = None,
-    mtype: MemoryType = MemoryType.IDEA_SEED,
+    category: str = "idea",
+    cross_ref_candidate: bool = True,
     confidence: float = 0.9,
 ) -> MemoryUnit:
+    """Seed a cross-reference-candidate memory on the category-split contract.
+
+    The old ``idea_seed`` type is now the ``cross_ref_candidate=True`` FLAG
+    (default here, since these builders seed cross-ref seeds); ``category`` is the
+    free-form semantic role. A global, *un*-flagged memory (e.g. a plain
+    preference) will not surface as a cross-reference — that is what the
+    flag-driven engine asserts.
+    """
+
     mem = MemoryUnit(
-        type=mtype,
         content=content,
         scope=scope or Scope.global_(),
+        category=category,
+        cross_ref_candidate=cross_ref_candidate,
         entities=entities,
         confidence=confidence,
         provenance=_prov(),
@@ -93,9 +103,7 @@ def _settings(**crossref_overrides: object) -> Settings:
 def _engine(store: InMemoryStorage, **crossref_overrides: object) -> CrossReferenceEngine:
     """Build an engine over ``store`` with crossref settings overrides."""
 
-    return CrossReferenceEngine(
-        store, FakeEmbeddingProvider(), _settings(**crossref_overrides)
-    )
+    return CrossReferenceEngine(store, FakeEmbeddingProvider(), _settings(**crossref_overrides))
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +211,22 @@ async def test_no_shared_entity_no_graph_hit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preferences_do_not_surface_as_crossref() -> None:
-    """Only idea_seed/project nodes surface — not preferences (FR-RET-6)."""
+async def test_unflagged_global_memory_does_not_surface_as_crossref() -> None:
+    """A global, un-flagged memory (e.g. a plain preference) must NOT surface.
+
+    Core redesign: cross-ref surfacing is driven by the ``cross_ref_candidate``
+    FLAG (the old idea_seed behavior) OR project scope, NOT by category. A
+    global memory that is neither flagged nor project-scoped — a plain
+    preference — is not a cross-reference candidate even with a shared entity.
+    """
 
     store = InMemoryStorage()
     await _add_idea(
         store,
         content="prefers async runtime tokio for async work",
         entities=["async"],
-        mtype=MemoryType.PREFERENCE,
+        category="preference",
+        cross_ref_candidate=False,  # a plain global preference, not a seed
     )
     ctx = RetrievalContext(
         project="project-d",
@@ -222,6 +237,79 @@ async def test_preferences_do_not_surface_as_crossref() -> None:
     eng = _engine(store, relevance_threshold=0.1)
     hits = await eng.find_related(ctx)
     assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_crossref_driven_by_flag_not_category() -> None:
+    """Surfacing keys off the cross_ref_candidate FLAG, not the free-form category.
+
+    Two global memories share the active entities and carry the SAME free-form
+    category; only the one with ``cross_ref_candidate=True`` surfaces. This pins
+    that the engine drives off the flag (the old idea_seed behavior) rather than
+    branching on a category/type value.
+    """
+
+    store = InMemoryStorage()
+    flagged = await _add_idea(
+        store,
+        content="async cli seed flagged for cross reference",
+        entities=["async", "cli"],
+        category="note",
+        cross_ref_candidate=True,
+    )
+    await _add_idea(
+        store,
+        content="async cli note not flagged plain",
+        entities=["async", "cli"],
+        category="note",  # SAME category as the flagged one
+        cross_ref_candidate=False,
+    )
+    ctx = RetrievalContext(
+        project="project-d",
+        scopes=[Scope.global_()],
+        entities=["async", "cli"],
+        recent_text="async cli seed note flagged plain cross reference",
+    )
+    eng = _engine(store, relevance_threshold=0.1)
+    hits = await eng.find_related(ctx)
+
+    ids = {h.memory.id for h in hits}
+    assert flagged.id in ids  # the flagged seed surfaces
+    # Only the flagged one surfaces; the same-category unflagged one does not.
+    assert len(ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_fact_surfaces_without_flag() -> None:
+    """A project-scoped memory surfaces as a cross-ref even without the flag.
+
+    The category split keeps the old ``project_fact`` cross-ref behavior: a
+    ``ScopeDecision.PROJECT`` memory is a cross-reference candidate (it can
+    remind you of related project work) even when ``cross_ref_candidate`` is
+    False — that branch is driven by the scope decision, not a type.
+    """
+
+    store = InMemoryStorage()
+    fact = await _add_idea(
+        store,
+        content="project C decided on async cli architecture",
+        entities=["async", "cli"],
+        scope=Scope.project("project-c"),
+        category="decision",
+        cross_ref_candidate=False,  # NOT flagged; surfaces via PROJECT scope
+    )
+    ctx = RetrievalContext(
+        project="project-d",
+        # Compose project-c's scope so the candidate is retrievable; the no-leak
+        # rule is about a single query scope, while cross-ref deliberately spans
+        # the composed scope set it is given.
+        scopes=[Scope.global_(), Scope.project("project-c")],
+        entities=["async", "cli"],
+        recent_text="async cli architecture decided project",
+    )
+    eng = _engine(store, relevance_threshold=0.1)
+    hits = await eng.find_related(ctx)
+    assert any(h.memory.id == fact.id for h in hits)
 
 
 @pytest.mark.asyncio

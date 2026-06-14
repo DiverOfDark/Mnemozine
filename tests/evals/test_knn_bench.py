@@ -57,9 +57,7 @@ def test_effective_overfetch_k_never_below_top_k() -> None:
 def test_default_factor_holds_recall_flat() -> None:
     """Default knn_overfetch_factor returns the true top_k at every level."""
 
-    report = run_knn_overfetch_bench(
-        retrieval=RetrievalSettings(), config=KnnBenchConfig(top_k=10)
-    )
+    report = run_knn_overfetch_bench(retrieval=RetrievalSettings(), config=KnnBenchConfig(top_k=10))
     assert [r.level for r in report.results] == [1, 10, 100]
     # recall@k = 1.0 flat -> the configured over-fetch is sufficient.
     assert report.passed
@@ -136,7 +134,5 @@ def test_cli_knn_bench_fails_when_starved() -> None:
 def test_cli_knn_bench_tighter_scope_then_recover() -> None:
     starved = runner.invoke(app, ["knn-bench", "--in-scope-fraction", "0.05"])
     assert starved.exit_code == 1
-    recovered = runner.invoke(
-        app, ["knn-bench", "--in-scope-fraction", "0.05", "--factor", "40"]
-    )
+    recovered = runner.invoke(app, ["knn-bench", "--in-scope-fraction", "0.05", "--factor", "40"])
     assert recovered.exit_code == 0

@@ -96,9 +96,17 @@ async def test_default_job_set_runs_end_to_end_offline() -> None:
     embeddings = FakeEmbeddingProvider()
     jobs = build_default_jobs(storage, llm, embeddings, settings=Settings())
     names = [j.name for j in jobs]
-    assert names == ["consolidation", "entity_resolution", "decay", "audit"]
+    # Category merge (the category analogue of entity resolution) joins the
+    # default scheduled set between resolution and decay.
+    assert names == [
+        "consolidation",
+        "entity_resolution",
+        "category_merge",
+        "decay",
+        "audit",
+    ]
     runner = MaintenanceRunner(jobs, settings=Settings())
     # No data: every job runs cleanly and returns a report.
     reports = await runner.run_once()
-    assert len(reports) == 4
+    assert len(reports) == 5
     assert {r.job_name for r in reports} == set(names)

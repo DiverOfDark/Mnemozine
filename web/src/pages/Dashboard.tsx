@@ -22,7 +22,12 @@ import { PATHS } from "@/routes";
 
 import { StatTile } from "@/pages/dashboard/widgets";
 import { GrowthPanel } from "@/pages/dashboard/GrowthPanel";
-import { TotalsByType, TierSplit, SourceBreakdown } from "@/pages/dashboard/Breakdowns";
+import {
+  TotalsByCategory,
+  ScopeDecisionBreakdown,
+  TierSplit,
+  SourceBreakdown,
+} from "@/pages/dashboard/Breakdowns";
 import { ActivityFeed } from "@/pages/dashboard/ActivityFeed";
 import { MaintenanceStatus } from "@/pages/dashboard/MaintenanceStatus";
 import { HealthTiles } from "@/pages/dashboard/HealthTiles";
@@ -92,7 +97,8 @@ export default function Dashboard() {
       {/* Growth + breakdowns */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <GrowthPanel scope={scope} />
-        <TotalsByType stats={stats} />
+        <TotalsByCategory stats={stats} />
+        <ScopeDecisionBreakdown stats={stats} />
         <TierSplit stats={stats} />
         <SourceBreakdown stats={stats} />
       </div>

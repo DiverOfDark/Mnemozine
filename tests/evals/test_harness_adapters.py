@@ -15,7 +15,7 @@ from mnemozine.interfaces import (
     RetrievalContext,
     Retriever,
 )
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope, ScopeDecision
 from tests.conftest import InMemoryStorage
 
 
@@ -29,7 +29,7 @@ def test_adapters_satisfy_protocols() -> None:
 async def test_retriever_records_access() -> None:
     store = InMemoryStorage()
     unit = MemoryUnit(
-        type=MemoryType.PREFERENCE,
+        category="preference",
         content="prefers thiserror error handling",
         scope=Scope.global_(),
         entities=["rust", "errors"],
@@ -47,7 +47,7 @@ async def test_retriever_records_access() -> None:
 async def test_recall_records_access() -> None:
     store = InMemoryStorage()
     unit = MemoryUnit(
-        type=MemoryType.PREFERENCE,
+        category="preference",
         content="prefers ruff",
         scope=Scope.global_(),
         entities=["python"],
@@ -63,19 +63,19 @@ async def test_recall_records_access() -> None:
 @pytest.mark.parametrize(
     ("statement", "project", "expected"),
     [
-        ("I prefer thiserror over anyhow.", "rust-cli", MemoryType.PREFERENCE),
-        ("I always format Python with ruff.", "py", MemoryType.PREFERENCE),
-        ("This project pins tokio 1.38.", "rust-cli", MemoryType.PROJECT_FACT),
-        ("The webapp uses postgres 16 as its datastore.", "webapp", MemoryType.PROJECT_FACT),
+        ("I prefer thiserror over anyhow.", "rust-cli", ScopeDecision.GLOBAL),
+        ("I always format Python with ruff.", "py", ScopeDecision.GLOBAL),
+        ("This project pins tokio 1.38.", "rust-cli", ScopeDecision.PROJECT),
+        ("The webapp uses postgres 16 as its datastore.", "webapp", ScopeDecision.PROJECT),
     ],
 )
 async def test_keyword_extractor_classify(
-    statement: str, project: str, expected: MemoryType
+    statement: str, project: str, expected: ScopeDecision
 ) -> None:
     ctx = RetrievalContext(project=project)
     cls = await KeywordExtractor().classify(statement, ctx)
-    assert cls.type is expected
-    if expected is MemoryType.PROJECT_FACT:
+    assert cls.scope_decision is expected
+    if expected is ScopeDecision.PROJECT:
         assert cls.scope == Scope.project(project)
     else:
         assert cls.scope.is_global

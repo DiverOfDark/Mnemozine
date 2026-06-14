@@ -26,7 +26,7 @@ from mnemozine.interfaces import (
     RetrievalContext,
     StorageBackend,
 )
-from mnemozine.schema.models import Edge, Entity, MemoryType, MemoryUnit
+from mnemozine.schema.models import Edge, Entity, MemoryUnit
 from mnemozine.web.deps import CrossReferencerDep, StorageDep
 from mnemozine.web.routes._read import collect_memories, scope_to_obj
 from mnemozine.web.schemas import GraphEdge, GraphNode, GraphResponse
@@ -214,8 +214,10 @@ async def get_graph(
                 seen_edges.add(edge.id)
                 edges.append(_structural_edge(edge))
 
-    # --- idea-seed memory nodes ------------------------------------------
-    idea_seeds = [m for m in memories if m.type == MemoryType.IDEA_SEED]
+    # --- cross-reference seed memory nodes -------------------------------
+    # The old idea_seed type is now the cross_ref_candidate flag (FR-RET-6): these
+    # are the first-class memory nodes that power serendipitous cross-references.
+    idea_seeds = [m for m in memories if m.cross_ref_candidate]
     for seed in idea_seeds:
         nodes.append(_idea_seed_node(seed))
         for name in seed.entities:

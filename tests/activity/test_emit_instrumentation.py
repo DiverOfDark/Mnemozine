@@ -43,7 +43,7 @@ from mnemozine.maintenance.decision import WriteDecider
 from mnemozine.maintenance.runner import MaintenanceRunner
 from mnemozine.retrieval.retriever import ScopedRetriever
 from mnemozine.schema.events import IngestEvent, Role, Source
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope
 from tests.conftest import FakeEmbeddingProvider, FakeLLMProvider, InMemoryStorage
 
 
@@ -56,7 +56,7 @@ async def _drain() -> None:
 
 def _pref(content: str, *, entities: list[str], confidence: float = 0.9) -> MemoryUnit:
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
+        category="preference",
         content=content,
         scope=Scope.global_(),
         entities=entities,
@@ -244,7 +244,7 @@ async def test_build_index_emits_injection() -> None:
     assert ev.kind is ActivityKind.INJECTION
     assert ev.source == "retrieval"
     assert ev.project == "rust-cli"
-    assert ev.detail["preference_count"] == index.preference_count
+    assert ev.detail["global_count"] == index.global_count
     assert pref.id in ev.ref_memory_ids
 
 
@@ -284,7 +284,7 @@ async def test_build_index_default_no_log_is_unchanged() -> None:
     retriever = ScopedRetriever(storage, settings=Settings())  # no activity_log
     context = RetrievalContext(scopes=[Scope.global_()], entities=["rust"], recent_text="rust")
     index = await retriever.build_index(context)
-    assert index.preference_count == 1
+    assert index.global_count == 1
 
 
 # ---------------------------------------------------------------------------

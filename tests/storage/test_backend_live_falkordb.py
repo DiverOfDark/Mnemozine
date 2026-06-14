@@ -31,7 +31,6 @@ from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -74,11 +73,14 @@ def _memory(
     *,
     scope: Scope | None = None,
     entities: list[str] | None = None,
+    category: str = "preference",
 ) -> MemoryUnit:
+    # Category split: a global-scope memory tagged 'preference' is the new shape
+    # of the old PREFERENCE type; scope (not a type field) drives the no-leak rule.
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content=content,
         scope=scope or Scope.global_(),
+        category=category,
         entities=entities if entities is not None else ["dir"],
         confidence=0.9,
         provenance=Provenance(source=Source.CLAUDE_CODE.value, session_id="sess-live"),
@@ -185,6 +187,37 @@ async def test_scoped_query_scope_isolation_no_cross_project_leak(
     # ...but the owning project sees it.
     own = await live_backend.scoped_query("north", [Scope.project("p1")], top_k=5)
     assert [h.memory.content for h in own] == ["north"]
+
+
+async def test_scoped_query_composes_ancestors_against_real_index(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """Ancestor-composition runs through the real FalkorDB index post-filter.
+
+    A query at project:proj/auth must compose its ancestor chain (global +
+    project:proj + project:proj/auth) in the index ``WHERE m.scope IN $scopes``,
+    while a sibling sub-scope (project:proj/db) must NOT leak — proving the
+    no-leak rule holds against the live index, not just the fake.
+    """
+
+    await live_backend.upsert_memory(_memory("north", scope=Scope.global_()))
+    await live_backend.upsert_memory(
+        _memory("northeast", scope=Scope.project("proj"))
+    )
+    await live_backend.upsert_memory(
+        _memory("east", scope=Scope.project("proj", "auth"))
+    )
+    await live_backend.upsert_memory(
+        _memory("up", scope=Scope.project("proj", "db"))
+    )
+
+    hits = await live_backend.scoped_query(
+        "north", [Scope.project("proj", "auth")], top_k=10
+    )
+    contents = {h.memory.content for h in hits}
+    # Composes global + project + auth-self; the db sibling never leaks.
+    assert contents == {"north", "northeast", "east"}
+    assert "up" not in contents
 
 
 async def test_scoped_query_entity_filter_via_index(

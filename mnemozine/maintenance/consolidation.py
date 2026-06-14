@@ -34,7 +34,7 @@ from mnemozine.interfaces import (
     StorageBackend,
 )
 from mnemozine.maintenance.decision import cosine_similarity
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope, Tier
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope, Tier
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ class ConsolidationJob:
     ) -> list[list[MemoryUnit]]:
         """Greedy single-link clustering by entity overlap AND embedding similarity.
 
-        Only units of the same :class:`MemoryType` and sharing >=1 entity are
+        Only units of the same free-form ``category`` and sharing >=1 entity are
         candidates; a cosine similarity at/above ``threshold`` joins them. Greedy
         and deterministic (input order), which is enough for the periodic merge.
         """
@@ -134,7 +134,7 @@ class ConsolidationJob:
             for v in units[i + 1 :]:
                 if v.id in assigned:
                     continue
-                if v.type is not u.type:
+                if v.category != u.category:
                     continue
                 if not (set(u.entities) & set(v.entities)):
                     continue
@@ -165,14 +165,18 @@ class ConsolidationJob:
         if not text:
             return None
 
-        # Union of entities; highest source confidence; merged provenance.
+        # Union of entities; highest source confidence; merged provenance. The
+        # cluster is single-category (see _cluster), so the consolidated theme
+        # carries that category; it is a cross-ref seed iff any member was.
         entities = sorted({e for m in cluster for e in m.entities})
         confidence = max(m.confidence for m in cluster)
-        mtype: MemoryType = cluster[0].type
+        category = cluster[0].category
+        cross_ref_candidate = any(m.cross_ref_candidate for m in cluster)
         consolidated = MemoryUnit(
-            type=mtype,
             content=text,
             scope=scope,
+            category=category,
+            cross_ref_candidate=cross_ref_candidate,
             entities=entities,
             confidence=confidence,
             provenance=self._merged_provenance(cluster),

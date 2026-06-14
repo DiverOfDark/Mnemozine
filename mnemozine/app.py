@@ -417,6 +417,97 @@ def _maintenance_migrate_index_cmd(
         typer.echo(f"    - {note}")
 
 
+@maintenance_app.command("merge-categories")
+def _maintenance_merge_categories_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only print the proposed (source -> canonical) merges; apply nothing.",
+    ),
+) -> None:
+    """Merge near-duplicate emergent categories into a canonical one (FR-MNT-2/4).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_merge_categories` onto the
+    live ``mnemozine-maintenance`` console app (the runner's own Typer app is not
+    wired to a script). Clusters the free-form ``MemoryUnit.category`` registry by
+    name/embedding similarity above ``category.merge_similarity_threshold`` and
+    folds each cluster into its highest-count canonical category. Idempotent; use
+    ``--dry-run`` to review the proposals first.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_merge_categories
+
+    report = asyncio.run(_run_merge_categories(dry_run=dry_run))
+    _echo_report(report)
+
+
+@maintenance_app.command("reclassify")
+def _maintenance_reclassify_cmd(
+    scope: str | None = typer.Option(
+        None,
+        "--scope",
+        help=(
+            "Restrict to one scope (canonical form, e.g. 'global' or "
+            "'project:Mnemozine'); default: all scopes."
+        ),
+    ),
+) -> None:
+    """Re-scope + re-categorize stored memories with the current classifier (R1).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_reclassify`. Reads each
+    memory's already-stored content + provenance (no raw transcript) and re-applies
+    the current scope/category/cross-ref decision, writing only the fields that
+    drifted. Idempotent: a memory already matching the classifier is untouched.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_reclassify
+
+    report = asyncio.run(_run_reclassify(scope=scope))
+    _echo_report(report)
+
+
+@maintenance_app.command("re-extract")
+def _maintenance_re_extract_cmd(
+    scope: str | None = typer.Option(
+        None,
+        "--scope",
+        help="Restrict to one EXACT scope (e.g. 'project:Mnemozine'); default: all.",
+    ),
+    session_id: str | None = typer.Option(
+        None,
+        "--session-id",
+        help="Restrict to one originating session id; default: all sessions.",
+    ),
+    keep_existing: bool = typer.Option(
+        False,
+        "--keep-existing",
+        help=(
+            "Do NOT close the validity windows of the memories each chunk "
+            "previously produced (default: supersede them)."
+        ),
+    ),
+) -> None:
+    """Re-run the current extractor over the retained raw tier (offline reindex).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_re_extract`. Re-processes
+    stored RawChunks through the current extractor/classifier to apply a model or
+    prompt change to already-ingested data without the original transcript. By
+    default the memories each chunk previously produced are superseded;
+    ``--keep-existing`` leaves them active. Idempotent.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_re_extract
+
+    report = asyncio.run(
+        _run_re_extract(
+            scope=scope,
+            session_id=session_id,
+            supersede_existing=not keep_existing,
+        )
+    )
+    _echo_report(report)
+
+
 # ---------------------------------------------------------------------------
 # mnemozine-eval — the §9 eval harness
 # ---------------------------------------------------------------------------

@@ -142,7 +142,9 @@ def _to_detail(unit: MemoryUnit) -> MemoryDetail:
     prov = unit.provenance
     return MemoryDetail(
         id=unit.id,
-        type=unit.type,
+        category=unit.category,
+        cross_ref_candidate=unit.cross_ref_candidate,
+        scope_decision=unit.scope_decision,
         content=unit.content,
         scope=unit.scope.as_str(),
         entities=list(unit.entities),
@@ -205,17 +207,20 @@ async def patch_memory(
 ) -> MutationResponse:
     """Apply a HITL correction to one memory (PRD §4.3, R1/R5).
 
-    Only ``type`` (reclassify), ``scope`` (re-scope), and ``tier``
-    (archive=``archive`` / restore=``hot``) are accepted — content is never
-    editable (PRD §7). A patch that sets nothing is a 422; an unknown id is 404.
-    Tier changes go through :meth:`StorageBackend.archive` / :meth:`promote`;
-    type/scope are applied to the unit and persisted through the backend. Emits an
+    Only ``category`` (re-label), ``cross_ref_candidate`` (toggle the seed flag),
+    ``scope`` (re-scope), and ``tier`` (archive=``archive`` / restore=``hot``) are
+    accepted — content is never editable (PRD §7). A patch that sets nothing is a
+    422; an unknown id is 404. Tier changes go through
+    :meth:`StorageBackend.archive` / :meth:`promote`; category/cross-ref/scope are
+    applied via :meth:`StorageBackend.reclassify_memory`. Emits an
     ``extract_decision`` activity event recording the correction.
     """
 
     changed: list[str] = []
-    if req.type is not None:
-        changed.append("type")
+    if req.category is not None:
+        changed.append("category")
+    if req.cross_ref_candidate is not None:
+        changed.append("cross_ref_candidate")
     if req.scope is not None:
         changed.append("scope")
     if req.tier is not None:
@@ -223,7 +228,7 @@ async def patch_memory(
     if not changed:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="patch must set at least one of: type, scope, tier",
+            detail="patch must set at least one of: category, cross_ref_candidate, scope, tier",
         )
 
     # Validate the scope eagerly so a bad scope string is a 422, not a 500.
@@ -252,17 +257,36 @@ async def patch_memory(
             unit = await storage.promote(memory_id)
             detail_extra["tier"] = "hot"
 
-    # Reclassify / re-scope: mutate the unit and persist through the backend.
-    if req.type is not None:
-        detail_extra["from_type"] = unit.type.value
-        detail_extra["to_type"] = req.type.value
-        unit.type = req.type
+    # Reclassify / re-scope / toggle cross-ref: persist via the backend's
+    # reclassify_memory seam when available (the real Graphiti backend + the fake
+    # both implement it), falling back to the dict-backed in-place write.
+    if req.category is not None:
+        detail_extra["from_category"] = unit.category
+    if req.cross_ref_candidate is not None:
+        detail_extra["from_cross_ref_candidate"] = unit.cross_ref_candidate
+        detail_extra["to_cross_ref_candidate"] = req.cross_ref_candidate
     if new_scope is not None:
         detail_extra["from_scope"] = unit.scope.as_str()
         detail_extra["to_scope"] = new_scope.as_str()
-        unit.scope = new_scope
-    if req.type is not None or new_scope is not None:
-        _persist_inplace(storage, unit)
+    if req.category is not None or req.cross_ref_candidate is not None or new_scope is not None:
+        reclassify = getattr(storage, "reclassify_memory", None)
+        if callable(reclassify):
+            unit = await reclassify(
+                memory_id,
+                scope=new_scope,
+                category=req.category,
+                cross_ref_candidate=req.cross_ref_candidate,
+            )
+        else:
+            if req.category is not None:
+                unit.category = req.category.strip().lower()
+            if req.cross_ref_candidate is not None:
+                unit.cross_ref_candidate = req.cross_ref_candidate
+            if new_scope is not None:
+                unit.scope = new_scope
+            _persist_inplace(storage, unit)
+        if req.category is not None:
+            detail_extra["to_category"] = unit.category
 
     await emit(
         activity,

@@ -129,11 +129,12 @@ async def health(container: ContainerDep, settings: SettingsDep) -> HealthRespon
 async def stats(storage: StorageDep) -> StoreStatsResponse:
     """Live store totals for the top bar + Dashboard (PRD §4.1).
 
-    Streams the store once and tallies per-type / per-tier / per-source counts plus
-    active vs superseded; entities are counted off ``iter_entities``.
+    Streams the store once and tallies per-category / per-scope-decision / per-tier
+    / per-source counts plus active vs superseded; entities off ``iter_entities``.
     """
 
-    by_type: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    by_scope_decision: dict[str, int] = {}
     by_tier: dict[str, int] = {}
     by_source: dict[str, int] = {}
     total = 0
@@ -141,7 +142,9 @@ async def stats(storage: StorageDep) -> StoreStatsResponse:
     superseded = 0
     async for memory in storage.iter_memories():
         total += 1
-        by_type[memory.type.value] = by_type.get(memory.type.value, 0) + 1
+        by_category[memory.category] = by_category.get(memory.category, 0) + 1
+        decision = memory.scope_decision.value
+        by_scope_decision[decision] = by_scope_decision.get(decision, 0) + 1
         by_tier[memory.tier.value] = by_tier.get(memory.tier.value, 0) + 1
         src = memory.provenance.source
         by_source[src] = by_source.get(src, 0) + 1
@@ -156,7 +159,8 @@ async def stats(storage: StorageDep) -> StoreStatsResponse:
 
     return StoreStatsResponse(
         total_memories=total,
-        by_type=by_type,
+        by_category=by_category,
+        by_scope_decision=by_scope_decision,
         by_tier=by_tier,
         by_source=by_source,
         active_count=active,

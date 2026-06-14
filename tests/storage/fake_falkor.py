@@ -39,6 +39,9 @@ class FakeFalkorDriver:
         self.edges: dict[str, dict[str, Any]] = {}
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.suppressions: set[tuple[str, str]] = set()
+        # Raw-chunk tier (offline re-extraction/reindex), keyed on content_hash
+        # to mirror the backend's MERGE idempotency key (FR-ING-5).
+        self.raw_chunks: dict[str, dict[str, Any]] = {}
         self.closed = False
         self.queries: list[str] = []
 
@@ -61,6 +64,9 @@ class FakeFalkorDriver:
         if "db.idx.vector.queryNodes" in c:
             return self._vector_knn(c, params)
 
+        # --- MnemozineRawChunk (the retained raw tier) -----------------------
+        if ":MnemozineRawChunk" in c:
+            return self._raw_chunk(c, params)
         # --- MnemozineMemory --------------------------------------------------
         if ":MnemozineMemory" in c:
             return self._memory(c, params)
@@ -90,6 +96,47 @@ class FakeFalkorDriver:
                 props["embedding"] = list(p["embedding"])
             self.memories[props["id"]] = props
             return _Result([[props]])
+
+        # --- category registry (list_categories / merge_categories) ----------
+        # ``list_categories``: count active memories grouped by category. Emitted
+        # as ``... WHERE m.valid_to IS NULL RETURN m.category AS category,
+        # count(m) AS n`` — return ``[category, count]`` rows.
+        if "RETURN m.category AS category" in c:
+            counts: dict[str, int] = {}
+            for m in self.memories.values():
+                if m.get("valid_to") is not None:
+                    continue
+                cat = m.get("category") or "fact"
+                counts[cat] = counts.get(cat, 0) + 1
+            return _Result([[cat, n] for cat, n in counts.items()])
+        # ``merge_categories``: re-label every memory tagged $src to $tgt, return
+        # the count. Emitted as ``... WHERE m.category = $src SET m.category = $tgt
+        # RETURN count(m) AS n``.
+        if "WHERE m.category = $src" in c and "SET m.category = $tgt" in c:
+            n = 0
+            for m in self.memories.values():
+                if m.get("category") == p.get("src"):
+                    m["category"] = p.get("tgt")
+                    n += 1
+            return _Result([[n]])
+
+        # --- reclassify_memory: SET any subset of scope/category/cross_ref -----
+        # Emitted as ``MATCH (m:MnemozineMemory {id: $id}) SET <fields> RETURN m``
+        # where <fields> is some subset of ``m.scope = $scope`` /
+        # ``m.category = $category`` / ``m.cross_ref_candidate = $cross_ref_candidate``.
+        if "{id: $id}" in c and "RETURN m" in c and "SET m." in c and (
+            "m.scope = $scope" in c
+            or "m.category = $category" in c
+            or "m.cross_ref_candidate = $cross_ref_candidate" in c
+        ):
+            m = self.memories[p["id"]]
+            if "m.scope = $scope" in c:
+                m["scope"] = p["scope"]
+            if "m.category = $category" in c:
+                m["category"] = p["category"]
+            if "m.cross_ref_candidate = $cross_ref_candidate" in c:
+                m["cross_ref_candidate"] = p["cross_ref_candidate"]
+            return _Result([[m]])
 
         if "SET m.confidence" in c:
             m = self.memories[p["id"]]
@@ -179,6 +226,42 @@ class FakeFalkorDriver:
             if la is not None and not (str(la) < str(p.get("unused_since"))):
                 return False
         return True
+
+    # -- raw chunk (the retained raw tier) ------------------------------------
+
+    def _raw_chunk(self, c: str, p: dict[str, Any]) -> _Result:
+        """Interpret the RawChunk persist/iter Cypher against the dict store.
+
+        ``persist_raw_chunk`` is idempotent on ``content_hash`` (the backend emits
+        ``MERGE (c:MnemozineRawChunk {content_hash: $content_hash}) SET c = $props``):
+        re-persisting the same hash overwrites the stored props in place rather
+        than duplicating. ``iter_raw_chunks`` matches EXACTLY (no ancestor
+        composition — a re-extraction must not widen scope), AND-combining the
+        optional scope/session/source/since filters the backend emits.
+        """
+
+        if c.startswith("MERGE (c:MnemozineRawChunk {content_hash: $content_hash})"):
+            props = dict(p["props"])
+            self.raw_chunks[props["content_hash"]] = props
+            return _Result([[props]])
+
+        # MATCH (c:MnemozineRawChunk)[ WHERE ...] RETURN c
+        rows: list[list[Any]] = []
+        for chunk in self.raw_chunks.values():
+            if "c.scope = $scope" in c and chunk.get("scope") != p.get("scope"):
+                continue
+            if "c.session_id = $session_id" in c and chunk.get("session_id") != p.get(
+                "session_id"
+            ):
+                continue
+            if "c.source = $source" in c and chunk.get("source") != p.get("source"):
+                continue
+            if "c.ingested_at >= $since" in c:
+                ing = chunk.get("ingested_at")
+                if ing is None or not (str(ing) >= str(p.get("since"))):
+                    continue
+            rows.append([chunk])
+        return _Result(rows)
 
     # -- entity / edge --------------------------------------------------------
 

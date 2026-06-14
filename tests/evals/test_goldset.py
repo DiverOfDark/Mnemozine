@@ -11,7 +11,7 @@ from mnemozine.evals.goldset import (
     runtime_ids,
     save_gold_set,
 )
-from mnemozine.schema.models import MemoryType, Scope, Tier
+from mnemozine.schema.models import Scope, ScopeDecision, Tier
 
 
 def test_fixture_loads() -> None:
@@ -46,10 +46,7 @@ def test_materialize_deterministic_ids() -> None:
     gs = load_gold_set()
     units = gs.materialize_memories()
     # Runtime ids derive from the fixture-stable gold ids (no random uuids).
-    assert all(
-        u.id == gs.runtime_id(g.gold_id)
-        for u, g in zip(units, gs.memories, strict=True)
-    )
+    assert all(u.id == gs.runtime_id(g.gold_id) for u, g in zip(units, gs.memories, strict=True))
 
 
 def test_superseded_memory_is_closed() -> None:
@@ -71,7 +68,8 @@ def test_age_days_makes_unit_older() -> None:
 def test_project_fact_scope_parsed() -> None:
     gs = load_gold_set()
     fact = gs.memory_by_gold_id("fact-rustcli-tokio").to_memory()
-    assert fact.type is MemoryType.PROJECT_FACT
+    assert fact.scope_decision is ScopeDecision.PROJECT
+    assert fact.category == "fact"
     assert fact.scope == Scope.project("rust-cli")
     assert fact.tier is Tier.HOT
 

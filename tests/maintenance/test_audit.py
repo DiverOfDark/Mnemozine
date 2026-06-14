@@ -6,7 +6,7 @@ import pytest
 
 from mnemozine.config import Settings
 from mnemozine.maintenance.audit import AuditJob
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope, Tier
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope, Tier
 from tests.conftest import InMemoryStorage
 
 
@@ -15,18 +15,18 @@ async def test_audit_counts_and_flags_anomalies() -> None:
     storage = InMemoryStorage()
 
     good = MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content="solid pref",
         scope=Scope.global_(),
+        category="preference",
         entities=["rust"],
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),
     )
     # Anomaly: classify-sentinel provenance + no entities + low confidence.
     sketchy = MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content="sketchy pref",
         scope=Scope.global_(),
+        category="preference",
         entities=[],
         confidence=0.05,
     )
@@ -35,9 +35,9 @@ async def test_audit_counts_and_flags_anomalies() -> None:
     # One superseded + archived unit.
     await storage.upsert_memory(
         MemoryUnit(
-            type=MemoryType.PREFERENCE,
             content="old pref",
             scope=Scope.global_(),
+            category="preference",
             entities=["rust"],
             confidence=0.9,
             provenance=Provenance(source="claude_code", session_id="s1"),
@@ -65,9 +65,9 @@ async def test_audit_is_read_only_and_idempotent() -> None:
     storage = InMemoryStorage()
     await storage.upsert_memory(
         MemoryUnit(
-            type=MemoryType.PREFERENCE,
             content="a pref",
             scope=Scope.global_(),
+            category="preference",
             entities=["rust"],
             confidence=0.9,
             provenance=Provenance(source="claude_code", session_id="s1"),

@@ -177,9 +177,7 @@ async def injection_precision(
             entities=list(case.entities),
             recent_text=case.query,
         )
-        retrieved = await retriever.scoped_retrieve(
-            case.query, ctx, top_k=case.top_k
-        )
+        retrieved = await retriever.scoped_retrieve(case.query, ctx, top_k=case.top_k)
         retrieved_ids = [r.memory.id for r in retrieved]
         relevant = {gold_set.runtime_id(g) for g in case.should_surface}
         p = precision_at_k(retrieved_ids, relevant, case.top_k)
@@ -230,9 +228,7 @@ async def changed_preference_correctness(
             entities=list(case.entities),
             recent_text=case.query,
         )
-        retrieved = await retriever.scoped_retrieve(
-            case.query, ctx, top_k=case.top_k
-        )
+        retrieved = await retriever.scoped_retrieve(case.query, ctx, top_k=case.top_k)
         retrieved_ids = {r.memory.id for r in retrieved}
         current_id = gold_set.runtime_id(case.current_gold_id)
         stale_id = gold_set.runtime_id(case.stale_gold_id)
@@ -284,9 +280,7 @@ async def crossref_precision(
             scopes=[Scope.global_()],
             entities=list(case.entities),
         )
-        refs = await cross_referencer.find_related(
-            ctx, max_suggestions=case.max_suggestions
-        )
+        refs = await cross_referencer.find_related(ctx, max_suggestions=case.max_suggestions)
         surfaced_ids = [r.memory.id for r in refs]
         relevant = {gold_set.runtime_id(g) for g in case.relevant_gold_ids}
         if surfaced_ids:
@@ -324,12 +318,14 @@ async def classifier_accuracy(
     *,
     threshold: float = 0.9,
 ) -> MetricResult:
-    """Classifier accuracy: preference vs project_fact (R1, the gate, PRD §9).
+    """Classifier accuracy: global vs project scope-decision (R1, the gate, §9).
 
     For each classifier case, runs ``Extractor.classify`` on the bare statement
-    and compares the returned type against the gold ``expected_type``. This is
-    the make-or-break metric; the default threshold is high (0.9). Score is the
-    accuracy across cases.
+    and compares the returned controlled :class:`ScopeDecision` against the gold
+    ``expected_scope_decision`` (the make-or-break distinction that drives the
+    no-leak rule under the category split). When a case sets
+    ``expected_cross_ref`` the cross-reference flag must also match. The default
+    threshold is high (0.9). Score is the accuracy across cases.
     """
 
     cases: list[CaseResult] = []
@@ -337,20 +333,22 @@ async def classifier_accuracy(
     for case in gold_set.classifier_cases:
         ctx = RetrievalContext(
             project=case.project,
-            scopes=(
-                [Scope.project(case.project)] if case.project else [Scope.global_()]
-            ),
+            scopes=([Scope.project(case.project)] if case.project else [Scope.global_()]),
         )
         classification = await extractor.classify(case.statement, ctx)
-        ok = classification.type == case.expected_type
+        ok = classification.scope_decision == case.expected_scope_decision
+        if case.expected_cross_ref is not None:
+            ok = ok and (classification.cross_ref_candidate == case.expected_cross_ref)
         correct += int(ok)
         cases.append(
             CaseResult(
                 case_id=case.case_id,
                 passed=ok,
                 detail={
-                    "expected": case.expected_type.value,
-                    "predicted": classification.type.value,
+                    "expected_scope_decision": case.expected_scope_decision.value,
+                    "predicted_scope_decision": classification.scope_decision.value,
+                    "predicted_category": classification.category,
+                    "predicted_cross_ref": classification.cross_ref_candidate,
                 },
             )
         )

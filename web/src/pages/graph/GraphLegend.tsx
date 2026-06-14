@@ -45,7 +45,7 @@ export function GraphLegend() {
     <div className="pointer-events-none absolute bottom-3 left-3 z-10 flex flex-col gap-1.5 rounded-md border border-border bg-bg-raised/90 px-3 py-2 backdrop-blur-sm">
       <div className="mb-0.5 text-2xs font-semibold uppercase tracking-wider text-text-faint">legend</div>
       <Swatch color={HEX.accent} label="entity" />
-      <Swatch color={HEX.type.idea_seed} label="idea seed" />
+      <Swatch color={HEX.type.idea_seed} label="cross-ref seed" />
       <Swatch color={HEX.type.project_fact} label="memory" />
       <Swatch color={HEX.edge} label="relation (weighted)" edge />
       <Swatch color={HEX.crossref} label="cross-reference" edge dashed />

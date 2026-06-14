@@ -21,6 +21,8 @@ export const queryKeys = {
     all: () => ["memories"] as const,
     list: (params: MemoriesQuery) => ["memories", "list", params] as const,
     detail: (id: string) => ["memories", "detail", id] as const,
+    categoryFacets: () => ["memories", "facets", "categories"] as const,
+    scopeTree: () => ["memories", "facets", "scope-tree"] as const,
   },
 
   graph: (params: GraphQuery) => ["graph", params] as const,

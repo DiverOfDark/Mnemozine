@@ -1,8 +1,10 @@
 """Memories list + detail route tests (PRD §4.2/§4.3) — offline against fakes.
 
-Covers the table filters (type / scope / tier / entity / active-vs-superseded /
-source / free-text), pagination, and the detail view's provenance + validity
-window + supersession chain (the signature temporal feature).
+Covers the table filters (category / scope / tier / entity / active-vs-superseded
+/ source / free-text), the category-facets + scope-tree discovery endpoints,
+pagination, and the detail view's provenance + validity window + supersession
+chain (the signature temporal feature). The old fixed ``type`` enum filter is now
+the free-form ``category`` filter.
 """
 
 from __future__ import annotations
@@ -31,10 +33,28 @@ def test_list_returns_all_seeded_memories(client: TestClient) -> None:
     assert all("active" in i for i in body["items"])
 
 
-def test_list_filter_by_type(client: TestClient) -> None:
-    resp = client.get("/api/memories", params={"type": "preference"})
+def test_list_filter_by_category(client: TestClient) -> None:
+    resp = client.get("/api/memories", params={"category": "preference"})
     assert resp.status_code == 200
     assert _ids(resp.json()["items"]) == {"mem-pref-current", "mem-pref-stale"}
+
+
+def test_list_filter_by_category_is_case_insensitive(client: TestClient) -> None:
+    # Categories are normalized (lowercased/trimmed); the filter normalizes too.
+    resp = client.get("/api/memories", params={"category": "  Preference "})
+    assert _ids(resp.json()["items"]) == {"mem-pref-current", "mem-pref-stale"}
+
+
+def test_list_item_carries_category_and_scope(client: TestClient) -> None:
+    items = {i["id"]: i for i in client.get("/api/memories").json()["items"]}
+    # The free-form category chip + the persisted scope path are on every row.
+    assert items["mem-fact-tokio"]["category"] == "decision"
+    assert items["mem-fact-tokio"]["scope"] == "project:rust-cli"
+    assert items["mem-fact-tokio"]["scope_decision"] == "project"
+    assert items["mem-idea-cli"]["category"] == "idea"
+    assert items["mem-idea-cli"]["cross_ref_candidate"] is True
+    assert items["mem-pref-current"]["scope"] == "global"
+    assert items["mem-pref-current"]["scope_decision"] == "global"
 
 
 def test_list_filter_by_tier_archive(client: TestClient) -> None:
@@ -123,3 +143,55 @@ def test_detail_supersession_chain(client: TestClient) -> None:
 def test_detail_unknown_id_404(client: TestClient) -> None:
     resp = client.get("/api/memories/does-not-exist")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Category facets (the dynamic CATEGORY filter discovery surface)
+# ---------------------------------------------------------------------------
+
+
+def test_category_facets_lists_discovered_categories(client: TestClient) -> None:
+    resp = client.get("/api/memories/facets/categories")
+    assert resp.status_code == 200
+    body = resp.json()
+    by_cat = {f["category"]: f["count"] for f in body["facets"]}
+    # The active categories in the seed (the superseded 'preference' is excluded
+    # by list_categories, which counts active memories only).
+    assert by_cat == {"preference": 1, "decision": 1, "idea": 1}
+    assert body["total"] == 3
+
+
+def test_category_facets_ordered_most_frequent_first(client: TestClient) -> None:
+    facets = client.get("/api/memories/facets/categories").json()["facets"]
+    counts = [f["count"] for f in facets]
+    assert counts == sorted(counts, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Scope tree (the hierarchical SCOPE NAVIGATOR discovery surface)
+# ---------------------------------------------------------------------------
+
+
+def test_scope_tree_has_global_root_with_children(client: TestClient) -> None:
+    resp = client.get("/api/memories/facets/scope-tree")
+    assert resp.status_code == 200
+    root = resp.json()["root"]
+    assert root["segment"] == "global"
+    assert root["path"] == "global"
+    assert root["depth"] == 0
+    # Three memories sit at global (current/stale prefs + the archived idea);
+    # the project memory rolls up under the project child.
+    assert root["count"] == 3
+    assert root["total_count"] == 4
+    child_paths = {c["path"] for c in root["children"]}
+    assert "project:rust-cli" in child_paths
+
+
+def test_scope_tree_project_node_counts(client: TestClient) -> None:
+    root = client.get("/api/memories/facets/scope-tree").json()["root"]
+    project = next(c for c in root["children"] if c["path"] == "project:rust-cli")
+    assert project["segment"] == "rust-cli"
+    assert project["depth"] == 1
+    assert project["count"] == 1
+    assert project["total_count"] == 1
+    assert project["children"] == []

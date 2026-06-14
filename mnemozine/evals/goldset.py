@@ -17,7 +17,7 @@ A :class:`GoldSet` carries the inputs every §9 metric needs:
 * **crossref cases** — for FR-RET-6 cross-reference precision: the connections a
   context should surface, judged relevant/irrelevant.
 * **classifier cases** — for the make-or-break R1 classifier-accuracy metric: a
-  bare statement plus its gold ``preference``/``project_fact`` label.
+  bare statement plus its gold ``global``/``project`` scope-decision label.
 * **no-leak cases** — for the no-leak check: a ``project_fact`` and the unrelated
   project scope it must never appear in.
 
@@ -37,10 +37,11 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from mnemozine.schema.models import (
-    MemoryType,
+    DEFAULT_CATEGORY,
     MemoryUnit,
     Provenance,
     Scope,
+    ScopeDecision,
     Tier,
 )
 
@@ -67,7 +68,18 @@ class GoldMemory(BaseModel):
     """
 
     gold_id: str = Field(description="Fixture-stable id referenced by metric cases.")
-    type: MemoryType
+    category: str = Field(
+        default=DEFAULT_CATEGORY,
+        description=(
+            "FREE-FORM emergent classifier category (no fixed enum); replaces the "
+            "old MemoryType. The scope decision (global vs project) is implied by "
+            "the persisted 'scope' string, so it is not carried separately."
+        ),
+    )
+    cross_ref_candidate: bool = Field(
+        default=False,
+        description="True for a cross-reference seed (the old idea_seed flag).",
+    )
     content: str
     scope: str = Field(description="Persisted scope string: 'global' or 'project:<id>'.")
     entities: list[str] = Field(default_factory=list)
@@ -88,7 +100,8 @@ class GoldMemory(BaseModel):
         valid_from = now - timedelta(days=self.age_days)
         unit = MemoryUnit(
             id=_gold_memory_id(self.gold_id),
-            type=self.type,
+            category=self.category,
+            cross_ref_candidate=self.cross_ref_candidate,
             content=self.content,
             scope=Scope.parse(self.scope),
             entities=list(self.entities),
@@ -171,18 +184,25 @@ class CrossRefCase(BaseModel):
 
 
 class ClassifierCase(BaseModel):
-    """A classifier-accuracy case: a bare statement + its gold type (R1, §9).
+    """A classifier-accuracy case: a bare statement + its gold decision (R1, §9).
 
     The single make-or-break metric. ``statement`` is fed to
-    ``Extractor.classify`` and the returned :class:`Classification` type is
-    compared against ``expected_type`` (``preference`` vs ``project_fact``, the
-    distinction that gates everything else).
+    ``Extractor.classify`` and the returned :class:`Classification` is compared
+    against the gold labels. Under the category split the *controlled* decision
+    that gates everything else is the :class:`ScopeDecision` (``global`` vs
+    ``project``); the free-form category is emergent and not graded for exact
+    equality (it has no fixed enum). ``expected_cross_ref`` optionally grades the
+    cross-reference flag (the old ``idea_seed`` distinction).
     """
 
     case_id: str
     statement: str
     project: str | None = None
-    expected_type: MemoryType
+    expected_scope_decision: ScopeDecision
+    expected_cross_ref: bool | None = Field(
+        default=None,
+        description="If set, also grade the cross-reference flag for this case.",
+    )
 
 
 class NoLeakCase(BaseModel):
@@ -232,9 +252,7 @@ class GoldSet(BaseModel):
 
         return _gold_memory_id(gold_id)
 
-    def materialize_memories(
-        self, *, now: datetime | None = None
-    ) -> list[MemoryUnit]:
+    def materialize_memories(self, *, now: datetime | None = None) -> list[MemoryUnit]:
         """Materialize all seed memories into runtime :class:`MemoryUnit`s."""
 
         now = now or datetime.now(UTC)

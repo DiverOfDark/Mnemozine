@@ -9,7 +9,6 @@ from mnemozine.retrieval.injection import (
 )
 from mnemozine.retrieval.retriever import ScopedRetriever
 from mnemozine.schema.models import (
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -17,11 +16,21 @@ from mnemozine.schema.models import (
 from tests.conftest import InMemoryStorage
 
 
-def _mem(content: str, type_: MemoryType, scope: Scope, entities: list[str]) -> MemoryUnit:
+def _mem(
+    content: str,
+    scope: Scope,
+    entities: list[str],
+    *,
+    category: str = "fact",
+    cross_ref_candidate: bool = False,
+) -> MemoryUnit:
+    """Build a MemoryUnit on the category-split contract (no legacy ``type``)."""
+
     return MemoryUnit(
-        type=type_,
         content=content,
         scope=scope,
+        category=category,
+        cross_ref_candidate=cross_ref_candidate,
         entities=entities,
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s"),
@@ -37,9 +46,9 @@ async def test_session_start_injection_under_budget(tmp_path, settings: Settings
     await storage.upsert_memory(
         _mem(
             "Prefers thiserror over anyhow for rust error handling",
-            MemoryType.PREFERENCE,
             Scope.global_(),
             ["rust", "thiserror", "error-handling"],
+            category="preference",
         )
     )
     retriever = ScopedRetriever(storage, settings=settings)
@@ -56,9 +65,9 @@ async def test_mid_session_injection_smaller_budget(settings: Settings) -> None:
         await storage.upsert_memory(
             _mem(
                 f"Prefers approach {i} for async runtime selection in services",
-                MemoryType.PREFERENCE,
                 Scope.global_(),
                 ["async", "runtime"],
+                category="preference",
             )
         )
     retriever = ScopedRetriever(storage, settings=settings, default_project="svc")
@@ -77,9 +86,9 @@ async def test_mid_session_injection_does_not_record_access(settings: Settings) 
     await storage.upsert_memory(
         _mem(
             "Prefers tokio for async runtime",
-            MemoryType.PREFERENCE,
             Scope.global_(),
             ["async", "runtime", "tokio"],
+            category="preference",
         )
     )
     retriever = ScopedRetriever(storage, settings=settings, default_project="svc")

@@ -94,8 +94,7 @@ class ScalingReport:
             lines.append(f"  {lvl:>4}x  precision={p:.3f}")
         verdict = "PASS" if self.passed else "FAIL"
         lines.append(
-            f"--- baseline={self.baseline:.3f} tolerance={self.tolerance:.3f} "
-            f"-> {verdict} ---"
+            f"--- baseline={self.baseline:.3f} tolerance={self.tolerance:.3f} -> {verdict} ---"
         )
         return "\n".join(lines)
 
@@ -128,9 +127,7 @@ class EvalRunner:
 
     # --- store seeding ---------------------------------------------------
 
-    async def seed_store(
-        self, storage: StorageBackend, *, inflation_multiplier: int = 1
-    ) -> int:
+    async def seed_store(self, storage: StorageBackend, *, inflation_multiplier: int = 1) -> int:
         """Load gold memories into ``storage`` and optionally inflate. Returns distractor count.
 
         Gold memories are inserted first (so they exist regardless of how many
@@ -143,9 +140,7 @@ class EvalRunner:
             await storage.upsert_memory(unit)
         if inflation_multiplier <= 0:
             return 0
-        gen = DistractorGenerator(
-            self.gold_set, llm=self.llm, seed=self.distractor_seed
-        )
+        gen = DistractorGenerator(self.gold_set, llm=self.llm, seed=self.distractor_seed)
         return await gen.inflate_store(storage, multiplier=inflation_multiplier)
 
     # --- full metric run -------------------------------------------------
@@ -160,17 +155,11 @@ class EvalRunner:
 
         results: list[MetricResult] = []
         results.append(await metrics.injection_precision(retriever, self.gold_set))
-        results.append(
-            await metrics.changed_preference_correctness(retriever, self.gold_set)
-        )
+        results.append(await metrics.changed_preference_correctness(retriever, self.gold_set))
         results.append(await metrics.crossref_precision(crossref, self.gold_set))
+        results.append(await metrics.classifier_accuracy(self._extractor, self.gold_set))
         results.append(
-            await metrics.classifier_accuracy(self._extractor, self.gold_set)
-        )
-        results.append(
-            await metrics.retrieval_latency(
-                retriever, self.gold_set, settings=self.settings
-            )
+            await metrics.retrieval_latency(retriever, self.gold_set, settings=self.settings)
         )
         results.append(await metrics.no_leak_check(storage, self.gold_set))
         await storage.close()

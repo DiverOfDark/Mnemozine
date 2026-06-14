@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 from mnemozine.activity.models import ActivityKind
 from mnemozine.interfaces import WriteDecision
-from mnemozine.schema.models import MemoryType, Tier
+from mnemozine.schema.models import MemoryType, ScopeDecision, Tier
 
 # ---------------------------------------------------------------------------
 # Shared / common
@@ -90,7 +90,15 @@ class MemoryListItem(BaseModel):
     """A compact memory row for the Memories table (PRD §4.2)."""
 
     id: str
-    type: MemoryType = Field(description="preference | project_fact | idea_seed.")
+    category: str = Field(
+        description="Free-form emergent category (e.g. 'preference', 'decision', 'gotcha')."
+    )
+    cross_ref_candidate: bool = Field(
+        default=False, description="True if flagged as a cross-reference seed (FR-RET-6)."
+    )
+    scope_decision: ScopeDecision = Field(
+        description="Controlled scope decision implied by the scope: global | project."
+    )
     content: str = Field(description="The distilled memory statement (snippet in the table).")
     scope: str = Field(description="Persisted scope string: 'global' or 'project:<id>'.")
     entities: list[str] = Field(default_factory=list, description="Linked entity names.")
@@ -108,7 +116,13 @@ class MemoryDetail(BaseModel):
     """The full single-memory view (PRD §4.3): content + provenance + validity + chain."""
 
     id: str
-    type: MemoryType
+    category: str = Field(description="Free-form emergent category.")
+    cross_ref_candidate: bool = Field(
+        default=False, description="True if flagged as a cross-reference seed (FR-RET-6)."
+    )
+    scope_decision: ScopeDecision = Field(
+        description="Controlled scope decision implied by the scope: global | project."
+    )
     content: str
     scope: str
     entities: list[str] = Field(default_factory=list)
@@ -135,6 +149,77 @@ class MemoryListResponse(BaseModel):
 
     items: list[MemoryListItem]
     page: Page
+
+
+# ---------------------------------------------------------------------------
+# Category facets + scope tree (the discovery surface for the open-ended model)
+# ---------------------------------------------------------------------------
+
+
+class CategoryFacet(BaseModel):
+    """One discovered free-form category with its memory count.
+
+    Categories are now open-ended (the old 3-value ``MemoryType`` enum is gone),
+    so the UI cannot ship a fixed list — it must discover the in-use categories
+    from the store. Each facet is a ``(category, count)`` pair the frontend
+    renders as a filter chip in the dynamic CATEGORY facet.
+    """
+
+    category: str = Field(description="The free-form, normalized category slug.")
+    count: int = Field(description="How many memories carry this category.")
+
+
+class CategoryFacetsResponse(BaseModel):
+    """The discovered category facets (distinct categories + counts).
+
+    Backs the dynamic CATEGORY filter that replaced the fixed type enum: the
+    frontend lists exactly the categories that exist in the store with their
+    counts, ordered most-frequent first.
+    """
+
+    facets: list[CategoryFacet] = Field(default_factory=list)
+    total: int = Field(default=0, description="Number of distinct categories.")
+
+
+class ScopeTreeNode(BaseModel):
+    """One node in the hierarchical scope tree (a project / sub-scope segment).
+
+    Mirrors :class:`~mnemozine.schema.models.Scope`'s ordered path: a node's
+    :attr:`path` is the full canonical scope string (``'global'`` /
+    ``'project:<P>'`` / ``'project:<P>/<sub>...'``) so the frontend can drill in
+    and select it directly. :attr:`count` is the number of memories stored
+    *exactly* at this scope; :attr:`total_count` rolls up this node plus all of
+    its descendants (the ancestor-composed view a query at this scope would see
+    from this subtree). Children are the immediate sub-scopes.
+    """
+
+    segment: str = Field(
+        description="This node's own segment label ('global' for the root)."
+    )
+    path: str = Field(
+        description="Canonical scope string for this node ('global'/'project:<P>'/...)."
+    )
+    depth: int = Field(description="Path depth (0 = global root).")
+    count: int = Field(default=0, description="Memories stored exactly at this scope.")
+    total_count: int = Field(
+        default=0,
+        description="Memories at this scope plus all descendant sub-scopes (rolled up).",
+    )
+    children: list[ScopeTreeNode] = Field(
+        default_factory=list, description="Immediate sub-scope nodes."
+    )
+
+
+class ScopeTreeResponse(BaseModel):
+    """The project/sub-scope hierarchy with per-node counts (the scope navigator).
+
+    A single :attr:`root` (``global``) holds the whole tree: each project is a
+    child of the root and each sub-scope is a child of its project. Powers the
+    SCOPE TREE navigator that replaced the flat scope filter — selecting a node
+    shows its ancestor-composed memories.
+    """
+
+    root: ScopeTreeNode = Field(description="The global root of the scope tree.")
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +308,11 @@ class InjectionIndexPreview(BaseModel):
     text: str = Field(description="The final injected text (already truncated to budget).")
     token_estimate: int = Field(description="Estimated token size of the index.")
     token_budget: int = Field(description="The configured hard cap (inject.token_budget).")
-    preference_count: int = 0
-    project_fact_count: int = 0
-    idea_seed_hints: list[str] = Field(default_factory=list)
+    global_count: int = Field(default=0, description="Global-scope memories in the index.")
+    project_count: int = Field(default=0, description="Project-scope memories in the index.")
+    cross_ref_hints: list[str] = Field(
+        default_factory=list, description="One-line cross-reference seed hints (FR-RET-6)."
+    )
     entity_tags: list[str] = Field(default_factory=list)
 
 
@@ -423,10 +510,15 @@ class MemoryPatchRequest(BaseModel):
     """A HITL correction to one memory (reclassify / re-scope / tier) — PRD §4.3, R1/R5.
 
     All fields optional; only the supplied ones are applied. Content is NOT
-    editable (PRD §7 out-of-scope) — only classification, scope, and tier.
+    editable (PRD §7 out-of-scope) — only classification, scope, and tier. The old
+    ``type`` reclassify is split into the free-form ``category`` re-label and the
+    ``cross_ref_candidate`` flag (the controlled scope decision follows the scope).
     """
 
-    type: MemoryType | None = Field(default=None, description="Reclassify (R1 HITL).")
+    category: str | None = Field(default=None, description="Re-label free-form category (R1 HITL).")
+    cross_ref_candidate: bool | None = Field(
+        default=None, description="Toggle the cross-reference seed flag (FR-RET-6)."
+    )
     scope: str | None = Field(default=None, description="Re-scope ('global'/'project:<id>').")
     tier: Tier | None = Field(default=None, description="Archive (archive) / restore (hot).")
 
@@ -481,7 +573,12 @@ class StoreStatsResponse(BaseModel):
     """Top-bar live store stats + Dashboard totals (PRD §4.1)."""
 
     total_memories: int = 0
-    by_type: dict[str, int] = Field(default_factory=dict, description="Count per MemoryType.")
+    by_category: dict[str, int] = Field(
+        default_factory=dict, description="Count per free-form category."
+    )
+    by_scope_decision: dict[str, int] = Field(
+        default_factory=dict, description="Count per controlled scope decision (global/project)."
+    )
     by_tier: dict[str, int] = Field(default_factory=dict, description="hot vs archive counts.")
     by_source: dict[str, int] = Field(default_factory=dict, description="Count per ingest source.")
     active_count: int = Field(default=0, description="Active (open validity window) memories.")
@@ -489,8 +586,10 @@ class StoreStatsResponse(BaseModel):
     entity_count: int = 0
 
 
-# Resolve forward references (MaintenanceJobStatus -> MaintenanceReportOut).
+# Resolve forward references (MaintenanceJobStatus -> MaintenanceReportOut;
+# ScopeTreeNode -> ScopeTreeNode for the recursive children list).
 MaintenanceJobStatus.model_rebuild()
+ScopeTreeNode.model_rebuild()
 
 
 class ScopeKind(str, Enum):
@@ -508,6 +607,10 @@ __all__ = [
     "MemoryListItem",
     "MemoryDetail",
     "MemoryListResponse",
+    "CategoryFacet",
+    "CategoryFacetsResponse",
+    "ScopeTreeNode",
+    "ScopeTreeResponse",
     "GraphNode",
     "GraphEdge",
     "GraphResponse",

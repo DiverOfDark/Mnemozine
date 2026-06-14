@@ -1,9 +1,13 @@
 /**
- * Column definitions for the Memories DataTable (PRD §4.2): type · content · scope ·
- * entities · confidence · tier · validity (valid_from → valid_to) · last_accessed ·
- * access_count, plus an active/superseded state badge. Page-local to the Memories
- * screen. Cells use the shared design-system components (TypeBadge / TierBadge /
- * StatusBadge / ScoreBar) and the shared formatters — never hand-rolled color spans.
+ * Column definitions for the Memories DataTable (PRD §4.2): category · content ·
+ * scope · entities · confidence · tier · validity (valid_from → valid_to) ·
+ * last_accessed · access_count, plus an active/superseded state badge. Page-local
+ * to the Memories screen. Cells use the shared design-system components
+ * (CategoryBadge / ScopePath / TierBadge / StatusBadge / ScoreBar) and the shared
+ * formatters — never hand-rolled color spans.
+ *
+ * The category column shows the FREE-FORM category chip (+ a cross-ref seed flag);
+ * the scope column renders the HIERARCHICAL scope path as a breadcrumb.
  *
  * The per-cell renderers are plain functions (not standalone components) so this
  * module stays a single constant export — keeping react-refresh / fast-reload happy.
@@ -11,20 +15,25 @@
 
 import type { ReactNode } from "react";
 import type { Column } from "@/components/DataTable";
-import { TypeBadge, TierBadge, StatusBadge, Badge } from "@/components/Badge";
+import {
+  CategoryBadge,
+  CrossRefBadge,
+  ScopePath,
+  TierBadge,
+  StatusBadge,
+  Badge,
+} from "@/components/Badge";
 import { ScoreBar } from "@/components/ScoreBar";
 import type { MemoryListItem } from "@/api/types";
-import { formatDate, formatRelative, formatDateTime, parseScope } from "@/lib/format";
+import { formatDate, formatRelative, formatDateTime } from "@/lib/format";
 
-/** Compact scope cell: "global" or a mono project label. */
-function renderScope(scope: string): ReactNode {
-  const parsed = parseScope(scope);
-  return parsed.kind === "global" ? (
-    <span className="font-mono text-2xs text-text-faint">global</span>
-  ) : (
-    <span className="font-mono text-2xs text-text-muted" title={scope}>
-      {parsed.label}
-    </span>
+/** Category cell: the free-form category chip plus an optional cross-ref seed flag. */
+function renderCategory(row: MemoryListItem): ReactNode {
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      <CategoryBadge category={row.category} />
+      {row.cross_ref_candidate && <CrossRefBadge />}
+    </div>
   );
 }
 
@@ -69,10 +78,10 @@ function renderValidity(row: MemoryListItem): ReactNode {
 
 export const memoryColumns: Column<MemoryListItem>[] = [
   {
-    id: "type",
-    header: "Type",
-    width: 116,
-    cell: (row) => <TypeBadge type={row.type} />,
+    id: "category",
+    header: "Category",
+    width: 140,
+    cell: (row) => renderCategory(row),
   },
   {
     id: "content",
@@ -87,8 +96,8 @@ export const memoryColumns: Column<MemoryListItem>[] = [
   {
     id: "scope",
     header: "Scope",
-    width: 96,
-    cell: (row) => renderScope(row.scope),
+    width: 150,
+    cell: (row) => <ScopePath scope={row.scope} />,
   },
   {
     id: "entities",

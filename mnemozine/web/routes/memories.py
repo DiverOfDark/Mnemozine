@@ -19,18 +19,22 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from mnemozine.schema.models import MemoryType, MemoryUnit, Tier
+from mnemozine.schema.models import MemoryUnit, Tier
 from mnemozine.web.deps import StorageDep
 from mnemozine.web.routes._read import (
+    build_scope_tree,
     collect_memories,
     memory_to_detail,
     memory_to_list_item,
     scope_to_obj,
 )
 from mnemozine.web.schemas import (
+    CategoryFacet,
+    CategoryFacetsResponse,
     MemoryDetail,
     MemoryListResponse,
     Page,
+    ScopeTreeResponse,
 )
 
 router = APIRouter(prefix="/api/memories", tags=["memories"])
@@ -39,7 +43,7 @@ router = APIRouter(prefix="/api/memories", tags=["memories"])
 def _matches(
     memory: MemoryUnit,
     *,
-    type_: MemoryType | None,
+    category: str | None,
     tier: Tier | None,
     entity: str | None,
     source: str | None,
@@ -48,7 +52,7 @@ def _matches(
 ) -> bool:
     """Apply the in-memory table filters to one unit (PRD §4.2)."""
 
-    if type_ is not None and memory.type != type_:
+    if category is not None and memory.category != category.strip().lower():
         return False
     if tier is not None and memory.tier != tier:
         return False
@@ -69,7 +73,9 @@ def _matches(
 @router.get("", response_model=MemoryListResponse, summary="List/filter memories")
 async def list_memories(
     storage: StorageDep,
-    type: Annotated[MemoryType | None, Query(description="Filter by memory type.")] = None,
+    category: Annotated[
+        str | None, Query(description="Filter by free-form category.")
+    ] = None,
     scope: Annotated[
         str | None, Query(description="Filter by scope ('global'/'project:<id>'/bare id).")
     ] = None,
@@ -98,7 +104,7 @@ async def list_memories(
         for m in units
         if _matches(
             m,
-            type_=type,
+            category=category,
             tier=tier,
             entity=entity,
             source=source,
@@ -113,6 +119,45 @@ async def list_memories(
     return MemoryListResponse(
         items=items, page=Page(total=total, limit=limit, offset=offset)
     )
+
+
+@router.get(
+    "/facets/categories",
+    response_model=CategoryFacetsResponse,
+    summary="Discovered category facets",
+)
+async def category_facets(storage: StorageDep) -> CategoryFacetsResponse:
+    """Distinct free-form categories in use + their counts (dynamic facet).
+
+    Categories are open-ended now (no fixed enum), so the UI discovers the filter
+    chips from the store. Reads :meth:`StorageBackend.list_categories` (the
+    contract's category registry: ``(category, active-count)`` pairs) and returns
+    them ordered most-frequent first so the busiest categories lead the facet.
+    """
+
+    pairs = await storage.list_categories()
+    facets = [CategoryFacet(category=cat, count=count) for cat, count in pairs]
+    facets.sort(key=lambda f: (-f.count, f.category))
+    return CategoryFacetsResponse(facets=facets, total=len(facets))
+
+
+@router.get(
+    "/facets/scope-tree",
+    response_model=ScopeTreeResponse,
+    summary="Hierarchical scope tree with counts",
+)
+async def scope_tree(storage: StorageDep) -> ScopeTreeResponse:
+    """The project/sub-scope hierarchy with per-node counts (scope navigator).
+
+    Streams the whole store and folds every memory's hierarchical
+    :class:`~mnemozine.schema.models.Scope` path into a tree rooted at ``global``.
+    Each node carries its exact ``count`` and a ``total_count`` rolled up over its
+    descendants — exactly the ancestor-composed view selecting that scope yields
+    from its subtree (no-leak: a node never counts a sibling subtree).
+    """
+
+    units = await collect_memories(storage)
+    return ScopeTreeResponse(root=build_scope_tree(units))
 
 
 @router.get("/{memory_id}", response_model=MemoryDetail, summary="Memory detail")

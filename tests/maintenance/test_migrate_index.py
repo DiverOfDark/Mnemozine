@@ -16,7 +16,6 @@ from mnemozine.config import EmbeddingSettings, Settings
 from mnemozine.maintenance.migrate_index import MigrateIndexJob, needs_migration
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -62,9 +61,9 @@ def _settings(dim: int) -> Settings:
 
 def _memory(content: str, *, tier: Tier = Tier.HOT) -> MemoryUnit:
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content=content,
         scope=Scope.global_(),
+        category="preference",
         entities=["rust"],
         confidence=0.9,
         provenance=Provenance(source=Source.CLAUDE_CODE.value, session_id="s"),

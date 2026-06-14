@@ -1,22 +1,22 @@
 /**
- * CorrectionControls (FE-B / PRD §4.3, R1/R5 HITL) — the three operator corrections
- * on a memory:
- *   • reclassify — a type <Select> (preference / project_fact / idea_seed)
- *   • re-scope   — a scope <Input> committed on Enter / blur
+ * CorrectionControls (FE-B / PRD §4.3, R1/R5 HITL) — the operator corrections on a
+ * memory:
+ *   • re-label   — a FREE-FORM category <Input> committed on Enter / blur
+ *   • cross-ref  — a cross-reference seed flag toggle (replaces the idea_seed type)
+ *   • re-scope   — a hierarchical scope <Input> committed on Enter / blur
  *   • archive/restore — a tier toggle button (hot ⇄ archive)
  *
  * All writes go through the page-local {@link usePatchControls} hook (which wraps the
  * shared cache-invalidating `usePatchMemory`). Content is intentionally NOT editable
- * here (PRD §7 — the patch contract accepts only type/scope/tier). Per-control
- * spinners + a `changed[]` echo / error line give honest write feedback.
+ * here (PRD §7 — the patch contract accepts only category / cross_ref_candidate /
+ * scope / tier). The core data-model redesign replaced the fixed `type` <Select>
+ * with the free-form category input + the cross-ref flag.
  */
 
 import { useEffect, useState } from "react";
-import { Button, Field, Input, Select, Spinner } from "@/components/index";
-import { MEMORY_TYPES } from "@/api";
+import { Button, Field, Input, Spinner } from "@/components/index";
 import type { MemoryDetail } from "@/api";
 import type { PatchControls } from "@/pages/memory-detail/usePatchControls";
-import { TYPE_BADGE } from "@/theme/tokens";
 
 export function CorrectionControls({
   memory,
@@ -26,38 +26,58 @@ export function CorrectionControls({
   controls: PatchControls;
 }) {
   const [scopeDraft, setScopeDraft] = useState(memory.scope);
+  const [categoryDraft, setCategoryDraft] = useState(memory.category);
 
-  // Keep the scope draft in sync when the underlying memory changes (after a patch).
+  // Keep the drafts in sync when the underlying memory changes (after a patch).
   useEffect(() => {
     setScopeDraft(memory.scope);
   }, [memory.scope]);
+  useEffect(() => {
+    setCategoryDraft(memory.category);
+  }, [memory.category]);
 
   const archived = memory.tier === "archive";
   const tierBusy = controls.pendingField === "tier";
-  const typeBusy = controls.pendingField === "type";
+  const categoryBusy = controls.pendingField === "category";
+  const crossRefBusy = controls.pendingField === "cross_ref_candidate";
   const scopeBusy = controls.pendingField === "scope";
   const scopeDirty = scopeDraft.trim() !== memory.scope && scopeDraft.trim().length > 0;
+  const categoryDirty =
+    categoryDraft.trim().toLowerCase() !== memory.category && categoryDraft.trim().length > 0;
 
   return (
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        {/* Reclassify --------------------------------------------------------- */}
-        <Field label="Reclassify (type)">
-          <div className="flex items-center gap-2">
-            <Select
-              value={memory.type}
+        {/* Re-label (free-form category) ------------------------------------- */}
+        <Field label="Re-label (category)">
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              controls.recategorize(categoryDraft);
+            }}
+          >
+            <Input
+              value={categoryDraft}
               disabled={controls.pending}
-              onChange={(e) => controls.reclassify(e.target.value as MemoryDetail["type"])}
-              className="flex-1"
-            >
-              {MEMORY_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {TYPE_BADGE[t].label}
-                </option>
-              ))}
-            </Select>
-            {typeBusy && <Spinner size={12} />}
-          </div>
+              spellCheck={false}
+              placeholder="e.g. preference, decision, gotcha"
+              onChange={(e) => setCategoryDraft(e.target.value)}
+              onBlur={() => controls.recategorize(categoryDraft)}
+              className="flex-1 font-mono"
+            />
+            {categoryBusy ? (
+              <Spinner size={12} />
+            ) : (
+              <Button
+                type="submit"
+                variant="default"
+                disabled={!categoryDirty || controls.pending}
+              >
+                set
+              </Button>
+            )}
+          </form>
         </Field>
 
         {/* Re-scope ----------------------------------------------------------- */}
@@ -73,7 +93,7 @@ export function CorrectionControls({
               value={scopeDraft}
               disabled={controls.pending}
               spellCheck={false}
-              placeholder="global | project:<id>"
+              placeholder="global | project:<id>[/<sub>]"
               onChange={(e) => setScopeDraft(e.target.value)}
               onBlur={() => controls.rescope(scopeDraft)}
               className="flex-1 font-mono"
@@ -83,6 +103,29 @@ export function CorrectionControls({
             </Button>
           </form>
         </Field>
+      </div>
+
+      {/* Cross-reference seed flag ------------------------------------------- */}
+      <div className="flex items-center justify-between rounded border border-border bg-bg px-3 py-2">
+        <div className="flex flex-col">
+          <span className="text-2xs uppercase tracking-wide text-text-faint">
+            Cross-reference seed
+          </span>
+          <span className="text-xs text-text-muted">
+            Flag this memory as a serendipitous-connection seed (replaces idea_seed).
+          </span>
+        </div>
+        <label className="flex items-center gap-2 font-mono text-xs text-text-muted">
+          {crossRefBusy && <Spinner size={12} />}
+          <input
+            type="checkbox"
+            checked={memory.cross_ref_candidate}
+            disabled={controls.pending}
+            onChange={(e) => controls.setCrossRef(e.target.checked)}
+            className="h-3.5 w-3.5 accent-accent"
+          />
+          {memory.cross_ref_candidate ? "on" : "off"}
+        </label>
       </div>
 
       {/* Archive / restore ---------------------------------------------------- */}

@@ -1,0 +1,17 @@
+# GPU override — give Ollama the host NVIDIA GPU for embeddings + extraction.
+#
+# Use alongside the main compose file:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.gpu.yml up -d
+#
+# Requires the NVIDIA Container Toolkit on the host (nvidia-ctk / CDI). Modern
+# Docker Compose translates the `driver: nvidia` reservation to a CDI device
+# request automatically. Without a GPU, just omit this file (Ollama runs on CPU).
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

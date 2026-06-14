@@ -28,6 +28,7 @@ from collections.abc import Sequence
 
 from mnemozine.config import Settings, get_settings
 from mnemozine.extract.extractor import ExtractionResult, TypedExtractor
+from mnemozine.extract.raw_tier import extract_with_raw_retention
 from mnemozine.ingestion.claude_code.chunker import Chunk, chunk_events
 from mnemozine.ingestion.claude_code.parser import read_transcript
 from mnemozine.interfaces import LLMProvider, StorageBackend
@@ -119,7 +120,14 @@ class MnemozineIngestService:
         if chunk.content_hash in self._seen:
             return False
         self._seen.add(chunk.content_hash)
-        result = await self._extractor.extract_full(chunk.events)
+        # Raw-tier retention (FR-ING-5 / R4): persist the normalized extraction
+        # input as a first-class RawChunk before/with extraction so the store can
+        # re-extract/reindex offline and survive Claude's 30-day local cleanup.
+        # Gated by ingest.raw_retention_enabled (default on), idempotent on the
+        # content hash, and error-swallowing — a drop-in for extract_full.
+        result = await extract_with_raw_retention(
+            self._extractor, self._storage, chunk.events, settings=self._settings
+        )
         await self._persist(result)
         return True
 

@@ -8,19 +8,19 @@ exactly one of:
 * **add**       — no related memory exists -> insert.
 * **reinforce** — a semantically equivalent memory exists -> bump its
   confidence, refresh its timestamp, **no new node**.
-* **supersede** — a related ``type=preference`` memory *contradicts* the new one
-  (e.g. "prefers ``anyhow``" -> "prefers ``thiserror``") -> **close the old
-  memory's validity window** (``valid_to = now``, demoting it off the hot path)
-  and insert the new one as active. This is the mechanism that delivers UC-2 /
-  Goal 2; the temporal model alone does not detect a preference *reversal*.
+* **supersede** — a related global-decision (``ScopeDecision.GLOBAL``) memory
+  *contradicts* the new one (e.g. "prefers ``anyhow``" -> "prefers ``thiserror``")
+  -> **close the old memory's validity window** (``valid_to = now``, demoting it
+  off the hot path) and insert the new one as active. This is the mechanism that
+  delivers UC-2 / Goal 2; the temporal model alone does not detect a *reversal*.
 * **no-op**     — the new memory is strictly weaker/older than what already
   exists.
 
 Contradiction detection is deliberately cheap and narrow (PRD FR-MNT-1): a
 **single** LLM call, fed at most
 :attr:`MaintenanceSettings.contradiction_candidate_cap` candidates, restricted
-to ``type=preference`` units in the same scope sharing >=1 entity. It is never a
-graph-wide scan.
+to global-decision (``ScopeDecision.GLOBAL``) units in the same scope sharing >=1
+entity. It is never a graph-wide scan.
 
 This module depends only on the :class:`~mnemozine.interfaces.StorageBackend`,
 :class:`~mnemozine.interfaces.LLMProvider`, and
@@ -49,7 +49,7 @@ from mnemozine.interfaces import (
     WriteDecision,
     WriteResult,
 )
-from mnemozine.schema.models import MemoryType, MemoryUnit
+from mnemozine.schema.models import MemoryUnit, ScopeDecision
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class WriteDecisionConfig:
     * :attr:`equivalence_threshold` — cosine-similarity cutoff above which a write
       *reinforces* an existing unit instead of *adding* a new node
       (``dedup.equivalence_threshold``).
-    * :attr:`contradiction_candidate_cap` — max ``type=preference`` candidates fed
+    * :attr:`contradiction_candidate_cap` — max global-decision candidates fed
       to the single cheap contradiction LLM call
       (``maintenance.contradiction_candidate_cap``).
     """
@@ -245,16 +245,20 @@ class WriteDecider:
     ) -> MemoryUnit | None:
         """Run the narrow contradiction check; return the first contradicted unit.
 
-        Only ``type=preference`` candidates are considered (FR-MNT-1: the
+        Only global-decision candidates are considered (FR-MNT-1: the
         MemoryUnit-level *preference-reversal* decision sits on top of Graphiti's
-        entity-edge invalidation). At most
+        entity-edge invalidation). In the category-split contract a "preference" is
+        a global-scope memory (``ScopeDecision.GLOBAL``), so both the new unit and
+        the candidates are gated on that. At most
         :attr:`WriteDecisionConfig.contradiction_candidate_cap` candidates are
         examined, and each is a single cheap LLM call — never a graph-wide scan.
         """
 
-        if new.type is not MemoryType.PREFERENCE:
+        if new.scope_decision is not ScopeDecision.GLOBAL:
             return None
-        pref_candidates = [c for c in candidates if c.type is MemoryType.PREFERENCE]
+        pref_candidates = [
+            c for c in candidates if c.scope_decision is ScopeDecision.GLOBAL
+        ]
         if not pref_candidates:
             return None
         capped = pref_candidates[: self._config.contradiction_candidate_cap]
@@ -286,11 +290,11 @@ class WriteDecider:
         Exact normalized-content match always counts as equivalent. If an
         :class:`EmbeddingProvider` is available, a cosine similarity at/above
         :attr:`WriteDecisionConfig.equivalence_threshold` also counts
-        (``dedup.equivalence_threshold``). Same-type candidates only.
+        (``dedup.equivalence_threshold``). Same-category candidates only.
         """
 
         new_norm = new.content.strip().lower()
-        same_type = [c for c in candidates if c.type is new.type]
+        same_type = [c for c in candidates if c.category == new.category]
         # Exact-content equivalence first (cheap, no embedding needed).
         for existing in same_type:
             if existing.content.strip().lower() == new_norm:
@@ -382,7 +386,9 @@ class WriteDecider:
                 ),
                 superseded_ids=superseded_ids,
                 detail={
-                    "type": memory.type.value,
+                    "category": memory.category,
+                    "cross_ref_candidate": memory.cross_ref_candidate,
+                    "scope_decision": memory.scope_decision.value,
                     "scope": memory.scope.as_str(),
                     "entities": list(memory.entities),
                     "confidence": memory.confidence,
@@ -396,15 +402,15 @@ class WriteDecider:
     ) -> MemoryUnit | None:
         """Return an existing unit the new one is strictly weaker/older than.
 
-        A near-duplicate (same type, same normalized content) that already exists
-        with >= the new confidence and a newer-or-equal ``valid_from`` makes the
-        write a no-op (nothing to learn).
+        A near-duplicate (same category, same normalized content) that already
+        exists with >= the new confidence and a newer-or-equal ``valid_from`` makes
+        the write a no-op (nothing to learn).
         """
 
         new_norm = new.content.strip().lower()
         for existing in candidates:
             if (
-                existing.type is new.type
+                existing.category == new.category
                 and existing.content.strip().lower() == new_norm
                 and new.confidence < existing.confidence
             ):

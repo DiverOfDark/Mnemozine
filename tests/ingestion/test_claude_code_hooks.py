@@ -55,7 +55,7 @@ class _FakeRetriever:
         return InjectionIndex(
             text=self._text,
             token_estimate=len(self._text) // 4,
-            preference_count=1,
+            global_count=1,
             entity_tags=["rust"],
         )
 

@@ -37,9 +37,10 @@ from mnemozine.schema.events import IngestEvent
 from mnemozine.schema.models import (
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
+    RawChunk,
     Scope,
+    ScopeDecision,
     SourceSession,
 )
 
@@ -108,9 +109,13 @@ class InjectionIndex:
 
     text: str
     token_estimate: int
-    preference_count: int = 0
-    project_fact_count: int = 0
-    idea_seed_hints: list[str] = field(default_factory=list)
+    # Counts by the controlled scope-decision (replaces the old
+    # preference_count / project_fact_count which keyed off MemoryType).
+    global_count: int = 0
+    project_count: int = 0
+    # One-line hints for cross-reference seeds (the old idea_seed_hints, now
+    # driven by MemoryUnit.cross_ref_candidate rather than a fixed type).
+    cross_ref_hints: list[str] = field(default_factory=list)
     entity_tags: list[str] = field(default_factory=list)
 
 
@@ -137,13 +142,25 @@ class Classification:
     Returned by :meth:`Extractor.classify` for the eval/reclassify path. Unlike a
     full :class:`MemoryUnit` it carries no provenance/validity/tier bookkeeping —
     a bare statement being scored against the §9 classifier-accuracy eval set has
-    no originating ingest session. The classifier's ``preference`` vs
-    ``project_fact`` accuracy is the make-or-break R1 metric and is what this
-    object is measured on.
+    no originating ingest session.
+
+    Core redesign — the old single ``type`` field is split into the new contract:
+
+    * :attr:`scope_decision` — the CONTROLLED ``global`` vs ``project`` decision
+      that drives :attr:`scope` and the no-leak rule (FR-EXT-3). This is the
+      make-or-break R1 classifier-accuracy metric.
+    * :attr:`category` — the FREE-FORM, emergent classifier category string (no
+      fixed enum); replaces the semantic role of the old type.
+    * :attr:`cross_ref_candidate` — preserves the old ``idea_seed`` flag.
+
+    The scope-decision is also derivable from :attr:`scope` (global vs project),
+    but is carried explicitly so the eval set can score the decision directly.
     """
 
-    type: MemoryType
+    scope_decision: ScopeDecision
     scope: Scope
+    category: str = "fact"
+    cross_ref_candidate: bool = False
     entities: list[str] = field(default_factory=list)
     confidence: float = 1.0
 
@@ -219,18 +236,25 @@ class IngestSource(Protocol):
 class Extractor(Protocol):
     """Turns a chunk of events into classified, scoped MemoryUnits (FR-EXT-*).
 
-    The classifier's accuracy on ``preference`` vs ``project_fact`` is the single
-    biggest driver of system quality (FR-EXT-3, R1); this layer is the crux and
-    must be independently testable.
+    The classifier's accuracy on the CONTROLLED scope decision
+    (:class:`~mnemozine.schema.models.ScopeDecision`: ``global`` vs ``project``)
+    is the single biggest driver of system quality (FR-EXT-3, R1); this layer is
+    the crux and must be independently testable. The free-form
+    :attr:`~mnemozine.schema.models.MemoryUnit.category` it also emits is
+    *emergent* (no enum) and is normalized later by the category maintenance job.
     """
 
     async def extract(self, chunk: Sequence[IngestEvent]) -> list[MemoryUnit]:
         """Extract memory units from one chunk/episode (FR-ING-6 unit).
 
         Each returned unit is:
-        * classified into exactly one :class:`MemoryType` (FR-EXT-1),
-        * scoped at extraction time — ``preference`` -> global,
-          ``project_fact`` -> ``project:<id>`` (FR-EXT-3),
+        * given a CONTROLLED scope decision
+          (:class:`~mnemozine.schema.models.ScopeDecision`) that sets its
+          hierarchical :class:`~mnemozine.schema.models.Scope` — ``global`` ->
+          the root scope, ``project`` -> ``project:<derived-name>[/<sub>...]``
+          (FR-EXT-3, no-leak),
+        * tagged with a FREE-FORM emergent ``category`` string (FR-EXT-1) and a
+          ``cross_ref_candidate`` flag for cross-reference seeds (FR-RET-6),
         * linked to extracted entities (FR-EXT-2),
         * stamped with a confidence score and provenance back to the source
           session/chunk (FR-EXT-4).
@@ -248,10 +272,11 @@ class Extractor(Protocol):
         set (FR-EXT-3, §9 classifier accuracy) and so memories can be
         reclassified after correction (R1).
 
-        Returns a lightweight :class:`Classification` (``type``, ``scope``,
-        ``entities``, ``confidence``) rather than a full :class:`MemoryUnit`: a
-        bare statement has no originating ingest session, so it cannot carry a
-        real :class:`~mnemozine.schema.models.Provenance`. A caller that wants to
+        Returns a lightweight :class:`Classification` (``scope_decision``,
+        ``scope``, ``category``, ``cross_ref_candidate``, ``entities``,
+        ``confidence``) rather than a full :class:`MemoryUnit`: a bare statement
+        has no originating ingest session, so it cannot carry a real
+        :class:`~mnemozine.schema.models.Provenance`. A caller that wants to
         persist the result builds a :class:`MemoryUnit` from this plus real
         provenance. (Note: ``MemoryUnit.provenance`` also has a classify
         sentinel default, so building one for a quick eval still validates.)
@@ -287,7 +312,9 @@ class StorageBackend(Protocol):
         * **no-op**     — the new memory is strictly weaker/older than existing.
 
         Contradiction detection is a single narrowly-scoped cheap LLM call over
-        ``type=preference`` candidates in the same scope sharing >=1 entity.
+        same-scope global-decision candidates sharing >=1 entity. (The candidate
+        set is keyed on the exact scope string, not the ancestor chain, so a
+        write never contradicts a memory in a different scope.)
         """
         ...
 
@@ -299,14 +326,26 @@ class StorageBackend(Protocol):
         entities: Sequence[str] | None = None,
         top_k: int = 10,
         include_archived: bool = False,
+        compose_ancestors: bool = True,
     ) -> list[RetrievedMemory]:
-        """Semantic search within a composed scope subset (FR-RET-2, FR-STO-3).
+        """Ancestor-composing semantic search within a scope subset (FR-RET-2/FR-STO-3).
 
-        Never searches the whole graph: restricts to ``scopes`` (current project
-        + global) and, when given, the ``entities`` neighborhood, then runs
-        semantic search inside that subset so effective search space stays
-        roughly constant as the store grows (FR-RET-2). Active (open validity
-        window, hot tier) memories only, unless ``include_archived``.
+        ANCESTOR-COMPOSITION (the no-leak rule): the query searches every
+        ancestor-or-self of each scope in ``scopes``. When
+        ``compose_ancestors`` is true (the default), each query scope ``S`` is
+        expanded to ``S.ancestors()`` (``[global, project:P, project:P/sub,
+        ..., S]``) and a memory matches iff its stored scope is one of those —
+        i.e. an ancestor-or-self of ``S``. So a query at ``project:P/auth`` sees
+        ``project:P/auth``, ``project:P`` and ``global`` memories, but NEVER a
+        sibling like ``project:P/db`` and NEVER a descendant — siblings cannot
+        leak. Pass ``compose_ancestors=False`` to match the exact scope strings
+        only (e.g. a maintenance pass that must not widen).
+
+        Never searches the whole graph: restricts to the composed scope set and,
+        when given, the ``entities`` neighborhood, then runs semantic search
+        inside that subset so effective search space stays roughly constant as
+        the store grows (FR-RET-2). Active (open validity window, hot tier)
+        memories only, unless ``include_archived``.
         """
         ...
 
@@ -509,6 +548,112 @@ class StorageBackend(Protocol):
         """Persist a source-session record for provenance/archive (§7, FR-STO-4)."""
         ...
 
+    # --- raw-chunk tier (offline re-extraction/reindex; survives R4 cleanup) --
+
+    async def persist_raw_chunk(self, chunk: RawChunk) -> RawChunk:
+        """Persist a :class:`~mnemozine.schema.models.RawChunk` (the raw tier).
+
+        Stores the normalized (tool-calls-stripped) extraction-input chunk so the
+        store can re-extract / reindex offline and survive Claude's 30-day local
+        transcript cleanup (R4). Idempotent on ``chunk.content_hash`` (the
+        FR-ING-5 key): re-persisting the same chunk updates its ``memory_ids`` /
+        timestamps rather than duplicating. Gated by
+        ``ingest.raw_retention_enabled`` at the call site (default on). Returns
+        the stored chunk.
+        """
+        ...
+
+    def iter_raw_chunks(
+        self,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        since: datetime | None = None,
+    ) -> AsyncIterator[RawChunk]:
+        """Stream stored raw chunks for offline re-extraction/reindex (raw tier).
+
+        The enumeration entry point for the re-extraction seam (see
+        :meth:`re_extract_from_raw_chunks`): a maintenance/offline job iterates
+        the raw tier and re-runs a newer extractor/classifier or embedding model
+        over each chunk's normalized ``content``. Filters (all optional,
+        AND-combined): ``scope`` (exact scope, no ancestor composition — a
+        re-extraction must not widen), ``session_id``, ``source``, and ``since``
+        (``ingested_at`` cutoff). Async generator (declared ``def`` returning
+        ``AsyncIterator``): iterate with ``async for c in
+        storage.iter_raw_chunks(...)`` — do not ``await`` it. Pages internally so
+        memory stays bounded.
+        """
+        ...
+
+    async def re_extract_from_raw_chunks(
+        self,
+        extractor: Extractor,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        supersede_existing: bool = True,
+    ) -> MaintenanceReport:
+        """Re-run extraction over the retained raw tier (offline reindex seam).
+
+        The re-extraction seam: iterates :meth:`iter_raw_chunks` (filtered by
+        ``scope`` / ``session_id``), feeds each chunk's normalized ``content``
+        back through ``extractor`` to produce fresh :class:`MemoryUnit`s, upserts
+        them via the FR-MNT-1 write path, and — when ``supersede_existing`` —
+        closes the validity windows of the memories the chunk previously produced
+        (``RawChunk.memory_ids``) so the new extraction replaces the old. Returns
+        a :class:`MaintenanceReport` summarizing the pass. Idempotent and safe to
+        re-run (FR-MNT-5): an unchanged extractor re-produces equivalent units
+        that reinforce rather than duplicate.
+        """
+        ...
+
+    async def reclassify_memory(
+        self,
+        memory_id: str,
+        *,
+        scope: Scope | None = None,
+        category: str | None = None,
+        cross_ref_candidate: bool | None = None,
+    ) -> MemoryUnit:
+        """Update a stored memory's scope/category/cross-ref WITHOUT raw text (R1).
+
+        Backs the WebUI reclassify / re-scope corrections (WEBUI PRD §3) and the
+        category-merge job. Re-derives classification *from the already-stored
+        content + provenance* — it does NOT need the raw transcript, so it works
+        long after Claude's 30-day cleanup. Any of ``scope`` (re-scope; must obey
+        the hierarchical no-leak rule), ``category`` (free-form re-label, will be
+        normalized), or ``cross_ref_candidate`` (toggle the seed flag) may be
+        given; unset fields are left unchanged. Returns the updated unit. (To
+        re-derive from raw input rather than just re-tag, use
+        :meth:`re_extract_from_raw_chunks`.)
+        """
+        ...
+
+    # --- category registry (emergent-category list/merge, FR-MNT-2/4) --------
+
+    async def list_categories(self) -> list[tuple[str, int]]:
+        """List the free-form categories in use with their memory counts.
+
+        Powers the category registry view + the merge job: returns
+        ``(category, count)`` pairs over active memories so near-duplicate
+        emergent categories (e.g. 'gotcha' / 'gotchas') can be surfaced and
+        merged. Ordering is unspecified; callers sort as needed.
+        """
+        ...
+
+    async def merge_categories(self, source: str, target: str) -> int:
+        """Re-label every memory tagged ``source`` to ``target`` (category merge).
+
+        The category analogue of :meth:`merge_entities`: consolidates a
+        fragmented emergent category into a canonical one. Both are normalized
+        (lowercased/trimmed) before matching, matching
+        :class:`~mnemozine.schema.models.MemoryUnit` category normalization.
+        Idempotent. Returns the number of memories re-labeled. Driven by the
+        :class:`CategoryMerger` maintenance job.
+        """
+        ...
+
     async def close(self) -> None:
         """Close the underlying connection/pool."""
         ...
@@ -590,7 +735,7 @@ class CrossReferencer(Protocol):
     async def find_related(
         self, context: RetrievalContext, *, max_suggestions: int | None = None
     ) -> list[CrossReference]:
-        """Find related idea_seed/project nodes for the current context (FR-RET-6).
+        """Find related cross-ref-candidate/project nodes for the context (FR-RET-6).
 
         Primary path is graph traversal over shared entities (explainable),
         using ``StorageBackend.neighbors`` (which now returns edges so the
@@ -632,8 +777,10 @@ class MaintenanceReport:
     job_name: str
     consolidated: int = 0
     entities_merged: int = 0
+    categories_merged: int = 0
     archived: int = 0
     edges_pruned: int = 0
+    re_extracted: int = 0
     notes: list[str] = field(default_factory=list)
 
 
@@ -642,8 +789,8 @@ class MaintenanceJob(Protocol):
     """A scheduled, idempotent maintenance pass (FR-MNT-5).
 
     Concrete jobs: dedup/consolidation (FR-MNT-2), entity resolution (FR-MNT-4),
-    decay/archive (FR-MNT-3), and audit (R5). Each must be safe to run
-    repeatedly.
+    decay/archive (FR-MNT-3), category merge (core redesign), and audit (R5).
+    Each must be safe to run repeatedly.
     """
 
     @property
@@ -653,6 +800,46 @@ class MaintenanceJob(Protocol):
 
     async def run(self) -> MaintenanceReport:
         """Execute the pass once. Idempotent and safe to re-run (FR-MNT-5)."""
+        ...
+
+
+@runtime_checkable
+class CategoryMerger(Protocol):
+    """Maintenance job that consolidates emergent free-form categories (FR-MNT-2/4).
+
+    The category analogue of entity resolution: because
+    :attr:`~mnemozine.schema.models.MemoryUnit.category` is FREE-FORM (no enum),
+    the registry fragments over time ('gotcha' / 'gotchas' / 'pitfall'). This job
+    proposes near-duplicate categories — embedding/string similarity above
+    ``category.merge_similarity_threshold`` — and folds each cluster into one
+    canonical category via :meth:`StorageBackend.merge_categories`. A
+    :class:`MaintenanceJob` (has ``name`` / ``run``); broken out as its own
+    Protocol so the merge policy is independently testable.
+    """
+
+    @property
+    def name(self) -> str:
+        """Stable job name, used in logs/reports and the scheduler."""
+        ...
+
+    async def propose_merges(self) -> list[tuple[str, str]]:
+        """Propose ``(source_category, target_category)`` merges (no writes).
+
+        Compares the in-use categories (:meth:`StorageBackend.list_categories`)
+        and returns the pairs whose similarity exceeds
+        ``category.merge_similarity_threshold``, each oriented source->canonical
+        (the higher-count / canonical category is the target). Pure/read-only so
+        the proposals can be reviewed (WebUI) before applying.
+        """
+        ...
+
+    async def run(self) -> MaintenanceReport:
+        """Apply the proposed category merges once (idempotent, FR-MNT-5).
+
+        Calls :meth:`StorageBackend.merge_categories` for each proposed pair and
+        reports the count in :attr:`MaintenanceReport.notes` /
+        :attr:`MaintenanceReport.consolidated`.
+        """
         ...
 
 

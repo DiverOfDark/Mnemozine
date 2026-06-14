@@ -17,15 +17,17 @@ from mnemozine.maintenance.decision import (
     build_contradiction_prompt,
     cosine_similarity,
 )
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope
 from tests.conftest import FakeEmbeddingProvider, FakeLLMProvider, InMemoryStorage
 
 
 def _pref(content: str, *, entities: list[str], confidence: float = 0.9) -> MemoryUnit:
+    # Category split: a "preference" is now a GLOBAL-scope memory (ScopeDecision
+    # drives the contradiction gate) carrying the free-form category "preference".
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content=content,
         scope=Scope.global_(),
+        category="preference",
         entities=entities,
         confidence=confidence,
         provenance=Provenance(source="claude_code", session_id="s1"),
@@ -34,9 +36,9 @@ def _pref(content: str, *, entities: list[str], confidence: float = 0.9) -> Memo
 
 def _project_fact(content: str, *, project: str, entities: list[str]) -> MemoryUnit:
     return MemoryUnit(
-        type=MemoryType.PROJECT_FACT,
         content=content,
         scope=Scope.project(project),
+        category="project_fact",
         entities=entities,
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),
@@ -188,23 +190,30 @@ async def test_supersede_only_considers_preference_candidates(settings: Settings
 
 
 @pytest.mark.asyncio
-async def test_no_contradiction_call_for_non_preference_new(settings: Settings) -> None:
+async def test_no_contradiction_call_for_non_global_new(settings: Settings) -> None:
+    # Category split: the contradiction (supersede) path is gated on the new
+    # unit's ScopeDecision being GLOBAL. A PROJECT-scoped new write — even one
+    # flagged as a cross-reference seed (the old idea_seed role) — never triggers
+    # the contradiction LLM call, so it is a plain add.
     storage = InMemoryStorage()
     llm = FakeLLMProvider(json_responder=_always_contradicts)
     decider = WriteDecider(storage, llm, embeddings=FakeEmbeddingProvider(), settings=settings)
-    # Seed a preference, then write an idea_seed sharing the entity.
-    await decider.decide(_pref("Prefers thiserror.", entities=["rust"]))
+    # Seed a project-scoped memory, then write another project-scoped seed
+    # sharing the entity (a global preference candidate is absent).
+    fact = _project_fact("Uses rust here.", project="p", entities=["rust"])
+    await decider.decide(fact)
     seed = MemoryUnit(
-        type=MemoryType.IDEA_SEED,
         content="Idea: a rust-based memory CLI.",
-        scope=Scope.global_(),
+        scope=Scope.project("p"),
+        category="idea",
+        cross_ref_candidate=True,
         entities=["rust"],
         confidence=0.8,
         provenance=Provenance(source="claude_code", session_id="s1"),
     )
     result = await decider.decide(seed)
     assert result.decision is WriteDecision.ADD
-    # New unit is not a preference => contradiction path is skipped entirely.
+    # New unit is not a GLOBAL-decision unit => contradiction path skipped entirely.
     assert sum(1 for c in llm.calls if c["kind"] == "json") == 0
 
 
@@ -247,9 +256,9 @@ async def test_candidates_are_scope_bounded(settings: Settings) -> None:
 
     # Project-scoped preference (unusual but valid for the bound test).
     other_scope = MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content="Prefers anyhow.",
         scope=Scope.project("other"),
+        category="preference",
         entities=["rust"],
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),

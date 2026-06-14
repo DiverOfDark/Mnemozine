@@ -14,12 +14,13 @@ import { useCrossRefs, useMemories } from "@/api";
 import {
   Badge,
   Button,
+  CategoryBadge,
+  CrossRefBadge,
   DetailDrawer,
   DrawerSection,
   KeyValue,
   Loading,
   StatusBadge,
-  TypeBadge,
 } from "@/components";
 import { HEX } from "@/theme/tokens";
 import { formatRelative, parseScope } from "@/lib/format";
@@ -119,7 +120,8 @@ export function NodeInspector({ node, scope, isFocused, onClose, onFocus }: Node
                   )}
                 >
                   <div className="mb-1 flex items-center gap-2">
-                    <TypeBadge type={m.type} />
+                    <CategoryBadge category={m.category} />
+                    {m.cross_ref_candidate && <CrossRefBadge />}
                     <StatusBadge active={m.active} />
                     <span className="ml-auto font-mono text-2xs text-text-faint">
                       {formatRelative(m.last_accessed)}

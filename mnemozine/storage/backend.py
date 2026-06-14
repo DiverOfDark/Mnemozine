@@ -35,23 +35,26 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mnemozine.config import MaintenanceSettings, RetrievalSettings, get_settings
 from mnemozine.interfaces import (
     EmbeddingProvider,
+    MaintenanceReport,
     Neighbor,
     RetrievedMemory,
     WriteDecision,
     WriteResult,
 )
 from mnemozine.schema.models import (
+    DEFAULT_CATEGORY,
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
     Provenance,
+    RawChunk,
     Scope,
+    ScopeDecision,
     SourceSession,
     Tier,
 )
@@ -60,11 +63,15 @@ from mnemozine.storage.graphiti_client import (
     ENTITY_LABEL,
     MEMORY_LABEL,
     MEMORY_VECTOR_INDEX,
+    RAW_CHUNK_LABEL,
     RELATES_TYPE,
     SESSION_LABEL,
     SUPPRESSION_LABEL,
     GraphitiClient,
 )
+
+if TYPE_CHECKING:
+    from mnemozine.interfaces import Extractor
 
 # A predicate the integration pass wires to the FR-MNT-1 cheap contradiction LLM
 # call. It is injected (not hard-wired to an LLM) so the backend stays free of an
@@ -236,7 +243,12 @@ class GraphitiStorageBackend:
 
         return {
             "id": memory.id,
-            "type": memory.type.value,
+            # Core redesign: the old flat `type` is replaced by the free-form
+            # `category` string plus the `cross_ref_candidate` flag; the
+            # controlled global/project decision is carried by the scope path
+            # (persisted as `scope`), not a separate column.
+            "category": memory.category,
+            "cross_ref_candidate": bool(memory.cross_ref_candidate),
             "content": memory.content,
             "scope": memory.scope.as_str(),
             "entities": list(memory.entities),
@@ -262,9 +274,13 @@ class GraphitiStorageBackend:
         )
         return MemoryUnit(
             id=props["id"],
-            type=MemoryType(props["type"]),
             content=props["content"],
             scope=Scope.parse(props["scope"]),
+            # Core redesign: load the free-form `category` + `cross_ref_candidate`
+            # flag; fall back to DEFAULT_CATEGORY for legacy nodes written before
+            # the category split (which had a `type` column and no `category`).
+            category=str(props.get("category") or DEFAULT_CATEGORY),
+            cross_ref_candidate=bool(props.get("cross_ref_candidate", False)),
             entities=list(props.get("entities") or []),
             confidence=float(props.get("confidence", 1.0)),
             provenance=provenance,
@@ -315,10 +331,10 @@ class GraphitiStorageBackend:
            (exact match, or cosine >= ``dedup.equivalence_threshold``) exists: bump
            its confidence + refresh timestamp, write no new node.
         2. **supersede** — the injected ``contradicts`` predicate flags one or more
-           ``type=preference`` candidates as contradicted: close their windows and
-           insert the new unit active (delivers UC-2 / Goal 2).
-        3. **no-op** — a strictly stronger/equal duplicate of the same type already
-           exists (new confidence < existing, same content): keep the existing.
+           global-decision (``ScopeDecision.GLOBAL``) candidates as contradicted:
+           close their windows and insert the new unit active (UC-2 / Goal 2).
+        3. **no-op** — a strictly stronger/equal duplicate of the same category
+           already exists (new confidence < existing, same content): keep existing.
         4. **add** — otherwise insert.
         """
 
@@ -340,7 +356,12 @@ class GraphitiStorageBackend:
                 return WriteResult(decision=WriteDecision.REINFORCE, memory=reinforced)
 
         # 2. supersede -------------------------------------------------------
-        pref_candidates = [c for c in candidates if c.type == MemoryType.PREFERENCE]
+        # Contradiction is a preference-reversal check; in the category-split
+        # contract a "preference" is a global-scope memory (ScopeDecision.GLOBAL),
+        # so the candidate set is the active global-decision candidates.
+        pref_candidates = [
+            c for c in candidates if c.scope_decision is ScopeDecision.GLOBAL
+        ]
         contradicted = await self._contradicts(memory, pref_candidates) if pref_candidates else []
         if contradicted:
             superseded: list[MemoryUnit] = []
@@ -354,7 +375,7 @@ class GraphitiStorageBackend:
         # 3. no-op -----------------------------------------------------------
         for existing in candidates:
             if (
-                existing.type == memory.type
+                existing.category == memory.category
                 and memory.confidence < existing.confidence
                 and existing.content.strip().lower() == new_content.lower()
             ):
@@ -401,6 +422,32 @@ class GraphitiStorageBackend:
 
     # -- scoped semantic retrieval (FR-RET-2 / FR-STO-3) ----------------------
 
+    @staticmethod
+    def _composed_scope_strs(
+        scopes: Sequence[Scope], *, compose_ancestors: bool
+    ) -> list[str]:
+        """Expand the query ``scopes`` into the set of scope strings to match.
+
+        ANCESTOR-COMPOSITION / no-leak (FR-STO-3): with ``compose_ancestors`` each
+        query scope is replaced by its ancestor-or-self chain
+        (:meth:`Scope.ancestors`), so a memory matches iff its stored scope is an
+        ancestor-or-self of *some* query scope. A query at ``project:P/auth`` thus
+        sees ``project:P/auth`` + ``project:P`` + ``global`` but never the sibling
+        ``project:P/db`` (it is not on the auth chain) and never a descendant. The
+        result is de-duplicated while preserving the ``WHERE m.scope IN $scopes``
+        membership semantics (order is irrelevant — the index post-filter is a set
+        membership test). With ``compose_ancestors=False`` the exact scope strings
+        are matched (no widening), used by maintenance passes that must not leak
+        ancestors in.
+        """
+
+        seen: dict[str, None] = {}
+        for s in scopes:
+            chain = s.ancestors() if compose_ancestors else [s]
+            for anc in chain:
+                seen[anc.as_str()] = None
+        return list(seen)
+
     def _scoped_filters(
         self,
         scope_strs: list[str],
@@ -432,8 +479,22 @@ class GraphitiStorageBackend:
         entities: Sequence[str] | None = None,
         top_k: int = 10,
         include_archived: bool = False,
+        compose_ancestors: bool = True,
     ) -> list[RetrievedMemory]:
-        """Semantic search restricted to the composed scope subset (FR-RET-2).
+        """Ancestor-composing semantic search within a scope subset (FR-RET-2/FR-STO-3).
+
+        ANCESTOR-COMPOSITION (the no-leak rule). When ``compose_ancestors`` is
+        true (the default) each query scope ``S`` is expanded to ``S.ancestors()``
+        (``[global, project:P, project:P/sub, ..., S]``, root-first/self-last) and
+        a memory matches iff its stored scope is one of those — i.e. an
+        ancestor-or-self of ``S``. So a query at ``project:P/auth`` sees
+        ``project:P/auth``, ``project:P`` and ``global`` memories but NEVER a
+        sibling like ``project:P/db`` (siblings are not on each other's ancestor
+        chain, so they cannot leak) and NEVER a descendant. Pass
+        ``compose_ancestors=False`` to match the exact scope strings only (e.g. a
+        maintenance pass that must not widen). The composed set is de-duplicated
+        (overlapping ancestor chains, e.g. two sub-scopes of the same project,
+        collapse the shared ``global``/``project:P`` prefix to one scope string).
 
         Never a graph-wide in-process scan. The candidate ranking comes from
         **FalkorDB's vector index** (FR-STO-2): a ``db.idx.vector.queryNodes`` KNN
@@ -457,7 +518,7 @@ class GraphitiStorageBackend:
         raising.
         """
 
-        scope_strs = [s.as_str() for s in scopes]
+        scope_strs = self._composed_scope_strs(scopes, compose_ancestors=compose_ancestors)
         if not scope_strs:
             return []
         query_vec = await self._embeddings.embed(query)
@@ -899,6 +960,230 @@ class GraphitiStorageBackend:
             ended_at=_to_iso(session.ended_at),
             raw_path=session.raw_path,
         )
+
+    # -- raw-chunk tier (offline re-extraction/reindex; survives R4 cleanup) --
+
+    @staticmethod
+    def _raw_chunk_props(chunk: RawChunk) -> dict[str, Any]:
+        """Flatten a :class:`RawChunk` into FalkorDB-storable scalar props."""
+
+        return {
+            "id": chunk.id,
+            "content_hash": chunk.content_hash,
+            "content": chunk.content,
+            "source": chunk.source,
+            "session_id": chunk.session_id,
+            "scope": chunk.scope.as_str(),
+            "project": chunk.project,
+            "started_at": _to_iso(chunk.started_at),
+            "ended_at": _to_iso(chunk.ended_at),
+            "event_count": int(chunk.event_count),
+            "raw_path": chunk.raw_path,
+            "memory_ids": list(chunk.memory_ids),
+            "ingested_at": _to_iso(chunk.ingested_at),
+        }
+
+    @staticmethod
+    def _row_to_raw_chunk(props: dict[str, Any]) -> RawChunk:
+        """Rebuild a :class:`RawChunk` from stored node properties."""
+
+        return RawChunk(
+            id=props["id"],
+            content_hash=props["content_hash"],
+            content=props["content"],
+            source=props["source"],
+            session_id=props["session_id"],
+            scope=Scope.parse(props["scope"]),
+            project=props.get("project") or (Scope.parse(props["scope"]).project_id or ""),
+            started_at=_from_iso(props.get("started_at")),
+            ended_at=_from_iso(props.get("ended_at")),
+            event_count=int(props.get("event_count", 0)),
+            raw_path=props.get("raw_path"),
+            memory_ids=list(props.get("memory_ids") or []),
+            ingested_at=_from_iso(props.get("ingested_at")) or datetime.now(UTC),
+        )
+
+    async def persist_raw_chunk(self, chunk: RawChunk) -> RawChunk:
+        """Persist a :class:`RawChunk` (the raw tier). Idempotent on content_hash.
+
+        Re-persisting the same chunk (same FR-ING-5 ``content_hash``) updates its
+        ``memory_ids`` / timestamps rather than duplicating, so offline
+        re-extraction over the raw tier stays idempotent (R4 / FR-MNT-5).
+        """
+
+        props = self._raw_chunk_props(chunk)
+        await self._query(
+            f"MERGE (c:{RAW_CHUNK_LABEL} {{content_hash: $content_hash}}) "
+            "SET c = $props RETURN c",
+            content_hash=chunk.content_hash,
+            props=props,
+        )
+        return chunk
+
+    async def iter_raw_chunks(
+        self,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        since: datetime | None = None,
+    ) -> AsyncIterator[RawChunk]:
+        """Stream stored raw chunks for offline re-extraction/reindex (raw tier).
+
+        Filters (all optional, AND-combined) match exactly (no ancestor
+        composition — a re-extraction must not widen scope). Async generator:
+        iterate with ``async for c in storage.iter_raw_chunks(...)``.
+        """
+
+        where: list[str] = []
+        params: dict[str, Any] = {}
+        if scope is not None:
+            where.append("c.scope = $scope")
+            params["scope"] = scope.as_str()
+        if session_id is not None:
+            where.append("c.session_id = $session_id")
+            params["session_id"] = session_id
+        if source is not None:
+            where.append("c.source = $source")
+            params["source"] = source
+        if since is not None:
+            where.append("c.ingested_at >= $since")
+            params["since"] = _to_iso(since)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        rows = await self._query(
+            f"MATCH (c:{RAW_CHUNK_LABEL}){clause} RETURN c", **params
+        )
+        for row in rows:
+            yield self._row_to_raw_chunk(self._props(row[0]))
+
+    async def re_extract_from_raw_chunks(
+        self,
+        extractor: Extractor,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        supersede_existing: bool = True,
+    ) -> MaintenanceReport:
+        """Re-run extraction over the retained raw tier (offline reindex seam).
+
+        Iterates :meth:`iter_raw_chunks` (filtered by ``scope`` / ``session_id``)
+        and re-runs ``extractor`` over each chunk's normalized ``content`` to
+        produce fresh :class:`MemoryUnit`s, upserting them via the FR-MNT-1 write
+        path. When ``supersede_existing`` it first closes the validity windows of
+        the memories the chunk previously produced (``RawChunk.memory_ids``) so the
+        re-extraction replaces the old units rather than duplicating. Idempotent
+        and safe to re-run (FR-MNT-5).
+
+        The :class:`~mnemozine.interfaces.Extractor` Protocol consumes
+        ``IngestEvent``s; an ``extractor`` that exposes a text-based re-extraction
+        entry point (``extract_text``) is used when present, otherwise the seam
+        still supersedes the prior memories so a reindex never leaves a stale and a
+        fresh copy both active.
+        """
+
+        report = MaintenanceReport(job_name="re_extract")
+        chunks = [
+            c
+            async for c in self.iter_raw_chunks(scope=scope, session_id=session_id)
+        ]
+        extract_text = getattr(extractor, "extract_text", None)
+        for chunk in chunks:
+            if supersede_existing:
+                for mid in chunk.memory_ids:
+                    try:
+                        await self.close_validity_window(mid)
+                    except KeyError:
+                        continue
+            if callable(extract_text):
+                for memory in await extract_text(chunk.content, scope=chunk.scope):
+                    await self.upsert_memory(memory)
+            report.re_extracted += 1
+        return report
+
+    async def reclassify_memory(
+        self,
+        memory_id: str,
+        *,
+        scope: Scope | None = None,
+        category: str | None = None,
+        cross_ref_candidate: bool | None = None,
+    ) -> MemoryUnit:
+        """Update a stored memory's scope/category/cross-ref WITHOUT raw text (R1).
+
+        Re-derives classification from the already-stored content (does NOT need
+        the raw transcript, so it survives the 30-day cleanup). Any subset of
+        ``scope`` (re-scope; must obey the hierarchical no-leak rule), ``category``
+        (free-form re-label, normalized), or ``cross_ref_candidate`` may be given;
+        unset fields are left unchanged. Returns the updated unit.
+        """
+
+        memory = await self.get_memory(memory_id)
+        if memory is None:
+            raise KeyError(memory_id)
+        sets: list[str] = []
+        params: dict[str, Any] = {"id": memory_id}
+        if scope is not None:
+            memory.scope = scope
+            sets.append("m.scope = $scope")
+            params["scope"] = scope.as_str()
+        if category is not None:
+            # Reuse the MemoryUnit normalization (lowercase/trim/default) so the
+            # stored category matches what list_categories/merge_categories compare.
+            normalized = MemoryUnit(
+                content=memory.content, scope=memory.scope, category=category
+            ).category
+            memory.category = normalized
+            sets.append("m.category = $category")
+            params["category"] = normalized
+        if cross_ref_candidate is not None:
+            memory.cross_ref_candidate = cross_ref_candidate
+            sets.append("m.cross_ref_candidate = $cross_ref_candidate")
+            params["cross_ref_candidate"] = bool(cross_ref_candidate)
+        if sets:
+            await self._query(
+                f"MATCH (m:{MEMORY_LABEL} {{id: $id}}) SET {', '.join(sets)} RETURN m",
+                **params,
+            )
+        return memory
+
+    # -- category registry (emergent-category list/merge, FR-MNT-2/4) ---------
+
+    async def list_categories(self) -> list[tuple[str, int]]:
+        """List the free-form categories in use with their active-memory counts."""
+
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) WHERE m.valid_to IS NULL "
+            "RETURN m.category AS category, count(m) AS n"
+        )
+        out: list[tuple[str, int]] = []
+        for row in rows:
+            category = row[0] if row[0] is not None else DEFAULT_CATEGORY
+            out.append((str(category), int(row[1])))
+        return out
+
+    async def merge_categories(self, source: str, target: str) -> int:
+        """Re-label every memory tagged ``source`` to ``target`` (category merge).
+
+        Both sides are normalized (lowercased/trimmed) before matching, mirroring
+        :class:`MemoryUnit` category normalization. Idempotent. Returns the count
+        of memories re-labeled.
+        """
+
+        src = source.strip().lower()
+        tgt = target.strip().lower()
+        if not tgt:
+            tgt = DEFAULT_CATEGORY
+        if src == tgt:
+            return 0
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) WHERE m.category = $src "
+            "SET m.category = $tgt RETURN count(m) AS n",
+            src=src,
+            tgt=tgt,
+        )
+        if not rows:
+            return 0
+        return int(rows[0][0])
 
     async def close(self) -> None:
         """Close the underlying FalkorDB connection/pool."""

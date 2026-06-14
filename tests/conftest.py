@@ -24,6 +24,8 @@ import pytest
 
 from mnemozine.config import Settings
 from mnemozine.interfaces import (
+    Extractor,
+    MaintenanceReport,
     Neighbor,
     RetrievedMemory,
     WriteDecision,
@@ -33,9 +35,9 @@ from mnemozine.schema.events import IngestEvent, Role, Source
 from mnemozine.schema.models import (
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
     Provenance,
+    RawChunk,
     Scope,
     SourceSession,
     Tier,
@@ -186,6 +188,8 @@ class InMemoryStorage:
         self.entities: dict[str, Entity] = {}
         self.edges: dict[str, Edge] = {}
         self.sessions: list[SourceSession] = []
+        # Raw-chunk tier (offline re-extraction/reindex), keyed on content_hash.
+        self.raw_chunks: dict[str, RawChunk] = {}
         # Suppression store: set of (memory_id, context_key) pairs (FR-RET-6/R2).
         self.suppressions: set[tuple[str, str]] = set()
         # Count of reembed() calls per memory id, so re-embed tests can assert.
@@ -224,10 +228,10 @@ class InMemoryStorage:
                 existing.last_accessed = datetime.now(UTC)
                 return WriteResult(decision=WriteDecision.REINFORCE, memory=existing)
 
-        # supersede: a contradicting active memory exists -> close its window.
+        # supersede: a contradicting active global-decision memory -> close window.
         superseded: list[MemoryUnit] = []
         for existing in candidates:
-            if existing.type == MemoryType.PREFERENCE and self._contradicts(memory, existing):
+            if existing.scope.is_global and self._contradicts(memory, existing):
                 existing.supersede()
                 superseded.append(existing)
         if superseded:
@@ -239,7 +243,7 @@ class InMemoryStorage:
         # no-op: strictly weaker/older duplicate-ish memory already present.
         for existing in candidates:
             if (
-                existing.type == memory.type
+                existing.category == memory.category
                 and memory.confidence < existing.confidence
                 and existing.content.strip().lower() == memory.content.strip().lower()
             ):
@@ -259,8 +263,17 @@ class InMemoryStorage:
         entities: Sequence[str] | None = None,
         top_k: int = 10,
         include_archived: bool = False,
+        compose_ancestors: bool = True,
     ) -> list[RetrievedMemory]:
-        scope_strs = {s.as_str() for s in scopes}
+        # Ancestor-composition (no-leak): expand each query scope to its
+        # ancestor-or-self chain so a memory matches iff its stored scope is an
+        # ancestor-or-self of a query scope (siblings never leak).
+        if compose_ancestors:
+            scope_strs = {
+                anc.as_str() for s in scopes for anc in s.ancestors()
+            }
+        else:
+            scope_strs = {s.as_str() for s in scopes}
         q_words = set(query.lower().split())
         results: list[RetrievedMemory] = []
         for m in self.memories.values():
@@ -434,6 +447,91 @@ class InMemoryStorage:
     async def record_session(self, session: SourceSession) -> None:
         self.sessions.append(session)
 
+    # --- raw-chunk tier (offline re-extraction/reindex) ------------------
+
+    async def persist_raw_chunk(self, chunk: RawChunk) -> RawChunk:
+        # Idempotent on content_hash (the FR-ING-5 key).
+        self.raw_chunks[chunk.content_hash] = chunk
+        return chunk
+
+    async def iter_raw_chunks(
+        self,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        since: datetime | None = None,
+    ) -> AsyncIterator[RawChunk]:
+        scope_str = scope.as_str() if scope is not None else None
+        for chunk in list(self.raw_chunks.values()):
+            if scope_str is not None and chunk.scope.as_str() != scope_str:
+                continue
+            if session_id is not None and chunk.session_id != session_id:
+                continue
+            if source is not None and chunk.source != source:
+                continue
+            if since is not None and chunk.ingested_at < since:
+                continue
+            yield chunk
+
+    async def re_extract_from_raw_chunks(
+        self,
+        extractor: Extractor,
+        *,
+        scope: Scope | None = None,
+        session_id: str | None = None,
+        supersede_existing: bool = True,
+    ) -> MaintenanceReport:
+        # The fake does not re-parse chunk.content back into events; it exercises
+        # the seam (iterate the raw tier, supersede the prior memories). The real
+        # backend re-runs ``extractor`` over the normalized content.
+        del extractor
+        count = 0
+        async for chunk in self.iter_raw_chunks(scope=scope, session_id=session_id):
+            if supersede_existing:
+                for mid in chunk.memory_ids:
+                    if mid in self.memories:
+                        self.memories[mid].supersede()
+            count += 1
+        return MaintenanceReport(job_name="re_extract", re_extracted=count)
+
+    async def reclassify_memory(
+        self,
+        memory_id: str,
+        *,
+        scope: Scope | None = None,
+        category: str | None = None,
+        cross_ref_candidate: bool | None = None,
+    ) -> MemoryUnit:
+        m = self.memories[memory_id]
+        if scope is not None:
+            m.scope = scope
+        if category is not None:
+            # Reuse the model's normalization (lowercase/trim).
+            m.category = MemoryUnit(content=m.content, scope=m.scope, category=category).category
+        if cross_ref_candidate is not None:
+            m.cross_ref_candidate = cross_ref_candidate
+        return m
+
+    # --- category registry (emergent-category list/merge) ----------------
+
+    async def list_categories(self) -> list[tuple[str, int]]:
+        counts: dict[str, int] = {}
+        for m in self.memories.values():
+            if m.is_active:
+                counts[m.category] = counts.get(m.category, 0) + 1
+        return list(counts.items())
+
+    async def merge_categories(self, source: str, target: str) -> int:
+        src = source.strip().lower()
+        tgt = target.strip().lower()
+        n = 0
+        for m in self.memories.values():
+            if m.category == src:
+                m.category = tgt
+                n += 1
+        return n
+
     async def close(self) -> None:
         return None
 
@@ -511,12 +609,12 @@ def sample_events() -> list[IngestEvent]:
 
 @pytest.fixture
 def sample_memory(sample_provenance: Provenance) -> MemoryUnit:
-    """A sample active global preference memory unit."""
+    """A sample active global preference memory unit (category split contract)."""
 
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content="Prefers thiserror over anyhow for Rust error handling.",
         scope=Scope.global_(),
+        category="preference",
         entities=["rust", "error-handling", "thiserror"],
         confidence=0.9,
         provenance=sample_provenance,

@@ -101,9 +101,7 @@ def scaling(
 
     parsed_levels = tuple(int(x) for x in levels.split(",") if x.strip())
     runner = default_inmemory_runner(gold_set=_load(gold_path))
-    report = asyncio.run(
-        runner.precision_scaling(levels=parsed_levels, tolerance=tolerance)
-    )
+    report = asyncio.run(runner.precision_scaling(levels=parsed_levels, tolerance=tolerance))
     typer.echo(report.render())
     raise typer.Exit(code=0 if report.passed else 1)
 
@@ -218,6 +216,7 @@ def bootstrap_propose(
     from mnemozine.evals.harness_adapters import KeywordExtractor
     from mnemozine.interfaces import RetrievalContext
     from mnemozine.schema.events import IngestEvent, Role, Source
+    from mnemozine.schema.models import MemoryType
 
     base = datetime(2026, 6, 13, tzinfo=UTC)
     demo_chunk = [
@@ -237,14 +236,14 @@ def bootstrap_propose(
         extractor = KeywordExtractor()
         candidates = []
         for i, ev in enumerate(demo_chunk):
-            cls = await extractor.classify(
-                ev.content, RetrievalContext(project=ev.project)
-            )
+            cls = await extractor.classify(ev.content, RetrievalContext(project=ev.project))
             candidates.append(
                 Candidate(
                     candidate_id=f"cand-{i:04d}",
                     content=ev.content,
-                    proposed_type=cls.type,
+                    proposed_type=MemoryType.from_split(
+                        cls.scope_decision, cls.cross_ref_candidate
+                    ),
                     scope=cls.scope.as_str(),
                     entities=cls.entities,
                     confidence=cls.confidence,

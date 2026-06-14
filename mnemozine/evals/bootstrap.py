@@ -84,10 +84,14 @@ class Candidate(BaseModel):
         """Build a candidate from an extracted :class:`MemoryUnit`."""
 
         sess = unit.provenance.session_id if unit.provenance else ""
+        # The bootstrap review sheet still speaks the legacy MemoryType (the
+        # operator ticks a single type); reverse-map the unit's category-split
+        # contract back onto it for display/labeling.
+        proposed = MemoryType.from_split(unit.scope_decision, unit.cross_ref_candidate)
         return cls(
             candidate_id=f"cand-{index:04d}",
             content=unit.content,
-            proposed_type=unit.type,
+            proposed_type=proposed,
             scope=unit.scope.as_str(),
             entities=list(unit.entities),
             confidence=unit.confidence,
@@ -246,10 +250,12 @@ def candidates_to_gold_set(
     classifier_cases: list[ClassifierCase] = []
     for c in kept:
         scope = Scope.parse(c.scope)
+        ftype = c.final_type
         memories.append(
             GoldMemory(
                 gold_id=c.candidate_id,
-                type=c.final_type,
+                category=ftype.category,
+                cross_ref_candidate=ftype.is_cross_ref,
                 content=c.content,
                 scope=c.scope,
                 entities=list(c.entities),
@@ -261,7 +267,8 @@ def candidates_to_gold_set(
                 case_id=f"cls-{c.candidate_id}",
                 statement=c.content,
                 project=scope.project_id,
-                expected_type=c.final_type,
+                expected_scope_decision=ftype.scope_decision,
+                expected_cross_ref=ftype.is_cross_ref,
             )
         )
     return GoldSet(

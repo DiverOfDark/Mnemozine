@@ -6,15 +6,17 @@ import pytest
 
 from mnemozine.config import Settings
 from mnemozine.maintenance.consolidation import ConsolidationJob
-from mnemozine.schema.models import MemoryType, MemoryUnit, Provenance, Scope, Tier
+from mnemozine.schema.models import MemoryUnit, Provenance, Scope, Tier
 from tests.conftest import FakeEmbeddingProvider, FakeLLMProvider, InMemoryStorage
 
 
 def _pref(content: str, *, entities: list[str]) -> MemoryUnit:
+    # Category split: a global-scope memory carrying the free-form "preference"
+    # category (clustering is per-category, so all members share one).
     return MemoryUnit(
-        type=MemoryType.PREFERENCE,
         content=content,
         scope=Scope.global_(),
+        category="preference",
         entities=entities,
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),
@@ -82,9 +84,9 @@ async def test_singletons_and_cross_scope_not_merged() -> None:
     # Same entity but DIFFERENT scopes => must never consolidate together.
     g = _pref("global rust pref.", entities=["rust"])
     p = MemoryUnit(
-        type=MemoryType.PROJECT_FACT,
         content="project rust fact.",
         scope=Scope.project("p1"),
+        category="project_fact",
         entities=["rust"],
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="s1"),

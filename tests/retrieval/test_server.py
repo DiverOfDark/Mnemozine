@@ -14,7 +14,6 @@ from mnemozine.config import Settings
 from mnemozine.retrieval.retriever import ScopedRetriever
 from mnemozine.retrieval.server import RecalledMemory, _parse_scope, build_mcp_server
 from mnemozine.schema.models import (
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -22,11 +21,21 @@ from mnemozine.schema.models import (
 from tests.conftest import InMemoryStorage
 
 
-def _mem(content: str, type_: MemoryType, scope: Scope, entities: list[str]) -> MemoryUnit:
+def _mem(
+    content: str,
+    scope: Scope,
+    entities: list[str],
+    *,
+    category: str = "fact",
+    cross_ref_candidate: bool = False,
+) -> MemoryUnit:
+    """Build a MemoryUnit on the category-split contract (no legacy ``type``)."""
+
     return MemoryUnit(
-        type=type_,
         content=content,
         scope=scope,
+        category=category,
+        cross_ref_candidate=cross_ref_candidate,
         entities=entities,
         confidence=0.9,
         provenance=Provenance(source="claude_code", session_id="sess-1"),
@@ -36,21 +45,21 @@ def _mem(content: str, type_: MemoryType, scope: Scope, entities: list[str]) -> 
 async def _seed(storage: InMemoryStorage) -> dict[str, MemoryUnit]:
     pref = _mem(
         "Prefers thiserror over anyhow for rust error handling",
-        MemoryType.PREFERENCE,
         Scope.global_(),
         ["rust", "error-handling"],
+        category="preference",
     )
     fact_here = _mem(
         "rust-cli pins tokio 1.38",
-        MemoryType.PROJECT_FACT,
         Scope.project("rust-cli"),
         ["rust", "tokio"],
+        category="decision",
     )
     fact_other = _mem(
         "other-proj uses postgres 16",
-        MemoryType.PROJECT_FACT,
         Scope.project("other-proj"),
         ["postgres"],
+        category="decision",
     )
     for m in (pref, fact_here, fact_other):
         await storage.upsert_memory(m)
@@ -74,10 +83,19 @@ def test_parse_scope_variants() -> None:
 def test_recalled_memory_projection() -> None:
     from mnemozine.interfaces import RetrievedMemory
 
-    m = _mem("x content", MemoryType.PREFERENCE, Scope.global_(), ["a"])
+    m = _mem(
+        "x content",
+        Scope.global_(),
+        ["a"],
+        category="preference",
+        cross_ref_candidate=True,
+    )
     rm = RecalledMemory.from_retrieved(RetrievedMemory(memory=m, score=0.5))
     assert rm.content == "x content"
-    assert rm.type == "preference"
+    # The category split: the wire view exposes the free-form category + the
+    # cross_ref_candidate flag instead of the dropped MemoryType.
+    assert rm.category == "preference"
+    assert rm.cross_ref_candidate is True
     assert rm.scope == "global"
     assert rm.source == "claude_code"
 

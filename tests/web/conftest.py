@@ -31,7 +31,6 @@ from mnemozine.config import Settings
 from mnemozine.schema.models import (
     Edge,
     Entity,
-    MemoryType,
     MemoryUnit,
     Provenance,
     Scope,
@@ -55,9 +54,13 @@ def _prov(source: str = "claude_code", session: str = "sess-1") -> Provenance:
 def seed_storage(storage: InMemoryStorage) -> None:
     """Seed a representative graph: memories (active/superseded/archived), entities, edges.
 
-    Covers every filter axis the Memories table exposes (type / scope / tier /
+    Covers every filter axis the Memories table exposes (category / scope / tier /
     active-vs-superseded / source) plus a supersession pair, entities with a
     duplicate group (for merge-candidates), and weighted edges (for the graph).
+
+    Reflects the core data-model redesign: memories carry a FREE-FORM ``category``
+    (not the old 3-value ``MemoryType``) and a HIERARCHICAL ``scope`` path, and the
+    old ``idea_seed`` type is now the boolean ``cross_ref_candidate`` flag.
     """
 
     # --- entities -------------------------------------------------------
@@ -86,10 +89,10 @@ def seed_storage(storage: InMemoryStorage) -> None:
     )
 
     # --- memories -------------------------------------------------------
-    # 1) active global preference (current value of a superseded pair).
+    # 1) active global 'preference' (current value of a superseded pair).
     storage.memories["mem-pref-current"] = MemoryUnit(
         id="mem-pref-current",
-        type=MemoryType.PREFERENCE,
+        category="preference",
         content="Prefers thiserror over anyhow for Rust error handling.",
         scope=Scope.global_(),
         entities=["rust", "error-handling"],
@@ -99,10 +102,10 @@ def seed_storage(storage: InMemoryStorage) -> None:
         last_accessed=_NOW - timedelta(hours=3),
         access_count=7,
     )
-    # 2) the stale, superseded preference it replaced (closed validity window).
+    # 2) the stale, superseded 'preference' it replaced (closed validity window).
     stale = MemoryUnit(
         id="mem-pref-stale",
-        type=MemoryType.PREFERENCE,
+        category="preference",
         content="Prefers anyhow over thiserror for Rust error handling.",
         scope=Scope.global_(),
         entities=["rust", "error-handling"],
@@ -112,10 +115,10 @@ def seed_storage(storage: InMemoryStorage) -> None:
     )
     stale.supersede(at=_NOW - timedelta(days=5))
     storage.memories["mem-pref-stale"] = stale
-    # 3) a project_fact (different scope + source) for scope/source filters.
+    # 3) a project-scoped 'decision' (different scope + source) for scope/source filters.
     storage.memories["mem-fact-tokio"] = MemoryUnit(
         id="mem-fact-tokio",
-        type=MemoryType.PROJECT_FACT,
+        category="decision",
         content="The rust-cli project pins tokio 1.38.",
         scope=Scope.project("rust-cli"),
         entities=["tokio", "rust"],
@@ -123,10 +126,12 @@ def seed_storage(storage: InMemoryStorage) -> None:
         provenance=_prov(source="openai", session="sess-2"),
         valid_from=_NOW - timedelta(days=3),
     )
-    # 4) an archived idea_seed (tier=archive) for tier filter + graph idea node.
+    # 4) an archived cross-ref seed (tier=archive) for tier filter + graph idea node.
+    #    The old idea_seed type is now category='idea' + cross_ref_candidate=True.
     storage.memories["mem-idea-cli"] = MemoryUnit(
         id="mem-idea-cli",
-        type=MemoryType.IDEA_SEED,
+        category="idea",
+        cross_ref_candidate=True,
         content="Idea: an async CLI that streams logs with a tokio runtime.",
         scope=Scope.global_(),
         entities=["tokio", "rust"],
@@ -158,6 +163,10 @@ def container(
     settings = Settings()
     # Disable the SPA static mount so create_app builds API-only (see module doc).
     settings.web.static_dir = Path("/nonexistent-spa-dir-for-tests")
+    # Keep the health endpoint's reported activity-log state deterministic: the
+    # tests inject their own InMemoryActivityLog directly onto the container
+    # (below), so the persisted-log feature flag is irrelevant here and pinned off.
+    settings.web.enable_activity_log = False
     c = Container(settings=settings)
     c._storage = storage
     c._embedding = FakeEmbeddingProvider()

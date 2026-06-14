@@ -4,7 +4,7 @@
   "memories": [
     {
       "gold_id": "pref-rust-errors-current",
-      "type": "preference",
+      "category": "preference",
       "content": "Prefers thiserror over anyhow for Rust error handling.",
       "scope": "global",
       "entities": ["rust", "error-handling", "thiserror"],
@@ -13,7 +13,7 @@
     },
     {
       "gold_id": "pref-rust-errors-stale",
-      "type": "preference",
+      "category": "preference",
       "content": "Prefers anyhow over thiserror for Rust error handling.",
       "scope": "global",
       "entities": ["rust", "error-handling", "anyhow"],
@@ -23,7 +23,7 @@
     },
     {
       "gold_id": "pref-python-fmt",
-      "type": "preference",
+      "category": "preference",
       "content": "Prefers ruff for Python formatting and linting.",
       "scope": "global",
       "entities": ["python", "formatting", "ruff"],
@@ -32,7 +32,7 @@
     },
     {
       "gold_id": "fact-rustcli-tokio",
-      "type": "project_fact",
+      "category": "fact",
       "content": "The rust-cli project pins tokio 1.38.",
       "scope": "project:rust-cli",
       "entities": ["tokio", "async", "rust-cli"],
@@ -41,7 +41,7 @@
     },
     {
       "gold_id": "fact-webapp-postgres",
-      "type": "project_fact",
+      "category": "fact",
       "content": "The webapp project uses postgres 16 as its primary datastore.",
       "scope": "project:webapp",
       "entities": ["postgres", "database", "webapp"],
@@ -50,7 +50,8 @@
     },
     {
       "gold_id": "idea-async-cli-tool",
-      "type": "idea_seed",
+      "category": "idea",
+      "cross_ref_candidate": true,
       "content": "Idea: an async CLI tool that streams logs with a tokio runtime and clap parsing.",
       "scope": "global",
       "entities": ["async", "cli", "tokio", "rust"],
@@ -59,7 +60,8 @@
     },
     {
       "gold_id": "idea-recipe-app",
-      "type": "idea_seed",
+      "category": "idea",
+      "cross_ref_candidate": true,
       "content": "Idea: a recipe app with a shared grocery list and meal planning.",
       "scope": "global",
       "entities": ["cooking", "mobile", "recipes"],
@@ -115,25 +117,25 @@
       "case_id": "cls-pref-rust",
       "statement": "I prefer thiserror over anyhow for error handling in Rust.",
       "project": "rust-cli",
-      "expected_type": "preference"
+      "expected_scope_decision": "global"
     },
     {
       "case_id": "cls-pref-python",
       "statement": "I always format Python with ruff.",
       "project": "py-svc",
-      "expected_type": "preference"
+      "expected_scope_decision": "global"
     },
     {
       "case_id": "cls-fact-tokio",
       "statement": "This project pins tokio 1.38.",
       "project": "rust-cli",
-      "expected_type": "project_fact"
+      "expected_scope_decision": "project"
     },
     {
       "case_id": "cls-fact-postgres",
       "statement": "The webapp uses postgres 16 as its datastore.",
       "project": "webapp",
-      "expected_type": "project_fact"
+      "expected_scope_decision": "project"
     }
   ],
   "no_leak_cases": [

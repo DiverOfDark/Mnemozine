@@ -55,9 +55,7 @@ def test_bootstrap_propose_then_finish(tmp_path: Path) -> None:
     review.write_text(text.replace("- [ ] keep", "- [x] keep"))
 
     # finish
-    r2 = runner.invoke(
-        app, ["bootstrap-finish", "--in", str(review), "--out", str(gold)]
-    )
+    r2 = runner.invoke(app, ["bootstrap-finish", "--in", str(review), "--out", str(gold)])
     assert r2.exit_code == 0
     assert gold.exists()
     assert "kept=1" in r2.stdout
