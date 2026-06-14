@@ -354,6 +354,62 @@ class RetrievalSettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# WebUI / Operator console (PRD WEBUI §3 — local-only FastAPI console)
+# ---------------------------------------------------------------------------
+
+
+class WebSettings(BaseModel):
+    """Operator-console WebUI server settings (WEBUI PRD §3, Q5).
+
+    The console is a **local, single-operator** surface that can contain
+    credentials (project threat model), so it binds to localhost by default and
+    is never exposed publicly. An optional static bearer ``token`` gates every
+    ``/api`` request when set (``MNEMOZINE_WEB__TOKEN=...``); when unset the API
+    is open on the bound interface (fine for a localhost bind). CORS is locked to
+    the configured ``cors_origins`` (empty = same-origin only, the default for the
+    single-image SPA served by this same app).
+    """
+
+    host: str = Field(
+        default="127.0.0.1",
+        description="WebUI bind host. Defaults to localhost; never bind publicly (Q5).",
+    )
+    port: int = Field(
+        default=8765,
+        description="WebUI bind port.",
+    )
+    token: str | None = Field(
+        default=None,
+        description=(
+            "Optional static bearer token gating /api requests "
+            "(MNEMOZINE_WEB__TOKEN). When unset, the API is open on the bound host."
+        ),
+    )
+    cors_origins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Allowed CORS origins for the API. Empty = same-origin only "
+            "(the default: the SPA is served by this same FastAPI app)."
+        ),
+    )
+    static_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory of built SPA static assets to serve. None = serve the "
+            "package's bundled web/static dir if present, else API-only."
+        ),
+    )
+    enable_activity_log: bool = Field(
+        default=False,
+        description=(
+            "Persist the ActivityEvent log (Q3). Off by default so the existing "
+            "pipeline + tests use the NullActivityLog no-op seam; the WebUI run "
+            "path turns it on (FalkorDB-backed)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level settings
 # ---------------------------------------------------------------------------
 
@@ -382,6 +438,7 @@ class Settings(BaseSettings):
     maintenance: MaintenanceSettings = Field(default_factory=MaintenanceSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    web: WebSettings = Field(default_factory=WebSettings)
 
     # MCP server bind settings (FR-RET-1).
     mcp_host: str = Field(default="127.0.0.1", description="MCP server bind host.")

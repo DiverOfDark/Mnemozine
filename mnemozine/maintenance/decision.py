@@ -39,8 +39,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from mnemozine.activity import emit, write_decision_event
 from mnemozine.config import Settings, get_settings
 from mnemozine.interfaces import (
+    ActivityLog,
     EmbeddingProvider,
     LLMProvider,
     StorageBackend,
@@ -207,6 +209,7 @@ class WriteDecider:
         embeddings: EmbeddingProvider | None = None,
         config: WriteDecisionConfig | None = None,
         settings: Settings | None = None,
+        activity_log: ActivityLog | None = None,
     ) -> None:
         self._storage = storage
         self._llm = llm
@@ -214,6 +217,10 @@ class WriteDecider:
         if config is None:
             config = WriteDecisionConfig.from_settings(settings or get_settings())
         self._config = config
+        # Optional WEBUI Q3 observability seam: the 4-way write decision is the
+        # extract_decision the Logs feed surfaces. Defaults to None so every
+        # existing caller is unaffected; emit() fast-paths None / NullActivityLog.
+        self._activity_log = activity_log
 
     # --- candidate gathering (same scope + overlapping entities) ----------
 
@@ -319,6 +326,14 @@ class WriteDecider:
         """
 
         candidates = await self._candidates(memory)
+        result = await self._decide_inner(memory, candidates)
+        self._emit_decision(memory, result)
+        return result
+
+    async def _decide_inner(
+        self, memory: MemoryUnit, candidates: list[MemoryUnit]
+    ) -> WriteResult:
+        """Resolve + apply the 4-way decision (the side-effecting branches)."""
 
         # 1) reinforce — a semantically equivalent active memory exists.
         equivalent = await self._equivalent(memory, candidates)
@@ -347,6 +362,33 @@ class WriteDecider:
         # 4) add.
         await self._insert(memory)
         return WriteResult(decision=WriteDecision.ADD, memory=memory)
+
+    def _emit_decision(self, memory: MemoryUnit, result: WriteResult) -> None:
+        """Record the FR-MNT-1 4-way write decision on the activity feed (WEBUI Q3).
+
+        Null-safe + error-swallowing (:func:`emit`); a no-op unless an activity log
+        is wired through the constructor, so the existing write path is unchanged.
+        """
+
+        superseded_ids = [m.id for m in result.superseded]
+        emit(
+            self._activity_log,
+            write_decision_event(
+                decision=result.decision.value,
+                memory_id=result.memory.id,
+                source=memory.provenance.source if memory.provenance else None,
+                summary=(
+                    f"write {result.decision.value}: {memory.content[:60]}"
+                ),
+                superseded_ids=superseded_ids,
+                detail={
+                    "type": memory.type.value,
+                    "scope": memory.scope.as_str(),
+                    "entities": list(memory.entities),
+                    "confidence": memory.confidence,
+                },
+            ),
+        )
 
     @staticmethod
     def _strictly_weaker(

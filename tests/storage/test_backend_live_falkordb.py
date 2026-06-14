@@ -262,3 +262,58 @@ async def test_upsert_edge_create_and_reassert_against_real_falkordb(
     assert reassert.weight == pytest.approx(2.5)
     incident2 = await live_backend.edges_for_entity(a.id)
     assert sum(1 for e in incident2 if e.relation == "formats") == 1, incident2
+
+
+async def test_activity_log_append_and_query_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """FalkorDBActivityLog append+query run against REAL FalkorDB (Q3 write path).
+
+    Regression guard: the offline activity tests use the InMemoryActivityLog, so
+    the FalkorDB node-create Cypher was never exercised. ``CREATE (a:Label $props)``
+    with a *parameterized map* is rejected by real FalkorDB ("Encountered unhandled
+    type in inlined properties"), which would have broken every WebUI activity
+    write the moment the log was enabled. This exercises the real CREATE + SET path
+    live, asserts events with NULL-valued fields (a maintenance event has no
+    source/session/project) append cleanly, and round-trip through query() with
+    their JSON-encoded ref_memory_ids/detail intact.
+    """
+
+    from mnemozine.activity.log import FalkorDBActivityLog
+    from mnemozine.activity.models import (
+        ActivityQuery,
+        ingest_event,
+        maintenance_event,
+    )
+
+    client = live_backend._client
+    log = FalkorDBActivityLog(client)
+
+    full = ingest_event(
+        source="claude_code",
+        session_id="sess-live",
+        project="proj-live",
+        summary="ingested live chunk",
+        ref_memory_ids=["m-live-1", "m-live-2"],
+        detail={"chunks": 2},
+    )
+    # A maintenance event carries NULL session_id/project — the exact shape that
+    # the parameterized-map CREATE rejected.
+    sparse = maintenance_event(job_name="consolidate", summary="live pass")
+
+    await log.append(full)
+    await log.append(sparse)
+
+    events = await log.query(ActivityQuery(limit=10))
+    by_summary = {e.summary: e for e in events}
+    assert "ingested live chunk" in by_summary
+    assert "live pass" in by_summary
+    # JSON-encoded list/map fields survive the FalkorDB round-trip.
+    assert by_summary["ingested live chunk"].ref_memory_ids == ["m-live-1", "m-live-2"]
+    assert by_summary["ingested live chunk"].detail == {"chunks": 2}
+    assert by_summary["live pass"].session_id is None
+    assert by_summary["live pass"].detail == {"job_name": "consolidate"}
+
+    # ref_memory_id filtering (Python-side over the JSON array) works end-to-end.
+    filtered = await log.query(ActivityQuery(ref_memory_id="m-live-1", limit=10))
+    assert [e.summary for e in filtered] == ["ingested live chunk"]

@@ -657,6 +657,54 @@ class MaintenanceJob(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Activity log (WEBUI Q3 — append-only observability feed)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ActivityLog(Protocol):
+    """An append-only record of what the memory layer did (WEBUI PRD §3, Q3).
+
+    Backs the WebUI Logs screen + Dashboard feed: ingestion, the FR-MNT-1 4-way
+    write decision, maintenance passes (FR-MNT-*), and injections (FR-RET-3/5).
+    Concrete impls live in :mod:`mnemozine.activity` —
+    ``NullActivityLog`` (the **default**, a no-op so existing pipeline call sites
+    and the test suite are unaffected), ``InMemoryActivityLog``, and the
+    persisted ``FalkorDBActivityLog`` (which reuses the storage connection — never
+    a new source of truth).
+
+    Pipeline seams do **not** call :meth:`append` directly; they go through the
+    safe :func:`mnemozine.activity.emit` helper (null-safe, error-swallowing,
+    fire-and-forget) so recording activity can never break a write or a recall.
+    The WebUI reads via :meth:`query`.
+    """
+
+    @property
+    def enabled(self) -> bool:
+        """False for the no-op default; True for a real persisted/in-memory log.
+
+        ``emit`` fast-paths on this so a disabled log costs nothing.
+        """
+        ...
+
+    async def append(self, event: Any) -> None:
+        """Append one :class:`~mnemozine.activity.ActivityEvent` (append-only)."""
+        ...
+
+    async def query(self, query: Any | None = None) -> list[Any]:
+        """Read events matching an :class:`~mnemozine.activity.ActivityQuery`.
+
+        Returns newest-first, paged by the query's ``offset``/``limit``. ``None``
+        means "recent events with defaults".
+        """
+        ...
+
+    async def close(self) -> None:
+        """Release any held resources (no-op for the in-memory/null impls)."""
+        ...
+
+
+# ---------------------------------------------------------------------------
 # LLM + embedding providers (the pluggable model endpoints)
 # ---------------------------------------------------------------------------
 

@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-bg text-text font-sans text-base antialiased;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Dense, dark scrollbars to match the console chrome. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: theme("colors.border.strong") transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    @apply rounded bg-border-strong;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    @apply bg-text-faint;
+  }
+
+  ::selection {
+    background: theme("colors.accent.muted");
+    color: theme("colors.text.DEFAULT");
+  }
+
+  /* Focus-visible ring across the app. */
+  :focus-visible {
+    outline: none;
+    @apply ring-2 ring-border-focus ring-offset-0;
+  }
+}
+
+@layer components {
+  /* Shared monospace token treatment for IDs / hashes (PRD §5). */
+  .mono-id {
+    @apply font-mono text-xs text-text-muted;
+  }
+
+  /* Superseded rendering: struck-through + greyed (PRD §5). */
+  .superseded {
+    @apply text-superseded line-through decoration-superseded/60;
+  }
+}

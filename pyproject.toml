@@ -30,6 +30,9 @@ dependencies = [
     "watchfiles>=0.24",
     "apscheduler>=3.10,<4",
     "typer>=0.26",
+    # WebUI operator console (WEBUI PRD): FastAPI app + uvicorn server.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +52,7 @@ mnemozine-mcp = "mnemozine.app:run_mcp"
 mnemozine-ingest = "mnemozine.app:run_ingest"
 mnemozine-maintenance = "mnemozine.app:run_maintenance"
 mnemozine-eval = "mnemozine.app:run_eval"
+mnemozine-web = "mnemozine.app:run_web"
 mnemozine-hook-session-start = "mnemozine.ingestion.claude_code.hooks.session_start:main"
 mnemozine-hook-user-prompt-submit = "mnemozine.ingestion.claude_code.hooks.user_prompt_submit:main"
 mnemozine-hook-stop = "mnemozine.ingestion.claude_code.hooks.stop:main"

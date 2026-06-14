@@ -29,8 +29,10 @@ import typer
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore[import-untyped]
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 
+from mnemozine.activity import emit, maintenance_event
 from mnemozine.config import Settings, get_settings
 from mnemozine.interfaces import (
+    ActivityLog,
     EmbeddingProvider,
     LLMProvider,
     MaintenanceJob,
@@ -83,9 +85,13 @@ class MaintenanceRunner:
         jobs: Sequence[MaintenanceJob],
         *,
         settings: Settings | None = None,
+        activity_log: ActivityLog | None = None,
     ) -> None:
         self._jobs = list(jobs)
         self._settings = settings or get_settings()
+        # Optional WEBUI Q3 observability seam. Defaults to None so every existing
+        # caller (CLI, tests) is unaffected; emit() fast-paths None / NullActivityLog.
+        self._activity_log = activity_log
 
     async def run_once(self) -> list[MaintenanceReport]:
         """Run every job once, in order, and return their reports.
@@ -113,6 +119,26 @@ class MaintenanceRunner:
                 report.entities_merged,
                 report.archived,
                 report.edges_pruned,
+            )
+            # WEBUI Q3 observability: record each job run on the activity feed.
+            # Null-safe + error-swallowing (emit); a no-op unless a log is wired.
+            emit(
+                self._activity_log,
+                maintenance_event(
+                    job_name=report.job_name,
+                    summary=(
+                        f"maintenance {report.job_name}: "
+                        f"consolidated={report.consolidated} merged={report.entities_merged} "
+                        f"archived={report.archived} pruned={report.edges_pruned}"
+                    ),
+                    detail={
+                        "consolidated": report.consolidated,
+                        "entities_merged": report.entities_merged,
+                        "archived": report.archived,
+                        "edges_pruned": report.edges_pruned,
+                        "notes": list(report.notes),
+                    },
+                ),
             )
         return reports
 

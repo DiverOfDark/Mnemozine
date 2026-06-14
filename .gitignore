@@ -43,3 +43,11 @@ htmlcov/
 *.log
 data/
 archive/
+
+# --- WebUI (web/) ---
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+# the built SPA is emitted here by `vite build` (vite.config.ts outDir); never commit it
+mnemozine/web/static/

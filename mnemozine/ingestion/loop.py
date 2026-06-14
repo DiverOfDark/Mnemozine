@@ -36,12 +36,13 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from mnemozine.activity import emit, ingest_event
 from mnemozine.config import Settings, get_settings
 from mnemozine.ingestion.claude_code.chunker import ChunkAccumulator
 from mnemozine.ingestion.claude_code.source import ClaudeCodeSource
 from mnemozine.ingestion.gateway.callback import GatewayCallback, make_gateway_callback
 from mnemozine.ingestion.hermes.adapter import HermesAdapter
-from mnemozine.interfaces import IngestSource
+from mnemozine.interfaces import ActivityLog, IngestSource
 from mnemozine.schema.events import IngestEvent, Source
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -168,6 +169,41 @@ async def _produce(
         await queue.put(_PRODUCER_DONE)
 
 
+async def _ingest_one(
+    chunk: Chunk,
+    ingest_service: IngestService,
+    activity_log: ActivityLog | None,
+) -> None:
+    """Ingest one chunk and (WEBUI Q3) record the ingestion on the activity feed.
+
+    The :func:`emit` seam is null-safe + error-swallowing, so when no activity log
+    is wired (the default ``None`` / ``NullActivityLog``) nothing is recorded and
+    the ingest path is unchanged. Only chunks that were *newly* ingested
+    (``ingest_chunk`` returned True — not an FR-ING-5 idempotent skip) are
+    recorded, so the feed reflects real ingestion, not re-flushes.
+    """
+
+    newly = await ingest_service.ingest_chunk(chunk)
+    if newly:
+        emit(
+            activity_log,
+            ingest_event(
+                source=chunk.source,
+                session_id=chunk.session_id,
+                project=chunk.project,
+                summary=(
+                    f"ingested chunk from {chunk.source} "
+                    f"({len(chunk.events)} event(s), session {chunk.session_id})"
+                ),
+                detail={
+                    "content_hash": chunk.content_hash,
+                    "event_count": len(chunk.events),
+                    "char_count": chunk.char_count,
+                },
+            ),
+        )
+
+
 async def _consume(
     queue: asyncio.Queue[object],
     accumulator: ChunkAccumulator,
@@ -175,6 +211,7 @@ async def _consume(
     *,
     producer_count: int,
     drain_to_completion: bool,
+    activity_log: ActivityLog | None = None,
 ) -> None:
     """Single consumer: drain the fan-in queue through chunk -> extract -> store.
 
@@ -184,6 +221,10 @@ async def _consume(
     has signalled done and then flushes the accumulator remainder; otherwise it
     runs until cancelled (the streaming watcher loop), and a final flush still
     runs in the cancellation handler so in-flight buffers are not lost.
+
+    ``activity_log`` is the optional WEBUI Q3 observability seam: when wired, each
+    newly-ingested chunk is recorded on the feed (per source). Defaults to None so
+    the existing ingest path is unaffected.
     """
 
     finished = 0
@@ -197,12 +238,12 @@ async def _consume(
                 continue
             assert isinstance(item, IngestEvent)  # narrows the object queue
             for chunk in accumulator.add(item):
-                await ingest_service.ingest_chunk(chunk)
+                await _ingest_one(chunk, ingest_service, activity_log)
     finally:
         # Flush any in-flight remainder so the last partial chunk per session is
         # not dropped (always for backfill; on cancellation for the stream loop).
         for chunk in accumulator.flush():
-            await ingest_service.ingest_chunk(chunk)
+            await _ingest_one(chunk, ingest_service, activity_log)
 
 
 async def run_ingest_loop(
@@ -211,6 +252,7 @@ async def run_ingest_loop(
     ingest_service: IngestService,
     *,
     backfill: bool = False,
+    activity_log: ActivityLog | None = None,
 ) -> None:
     """Run the enabled sources concurrently into the shared pipeline (FR-ING-*).
 
@@ -223,6 +265,10 @@ async def run_ingest_loop(
       / task cancellation at shutdown), flushing in-flight buffers on the way out.
 
     With no enabled sources this returns immediately (nothing to drive).
+
+    ``activity_log`` is the optional WEBUI Q3 observability seam threaded into the
+    consumer so each newly-ingested chunk is recorded on the activity feed.
+    Defaults to None (the existing pipeline behavior is unchanged).
     """
 
     source_list = list(
@@ -247,6 +293,7 @@ async def run_ingest_loop(
             ingest_service,
             producer_count=len(producers),
             drain_to_completion=backfill,
+            activity_log=activity_log,
         ),
         name="ingest-consumer",
     )

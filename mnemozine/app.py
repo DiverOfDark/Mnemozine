@@ -31,6 +31,7 @@ import typer
 
 from mnemozine.config import Settings, get_settings
 from mnemozine.interfaces import (
+    ActivityLog,
     CrossReferencer,
     EmbeddingProvider,
     Extractor,
@@ -61,6 +62,7 @@ class Container:
     _llm: LLMProvider | None = field(default=None, init=False, repr=False)
     _storage: StorageBackend | None = field(default=None, init=False, repr=False)
     _extractor: Extractor | None = field(default=None, init=False, repr=False)
+    _activity: ActivityLog | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_env(cls) -> Container:
@@ -130,6 +132,33 @@ class Container:
 
             self._extractor = TypedExtractor(self.build_llm_provider(), settings=self.settings)
         return self._extractor
+
+    # -- activity log (WEBUI Q3: injectable, NullActivityLog default) ------
+
+    async def build_activity_log(self) -> ActivityLog:
+        """Wire the append-only activity log (WEBUI Q3).
+
+        Returns a :class:`~mnemozine.activity.NullActivityLog` (a no-op) **by
+        default**, so every existing pipeline call site and the 442-test suite are
+        unaffected — the log is strictly opt-in. When ``web.enable_activity_log``
+        is set it returns a persisted :class:`~mnemozine.activity.FalkorDBActivityLog`
+        over the **same** storage connection (the ``GraphitiClient`` the backend
+        already holds), never a new source of truth; if that connection cannot be
+        reached it falls back to an in-memory log. Memoized like the other layers.
+        """
+
+        if self._activity is None:
+            from mnemozine.activity.log import build_activity_log
+
+            client: object | None = None
+            if self.settings.web.enable_activity_log:
+                storage = await self.build_storage()
+                client = getattr(storage, "_client", None)
+            self._activity = build_activity_log(
+                enable=self.settings.web.enable_activity_log,
+                client=client,
+            )
+        return self._activity
 
     async def build_retriever(self) -> Retriever:
         """Wire the scoped retriever over the connected storage backend (FR-RET-*)."""
@@ -397,3 +426,29 @@ def run_eval() -> None:
     from mnemozine.evals.cli import app as eval_app
 
     eval_app()
+
+
+# ---------------------------------------------------------------------------
+# mnemozine-web — the operator console WebUI (WEBUI PRD)
+# ---------------------------------------------------------------------------
+
+
+def run_web() -> None:
+    """Console-script entrypoint for ``mnemozine-web`` (the operator console).
+
+    Wires the live :class:`Container` into the FastAPI app
+    (:func:`mnemozine.web.create_app`) and serves it with uvicorn, bound to the
+    configured ``web.host`` / ``web.port`` (localhost by default — never expose
+    publicly, Q5). The container is shared with the app so every route goes
+    through the existing ``StorageBackend`` / retriever / maintenance / evals —
+    the UI is never a new source of truth (WEBUI PRD §2).
+    """
+
+    import uvicorn
+
+    from mnemozine.web import create_app
+
+    container = Container.from_env()
+    app = create_app(container)
+    cfg = container.settings.web
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level=container.settings.log_level.lower())

@@ -27,8 +27,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from mnemozine.activity import emit, injection_event
 from mnemozine.config import Settings, get_settings
 from mnemozine.interfaces import (
+    ActivityLog,
     InjectionIndex,
     RetrievalContext,
     RetrievedMemory,
@@ -73,10 +75,15 @@ class ScopedRetriever:
         *,
         settings: Settings | None = None,
         default_project: str | None = None,
+        activity_log: ActivityLog | None = None,
     ) -> None:
         self._storage = storage
         self._settings = settings or get_settings()
         self._default_project = default_project
+        # Optional WEBUI Q3 observability seam: build_index records the injection
+        # it surfaced on the activity feed. Defaults to None so the existing
+        # retrieval path is unchanged; emit() fast-paths None / NullActivityLog.
+        self._activity_log = activity_log
 
     # -- scope composition (FR-RET-2) --------------------------------------
 
@@ -248,13 +255,51 @@ class ScopedRetriever:
         )
         text, est = render_index(parts, token_budget=budget)
 
-        return InjectionIndex(
+        index = InjectionIndex(
             text=text,
             token_estimate=est,
             preference_count=len(preferences),
             project_fact_count=len(project_facts),
             idea_seed_hints=idea_hints,
             entity_tags=entity_tags,
+        )
+        self._emit_injection(context, candidates, index)
+        return index
+
+    def _emit_injection(
+        self,
+        context: RetrievalContext,
+        candidates: Sequence[RetrievedMemory],
+        index: InjectionIndex,
+    ) -> None:
+        """Record a surfaced injection index on the activity feed (WEBUI Q3, FR-RET-3/5).
+
+        Null-safe + error-swallowing (:func:`emit`); a no-op unless an activity log
+        is wired through the constructor, so the SessionStart/mid-session injection
+        path is unchanged. This is observability only — it does **not** record
+        access (``build_index`` must not, per the FR-MNT-3 decay-ranking contract).
+        """
+
+        ref_ids = [r.memory.id for r in candidates]
+        emit(
+            self._activity_log,
+            injection_event(
+                session_id=None,
+                project=context.project,
+                summary=(
+                    f"injection index surfaced: {index.preference_count} preference(s), "
+                    f"{index.project_fact_count} project fact(s), "
+                    f"{len(index.idea_seed_hints)} idea hint(s) (~{index.token_estimate} tok)"
+                ),
+                ref_memory_ids=ref_ids,
+                detail={
+                    "preference_count": index.preference_count,
+                    "project_fact_count": index.project_fact_count,
+                    "idea_seed_hints": list(index.idea_seed_hints),
+                    "entity_tags": list(index.entity_tags),
+                    "token_estimate": index.token_estimate,
+                },
+            ),
         )
 
     # -- FR-RET-4 recall ---------------------------------------------------
