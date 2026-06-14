@@ -110,6 +110,14 @@ The `mnemozine` app mounts the host Claude Code config dir read-only at `/claude
 for its ingest component (FR-ING-2). Override the host path with
 `HOST_CLAUDE_CONFIG_DIR` (defaults to `$HOME/.claude`).
 
+**Host-user mapping (so the mount is readable).** `~/.claude/projects` is usually
+mode `700`, owned by your login user — a non-root container can't read it. So the
+`mnemozine` and `mnemozine-ingest` compose services run as `${MNEMOZINE_UID:-1000}:${MNEMOZINE_GID:-1000}`,
+which is the typical single-user Linux uid and works out of the box. If `id -u` /
+`id -g` differ on your host, set `MNEMOZINE_UID` / `MNEMOZINE_GID` in `.env`.
+(On k8s you instead control this via volume ownership / `fsGroup`, or run ingest
+off-cluster — see the split deployment below.)
+
 ---
 
 ## Helm chart (homelab k8s)

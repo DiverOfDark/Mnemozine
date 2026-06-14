@@ -162,6 +162,12 @@ services:
     <<: [*mnemozine-image, *mnemozine-env]
     restart: unless-stopped
     command: ["mnemozine"]
+    # Run AS THE HOST USER so the read-only ~/.claude bind mount (typically mode
+    # 700, owned by your login user) is readable by the in-container ingest
+    # watcher. Defaults to uid/gid 1000 (the usual single-user Linux login). If
+    # your host user differs, set MNEMOZINE_UID/MNEMOZINE_GID in .env (`id -u`,
+    # `id -g`). The image is otherwise non-root (uid 10001); this just remaps it.
+    user: "${MNEMOZINE_UID:-1000}:${MNEMOZINE_GID:-1000}"
     # Graceful shutdown: run_all traps SIGTERM (compose's default stop signal).
     stop_signal: SIGTERM
     stop_grace_period: 30s
@@ -183,6 +189,9 @@ services:
       MNEMOZINE_MCP_PORT: ${MNEMOZINE_MCP_PORT:-8765}
       # Inside the container the Claude Code transcripts live at /claude.
       MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR: /claude
+      # Running as an arbitrary host uid (user: above) means no baked-in home
+      # dir; give libraries a writable HOME for any caches.
+      HOME: /tmp
     ports:
       # WebUI + /mcp share this one port (8765 by default).
       - "${MNEMOZINE_WEB__PORT:-8765}:8765"

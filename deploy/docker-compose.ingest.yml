@@ -45,12 +45,18 @@ services:
     <<: *mnemozine-image
     restart: unless-stopped
     command: ["mnemozine-ingest"]
+    # Run AS THE HOST USER so the read-only ~/.claude bind mount (mode 700, owned
+    # by your login user) is readable. Defaults to uid/gid 1000; override via
+    # MNEMOZINE_UID/MNEMOZINE_GID in .env (`id -u`, `id -g`) if your user differs.
+    user: "${MNEMOZINE_UID:-1000}:${MNEMOZINE_GID:-1000}"
     # Remote endpoints come from the repo-root .env (NOT overridden here).
     env_file:
       - ../.env
     environment:
       # Inside the container the transcripts live at /claude (mounted below).
       MNEMOZINE_INGEST__CLAUDE_CONFIG_DIR: /claude
+      # Arbitrary-uid run: give libraries a writable HOME for caches.
+      HOME: /tmp
     volumes:
       - ${HOST_CLAUDE_CONFIG_DIR:-${HOME}/.claude}:/claude:ro
     healthcheck:
