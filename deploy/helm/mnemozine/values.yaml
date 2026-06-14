@@ -16,11 +16,12 @@ commonAnnotations: {}
 imagePullSecrets: []
 
 # =============================================================================
-# Mnemozine application image (shared by mcp / ingest / maintenance).
-# The only difference between the three workloads is the console_script run.
+# Mnemozine application image (shared by mcp / ingest / maintenance / web).
+# The only difference between the workloads is the console_script run.
+# Published by the GitHub "Publish" workflow to GHCR on each v* tag.
 # =============================================================================
 image:
-  repository: mnemozine
+  repository: ghcr.io/diverofdark/mnemozine
   tag: ""          # defaults to .Chart.AppVersion when empty
   pullPolicy: IfNotPresent
 

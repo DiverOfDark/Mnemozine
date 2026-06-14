@@ -11,12 +11,35 @@
 #
 # The same image backs every Mnemozine service; the docker-compose / Helm layers
 # pick the console_script to run via `command:` (mnemozine-mcp / mnemozine-ingest
-# / mnemozine-maintenance / mnemozine-eval), all declared in pyproject [project.scripts].
+# / mnemozine-maintenance / mnemozine-eval / mnemozine-web), all declared in
+# pyproject [project.scripts]. Stage 0 builds the React SPA that mnemozine-web
+# serves; it is bundled into the runtime image at MNEMOZINE_WEB__STATIC_DIR.
+
+# ---------------------------------------------------------------------------
+# Global build args — declared before the first FROM so every stage's FROM can
+# reference them (an ARG declared inside a stage is not visible to later FROMs).
+# ---------------------------------------------------------------------------
+ARG NODE_VERSION=20
+ARG PYTHON_VERSION=3.11
+
+# ---------------------------------------------------------------------------
+# Stage 0 — frontend (build the React/Vite operator-console SPA)
+# ---------------------------------------------------------------------------
+FROM node:${NODE_VERSION}-slim AS frontend
+
+WORKDIR /web
+# Install from the lockfile first (cached across source-only changes).
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web/ ./
+# Build to /web/dist. The repo's vite config targets ../mnemozine/web/static for
+# local dev; here we override --outDir so the output is self-contained in this
+# stage and copied explicitly into the runtime image below.
+RUN npm run build -- --outDir dist --emptyOutDir
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder
 # ---------------------------------------------------------------------------
-ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 # uv: a fast, drop-in pip/venv replacement. Copied from the official image so we
@@ -60,13 +83,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       "httpx>=0.27" \
       "watchfiles>=0.24" \
       "apscheduler>=3.10,<4" \
-      "typer>=0.26"
+      "typer>=0.26" \
+      "fastapi>=0.115" \
+      "uvicorn[standard]>=0.30"
 
 # 2) Now copy the source and install the project itself (provides the
-#    console_scripts: mnemozine-mcp / -ingest / -maintenance / -eval).
+#    console_scripts: mnemozine-mcp / -ingest / -maintenance / -eval / -web).
+#    Installed WITH deps (no --no-deps) so pyproject [project.dependencies] is the
+#    single source of truth — anything missing from the pre-warm list above is
+#    resolved here, and the warm cache makes it nearly free.
 COPY mnemozine ./mnemozine
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python /opt/venv/bin/python --no-deps .
+    uv pip install --python /opt/venv/bin/python .
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -84,12 +112,17 @@ RUN apt-get update \
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MNEMOZINE_WEB__STATIC_DIR=/app/mnemozine/web/static
 
 # Bring over the fully-built virtualenv and the package source.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /app/mnemozine /app/mnemozine
 COPY pyproject.toml README.md /app/
+
+# Bundle the built SPA so `mnemozine-web` serves the operator console out of the
+# box (served from MNEMOZINE_WEB__STATIC_DIR; ignored by the other services).
+COPY --from=frontend /web/dist /app/mnemozine/web/static
 
 WORKDIR /app
 USER mnemozine

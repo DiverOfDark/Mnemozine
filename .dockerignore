@@ -1,5 +1,5 @@
-# Keep the build context small and reproducible. The Dockerfile only needs
-# pyproject.toml, README.md and the mnemozine/ package.
+# Keep the build context small and reproducible. The Dockerfile needs
+# pyproject.toml, README.md, the mnemozine/ package, and web/ (SPA source).
 .git
 .gitignore
 .venv
@@ -41,3 +41,10 @@ tests
 
 # deploy artifacts (avoid recursive context)
 deploy
+
+# frontend build artifacts — the SPA is built fresh in the node stage; keep the
+# web/ source in context but never ship local installs/builds.
+web/node_modules
+web/dist
+mnemozine/web/static
+docs/webui-screenshots
