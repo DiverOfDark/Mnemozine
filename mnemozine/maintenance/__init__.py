@@ -15,6 +15,10 @@ module's concrete code):
   by recency + access frequency; sink + archive, **never hard-delete**.
 * :class:`~mnemozine.maintenance.entity_resolution.EntityResolutionJob` —
   FR-MNT-4 duplicate-entity merge + low-weight edge pruning + node-degree cap.
+* :class:`~mnemozine.maintenance.migrate_index.MigrateIndexJob` — OQ3 vector
+  index/re-embed migration on an embedding-dimension change (the
+  ``mnemozine-maintenance migrate-index`` subcommand); not in the default
+  scheduled set (operator-triggered).
 * :class:`~mnemozine.maintenance.audit.AuditJob` — the R5 audit walk.
 * :class:`~mnemozine.maintenance.runner.MaintenanceRunner` — the APScheduler
   cron runner (FR-MNT-5), idempotent and safe to re-run, plus the
@@ -30,6 +34,7 @@ from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob, decay_score, rank_by_decay
 from mnemozine.maintenance.decision import WriteDecider, WriteDecisionConfig
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.migrate_index import MigrateIndexJob, needs_migration
 from mnemozine.maintenance.runner import (
     MaintenanceRunner,
     build_default_jobs,
@@ -43,11 +48,13 @@ __all__ = [
     "DecayJob",
     "EntityResolutionJob",
     "MaintenanceRunner",
+    "MigrateIndexJob",
     "WriteDecider",
     "WriteDecisionConfig",
     "build_default_jobs",
     "decay_score",
     "maintenance_cli",
+    "needs_migration",
     "rank_by_decay",
     "run_maintenance",
 ]

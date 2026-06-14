@@ -67,7 +67,11 @@ services:
   # FalkorDB — single graph + vector store (FR-STO-2). Redis-protocol on 6379.
   # -------------------------------------------------------------------------
   falkordb:
-    image: ${FALKORDB_IMAGE:-falkordb/falkordb:v4.2.2}
+    # Explicit, non-floating pin (matches falkordb/falkordb:latest digest as of
+    # 2026-06-10). Verified to support `CALL db.idx.vector.queryNodes` — the
+    # index-backed KNN seam FR-RET-2 depends on (graph module ver 41810, Redis
+    # 8.6.3). Do not float this to `latest`; bump deliberately + re-run the probe.
+    image: ${FALKORDB_IMAGE:-falkordb/falkordb:v4.18.10}
     restart: unless-stopped
     ports:
       - "${FALKORDB_PORT:-6379}:6379"

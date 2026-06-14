@@ -349,6 +349,17 @@ class StorageBackend(Protocol):
         A re-embed maintenance job iterates the relevant tier (see
         :meth:`iter_memories`) and calls this per unit. Idempotent: re-embedding
         an already-current unit is a no-op write. Returns the updated unit.
+
+        OQ3 ``migrate-index`` note: the re-embedding strategy needs no *new*
+        StorageBackend method beyond this one. The command compares the
+        configured ``embedding.dimensions`` against the live FalkorDB vector
+        index dimension; if they differ it recreates the index at the new width
+        through the existing ``GraphitiClient.ensure_vector_index`` seam (already
+        idempotent against the ``dimensions`` config) and then drives the full
+        hot-tier re-embed pass by iterating :meth:`iter_memories` and calling
+        :meth:`reembed` per unit. So index migration is covered by
+        ``embedding.dimensions`` (config) + :meth:`reembed` + :meth:`iter_memories`
+        already in this contract — no contract change required.
         """
         ...
 

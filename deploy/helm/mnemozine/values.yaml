@@ -174,7 +174,11 @@ falkordb:
   enabled: true
   image:
     repository: falkordb/falkordb
-    tag: v4.2.2
+    # Explicit, non-floating pin (matches falkordb/falkordb:latest digest as of
+    # 2026-06-10). Verified to support `CALL db.idx.vector.queryNodes` — the
+    # index-backed KNN seam FR-RET-2 depends on (graph module ver 41810, Redis
+    # 8.6.3). Do not float this to `latest`; bump deliberately + re-run the probe.
+    tag: v4.18.10
     pullPolicy: IfNotPresent
   port: 6379
   graphName: mnemozine
@@ -381,10 +385,38 @@ tuning:
     claudeConfigDir: /claude        # FR-ING-2 transcript root (in-container path)
     cleanupPeriodDays: 30           # FR-ING-2 / R4
     stripToolCalls: true            # FR-ING-7
+    # --- source enablement: which IngestSource(s) the ingest loop wires up ---
+    # Claude Code is the Phase-1 default-on path (FR-ING-2); the LiteLLM gateway
+    # (FR-ING-3) and Hermes (FR-ING-4) are Phase-2 and default OFF so a fresh
+    # install needs no running gateway / Hermes VM.
+    enableClaudeCode: true          # FR-ING-2 source toggle
+    enableGateway: false            # FR-ING-3 source toggle (Phase 2)
+    enableHermes: false             # FR-ING-4 source toggle (Phase 2)
+    # --- gateway (FR-ING-3) callback queue / default project ---
+    gatewayDefaultProject: default  # fallback project for gateway turns lacking metadata
+    gatewayQueueMax: 10000          # max buffered events in the gateway callback queue
+    # --- Hermes (FR-ING-4) fronting fallback + queue / default project ---
+    # hermesBaseUrl is for the gateway-fronting fallback (direct VM
+    # instrumentation is preferred); the API key is a Secret value below.
+    hermesBaseUrl: "https://hermes-agent.nousresearch.com/"
+    hermesDefaultProject: hermes    # fallback project for Hermes turns
+    hermesQueueMax: 10000           # max buffered events in the Hermes adapter queue
+    # Hermes API key — rendered into the chart Secret (a credential), not the
+    # ConfigMap. "not-needed" for the self-hosted homelab VM; set a real key when
+    # fronting a managed endpoint. Override via --set or extraSecrets.
+    hermesApiKey: "not-needed"      # MNEMOZINE_INGEST__HERMES_API_KEY (secret)
   retrieval:
     p95LatencyTargetMs: 500         # §6.6 retrieval.p95_latency_target
     topK: 10
     neighborhoodHops: 1             # FR-RET-2 entity-neighborhood depth
+    # FR-RET-2 index-backed KNN over-fetch tuning (§6.6 "config, not constants").
+    # The backend over-fetches K = min(topK * factor, cap) from the vector index
+    # before applying the scope/tier/entity filter, so a low-selectivity scope is
+    # not starved by nearer out-of-scope neighbours; the cap bounds the index scan
+    # so a large topK can't turn it into an unbounded scan (flat-search Goal 5).
+    # Calibrate with `mnemozine-eval knn-bench` (rule: factor >= 1/in_scope_fraction).
+    knnOverfetchFactor: 10          # MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR
+    knnOverfetchCap: 512            # MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_CAP
   embedding:
     model: bge-m3                   # OQ3 embedding model
     dimensions: 1024

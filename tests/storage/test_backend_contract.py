@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from mnemozine.config import MaintenanceSettings
+from mnemozine.config import MaintenanceSettings, RetrievalSettings
 from mnemozine.interfaces import StorageBackend, WriteDecision
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
@@ -33,7 +33,12 @@ from tests.conftest import FakeEmbeddingProvider
 from tests.storage.fake_falkor import FakeGraphitiClient
 
 
-def _backend(*, contradicts=None, dedup_threshold: float | None = None) -> GraphitiStorageBackend:
+def _backend(
+    *,
+    contradicts=None,
+    dedup_threshold: float | None = None,
+    retrieval: RetrievalSettings | None = None,
+) -> GraphitiStorageBackend:
     # The shared FakeEmbeddingProvider's coarse positive-orthant vectors give a
     # high cosine (~0.92) between unrelated short strings, so tests that need the
     # supersede/no-op branches (rather than reinforce) raise the dedup threshold
@@ -48,6 +53,7 @@ def _backend(*, contradicts=None, dedup_threshold: float | None = None) -> Graph
         embeddings=FakeEmbeddingProvider(),
         contradicts=contradicts,
         maintenance=maint,
+        retrieval=retrieval,
     )
 
 
@@ -196,6 +202,72 @@ async def test_scoped_query_excludes_other_scopes() -> None:
     # querying a different project must not see p1's fact (no-leak, FR-STO-3)
     hits = await store.scoped_query("secret", [Scope.project("p2")])
     assert hits == []
+
+
+# ---------------------------------------------------------------------------
+# F3 — config-driven KNN over-fetch (retrieval.knn_overfetch_factor / _cap)
+# ---------------------------------------------------------------------------
+
+
+def _capture_knn_k(store: GraphitiStorageBackend) -> list[int]:
+    """Spy on the driver so we can read back the ``$k`` of each KNN query.
+
+    The backend emits the index-backed KNN as
+    ``CALL db.idx.vector.queryNodes(..., $k, vecf32($qv))``; the emitted ``$k``
+    is exactly what F3 makes config-driven, so the test asserts on the captured
+    ``k`` param rather than re-deriving it.
+    """
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+    real = driver.execute_query
+    seen: list[int] = []
+
+    async def _spy(cypher: str, **params):  # type: ignore[no-untyped-def]
+        if "db.idx.vector.queryNodes" in cypher and "k" in params:
+            seen.append(params["k"])
+        return await real(cypher, **params)
+
+    driver.execute_query = _spy  # type: ignore[method-assign]
+    return seen
+
+
+async def test_knn_overfetch_k_honours_configured_factor() -> None:
+    # factor 4, generous cap -> k == top_k * factor (the over-fetch multiple).
+    store = _backend(
+        retrieval=RetrievalSettings(knn_overfetch_factor=4, knn_overfetch_cap=1000)
+    )
+    seen = _capture_knn_k(store)
+    await store.scoped_query("anything", [Scope.global_()], top_k=5)
+    assert seen == [20]  # 5 * 4
+
+
+async def test_knn_overfetch_k_bounded_by_configured_cap() -> None:
+    # top_k * factor (10*10=100) exceeds the cap (32) -> clamped to the cap.
+    store = _backend(
+        retrieval=RetrievalSettings(knn_overfetch_factor=10, knn_overfetch_cap=32)
+    )
+    seen = _capture_knn_k(store)
+    await store.scoped_query("anything", [Scope.global_()], top_k=10)
+    assert seen == [32]
+
+
+async def test_knn_overfetch_k_never_below_top_k() -> None:
+    # A degenerate factor of 0 must not starve the index below top_k itself.
+    store = _backend(
+        retrieval=RetrievalSettings(knn_overfetch_factor=0, knn_overfetch_cap=1000)
+    )
+    seen = _capture_knn_k(store)
+    await store.scoped_query("anything", [Scope.global_()], top_k=7)
+    assert seen == [7]
+
+
+async def test_knn_overfetch_defaults_match_config_defaults() -> None:
+    # No RetrievalSettings supplied -> the backend uses RetrievalSettings()
+    # defaults (factor 10, cap 512), so k == top_k * 10 while under the cap.
+    store = _backend()
+    seen = _capture_knn_k(store)
+    await store.scoped_query("anything", [Scope.global_()], top_k=3)
+    assert seen == [30]  # 3 * 10, under the 512 cap
 
 
 async def test_archive_drops_off_hot_path_promote_reembeds() -> None:

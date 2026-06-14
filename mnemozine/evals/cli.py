@@ -8,6 +8,10 @@ FalkorDB/Ollama/Qwen. Commands:
                           §9 metric once; exits non-zero on any failure.
 * ``scaling``           — the headline §9 assertion: injection precision at 1x /
                           10x / 100x; exits non-zero if precision declines.
+* ``knn-bench``         — KNN over-fetch recall@k benchmark (FR-RET-2): does the
+                          configured ``retrieval.knn_overfetch_factor`` return the
+                          true in-scope top_k for a low-selectivity scope inside a
+                          large store at 1x / 10x / 100x? Exits non-zero on a drop.
 * ``bootstrap-propose`` — auto-propose extracted candidates from a backlog and
                           write the operator review sheet (PRD §9 USER-TASK).
 * ``bootstrap-finish``  — fold the operator-labeled review sheet into a gold set.
@@ -29,6 +33,7 @@ from typing import Annotated
 
 import typer
 
+from mnemozine.config import RetrievalSettings
 from mnemozine.evals.bootstrap import (
     candidates_to_gold_set,
     propose_candidates,
@@ -43,6 +48,7 @@ from mnemozine.evals.goldset import (
     load_gold_set,
     save_gold_set,
 )
+from mnemozine.evals.knn_bench import KnnBenchConfig, run_knn_overfetch_bench
 from mnemozine.evals.runner import default_inmemory_runner
 
 app = typer.Typer(
@@ -97,6 +103,80 @@ def scaling(
     runner = default_inmemory_runner(gold_set=_load(gold_path))
     report = asyncio.run(
         runner.precision_scaling(levels=parsed_levels, tolerance=tolerance)
+    )
+    typer.echo(report.render())
+    raise typer.Exit(code=0 if report.passed else 1)
+
+
+@app.command("knn-bench")
+def knn_bench(
+    gold_path: GoldOpt = None,
+    factor: Annotated[
+        int | None,
+        typer.Option(
+            "--factor",
+            help="Override retrieval.knn_overfetch_factor (default: config value, 10).",
+        ),
+    ] = None,
+    cap: Annotated[
+        int | None,
+        typer.Option(
+            "--cap",
+            help="Override retrieval.knn_overfetch_cap (default: config value, 512).",
+        ),
+    ] = None,
+    top_k: Annotated[
+        int,
+        typer.Option("--top-k", help="Retrieval depth recall@k is measured at."),
+    ] = 10,
+    in_scope_fraction: Annotated[
+        float | None,
+        typer.Option(
+            "--in-scope-fraction",
+            help=(
+                "Fraction of the store the scope holds (lower = more selective). "
+                "A scope needs factor >= 1/fraction; e.g. 0.05 starves factor=10."
+            ),
+        ),
+    ] = None,
+    levels: Annotated[
+        str,
+        typer.Option("--levels", help="Comma-separated inflation levels (default 1,10,100)."),
+    ] = ",".join(str(x) for x in DEFAULT_INFLATION_LEVELS),
+    recall_floor: Annotated[
+        float,
+        typer.Option(
+            "--recall-floor",
+            help="Minimum recall@k each level must hold (1.0 = no in-scope miss).",
+        ),
+    ] = 1.0,
+) -> None:
+    """KNN over-fetch recall@k benchmark across 1x/10x/100x (FR-RET-2, PRD §9).
+
+    Measures whether the configured ``retrieval.knn_overfetch_factor`` returns
+    the true in-scope top_k (recall@k vs an exhaustive in-process baseline) for a
+    low-selectivity scope inside a large global store. The recommended tuning
+    rule (``factor >= 1 / in_scope_fraction``) is documented in the benchmark's
+    output and module docstring. Exits non-zero if recall@k drops below the floor.
+    """
+
+    retrieval = RetrievalSettings()
+    if factor is not None:
+        retrieval.knn_overfetch_factor = factor
+    if cap is not None:
+        retrieval.knn_overfetch_cap = cap
+    parsed_levels = tuple(int(x) for x in levels.split(",") if x.strip())
+    bench_config = (
+        KnnBenchConfig(top_k=top_k, in_scope_fraction_target=in_scope_fraction)
+        if in_scope_fraction is not None
+        else KnnBenchConfig(top_k=top_k)
+    )
+    report = run_knn_overfetch_bench(
+        retrieval=retrieval,
+        gold_set=_load(gold_path),
+        config=bench_config,
+        levels=parsed_levels,
+        recall_floor=recall_floor,
     )
     typer.echo(report.render())
     raise typer.Exit(code=0 if report.passed else 1)

@@ -97,6 +97,55 @@ def test_values_cover_all_section_6_6_tuning_params() -> None:
     assert "neighborhoodHops" in t["retrieval"]
 
 
+def test_values_expose_knn_overfetch_and_ingest_source_flags() -> None:
+    """New F2 knobs: KNN over-fetch tuning + ingest source enablement flags."""
+    values = _load_yaml(VALUES_FILE)
+    t = values["tuning"]
+    # FR-RET-2 KNN over-fetch tuning.
+    assert t["retrieval"]["knnOverfetchFactor"] == 10
+    assert t["retrieval"]["knnOverfetchCap"] == 512
+    # FR-ING-2/3/4 source enablement flags (Claude default-on, others off).
+    ing = t["ingest"]
+    assert ing["enableClaudeCode"] is True
+    assert ing["enableGateway"] is False
+    assert ing["enableHermes"] is False
+    # Gateway / Hermes connection settings.
+    for key in (
+        "gatewayDefaultProject",
+        "gatewayQueueMax",
+        "hermesBaseUrl",
+        "hermesDefaultProject",
+        "hermesQueueMax",
+        "hermesApiKey",
+    ):
+        assert key in ing, f"tuning.ingest.{key} missing"
+
+
+def test_configmap_template_wires_new_knobs() -> None:
+    """Static check: the ConfigMap template references every new env var."""
+    text = (TEMPLATES_DIR / "configmap.yaml").read_text()
+    for env in (
+        "MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR",
+        "MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_CAP",
+        "MNEMOZINE_INGEST__ENABLE_CLAUDE_CODE",
+        "MNEMOZINE_INGEST__ENABLE_GATEWAY",
+        "MNEMOZINE_INGEST__ENABLE_HERMES",
+        "MNEMOZINE_INGEST__GATEWAY_DEFAULT_PROJECT",
+        "MNEMOZINE_INGEST__GATEWAY_QUEUE_MAX",
+        "MNEMOZINE_INGEST__HERMES_BASE_URL",
+        "MNEMOZINE_INGEST__HERMES_DEFAULT_PROJECT",
+        "MNEMOZINE_INGEST__HERMES_QUEUE_MAX",
+    ):
+        assert env in text, f"{env} not wired into ConfigMap template"
+    # The Hermes API key is a credential -> Secret, NOT the ConfigMap.
+    assert "MNEMOZINE_INGEST__HERMES_API_KEY" not in text
+
+
+def test_secret_template_wires_hermes_api_key() -> None:
+    text = (TEMPLATES_DIR / "secret.yaml").read_text()
+    assert "MNEMOZINE_INGEST__HERMES_API_KEY" in text
+
+
 def test_falkordb_has_persistence_values() -> None:
     values = _load_yaml(VALUES_FILE)
     persistence = values["falkordb"]["persistence"]
@@ -167,6 +216,48 @@ def test_helm_template_wires_tuning_into_configmap() -> None:
     assert data["MNEMOZINE_CROSSREF__RELEVANCE_THRESHOLD"] == "0.8"
     # Endpoint resolves to the in-cluster FalkorDB Service name.
     assert "falkordb" in data["MNEMOZINE_FALKORDB__URL"]
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_renders_knn_and_ingest_flags() -> None:
+    out = _helm_template()
+    for d in yaml.safe_load_all(out):
+        if (
+            d
+            and d.get("kind") == "ConfigMap"
+            and "MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR" in d.get("data", {})
+        ):
+            data = d["data"]
+            assert data["MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR"] == "10"
+            assert data["MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_CAP"] == "512"
+            assert data["MNEMOZINE_INGEST__ENABLE_CLAUDE_CODE"] == "true"
+            assert data["MNEMOZINE_INGEST__ENABLE_GATEWAY"] == "false"
+            assert data["MNEMOZINE_INGEST__ENABLE_HERMES"] == "false"
+            assert "MNEMOZINE_INGEST__HERMES_API_KEY" not in data
+            return
+    pytest.fail("KNN/ingest-flag env not rendered into the ConfigMap")
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_overrides_knn_overfetch_factor() -> None:
+    out = _helm_template("tuning.retrieval.knnOverfetchFactor=40")
+    key = "MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR"
+    for d in yaml.safe_load_all(out):
+        if d and d.get("kind") == "ConfigMap" and key in d.get("data", {}):
+            assert d["data"][key] == "40"
+            return
+    pytest.fail("knnOverfetchFactor override did not propagate")
+
+
+@pytest.mark.skipif(HELM is None, reason="helm binary not available")
+def test_helm_template_hermes_api_key_in_secret() -> None:
+    out = _helm_template()
+    for d in yaml.safe_load_all(out):
+        if d and d.get("kind") == "Secret":
+            sd = d.get("stringData") or {}
+            if "MNEMOZINE_INGEST__HERMES_API_KEY" in sd:
+                return
+    pytest.fail("Hermes API key not rendered into the chart Secret")
 
 
 @pytest.mark.skipif(HELM is None, reason="helm binary not available")

@@ -53,10 +53,28 @@ data:
   MNEMOZINE_INGEST__CLEANUP_PERIOD_DAYS: {{ .Values.tuning.ingest.cleanupPeriodDays | quote }}
   MNEMOZINE_INGEST__STRIP_TOOL_CALLS: {{ .Values.tuning.ingest.stripToolCalls | quote }}
 
+  # --- Ingest source enablement (FR-ING-2/3/4) ---
+  MNEMOZINE_INGEST__ENABLE_CLAUDE_CODE: {{ .Values.tuning.ingest.enableClaudeCode | quote }}
+  MNEMOZINE_INGEST__ENABLE_GATEWAY: {{ .Values.tuning.ingest.enableGateway | quote }}
+  MNEMOZINE_INGEST__ENABLE_HERMES: {{ .Values.tuning.ingest.enableHermes | quote }}
+
+  # --- Gateway source (FR-ING-3) callback queue / default project ---
+  MNEMOZINE_INGEST__GATEWAY_DEFAULT_PROJECT: {{ .Values.tuning.ingest.gatewayDefaultProject | quote }}
+  MNEMOZINE_INGEST__GATEWAY_QUEUE_MAX: {{ .Values.tuning.ingest.gatewayQueueMax | quote }}
+
+  # --- Hermes source (FR-ING-4) fronting fallback / queue / default project ---
+  # (HERMES_API_KEY is a credential -> rendered into the chart Secret.)
+  MNEMOZINE_INGEST__HERMES_BASE_URL: {{ .Values.tuning.ingest.hermesBaseUrl | quote }}
+  MNEMOZINE_INGEST__HERMES_DEFAULT_PROJECT: {{ .Values.tuning.ingest.hermesDefaultProject | quote }}
+  MNEMOZINE_INGEST__HERMES_QUEUE_MAX: {{ .Values.tuning.ingest.hermesQueueMax | quote }}
+
   # --- Retrieval (FR-RET-2, §6.6) ---
   MNEMOZINE_RETRIEVAL__P95_LATENCY_TARGET_MS: {{ .Values.tuning.retrieval.p95LatencyTargetMs | quote }}
   MNEMOZINE_RETRIEVAL__TOP_K: {{ .Values.tuning.retrieval.topK | quote }}
   MNEMOZINE_RETRIEVAL__NEIGHBORHOOD_HOPS: {{ .Values.tuning.retrieval.neighborhoodHops | quote }}
+  # FR-RET-2 index-backed KNN over-fetch tuning (calibrate via mnemozine-eval knn-bench).
+  MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_FACTOR: {{ .Values.tuning.retrieval.knnOverfetchFactor | quote }}
+  MNEMOZINE_RETRIEVAL__KNN_OVERFETCH_CAP: {{ .Values.tuning.retrieval.knnOverfetchCap | quote }}
 
   # --- MCP server (FR-RET-1) ---
   MNEMOZINE_MCP_HOST: {{ .Values.mcp.host | quote }}

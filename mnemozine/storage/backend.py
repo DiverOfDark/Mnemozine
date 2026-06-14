@@ -37,7 +37,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from mnemozine.config import MaintenanceSettings, get_settings
+from mnemozine.config import MaintenanceSettings, RetrievalSettings, get_settings
 from mnemozine.interfaces import (
     EmbeddingProvider,
     Neighbor,
@@ -76,7 +76,10 @@ ContradictsFn = Callable[[MemoryUnit, list[MemoryUnit]], Awaitable[list[MemoryUn
 # scope/tier/entity WHERE *after* the KNN cut, so we over-fetch K to avoid the
 # post-filter being starved by nearer out-of-scope neighbours, bounded by an
 # absolute cap so a large top_k can't ask the index for an effectively unbounded
-# scan (which would defeat the flat-search-space goal).
+# scan (which would defeat the flat-search-space goal). These are now config-driven
+# (``retrieval.knn_overfetch_factor`` / ``retrieval.knn_overfetch_cap``, §6.6
+# "config, not constants"); the module constants below are only the fallback
+# defaults used when no ``RetrievalSettings`` is supplied.
 _KNN_OVERFETCH = 10
 _KNN_MAX_K = 512
 
@@ -137,11 +140,16 @@ class GraphitiStorageBackend:
         *,
         contradicts: ContradictsFn | None = None,
         maintenance: MaintenanceSettings | None = None,
+        retrieval: RetrievalSettings | None = None,
     ) -> None:
         self._client = client
         self._embeddings = embeddings
         self._contradicts = contradicts or _no_contradictions
         self._maint = maintenance or get_settings().maintenance
+        # FR-RET-2 KNN over-fetch tuning (§6.6 config, not constants). Falls back
+        # to the module-level defaults when no RetrievalSettings is supplied so
+        # existing call sites / fakes keep working.
+        self._retrieval = retrieval or RetrievalSettings()
 
     # -- result normalization -------------------------------------------------
 
@@ -457,8 +465,10 @@ class GraphitiStorageBackend:
 
         # Over-fetch K so the post-KNN scope/tier/entity filter is not starved by
         # nearer out-of-scope neighbours; bound it so a huge top_k can't ask the
-        # index for an unbounded scan.
-        knn_k = min(max(top_k * _KNN_OVERFETCH, top_k), _KNN_MAX_K)
+        # index for an unbounded scan. Both knobs are config-driven (§6.6).
+        overfetch = self._retrieval.knn_overfetch_factor
+        cap = self._retrieval.knn_overfetch_cap
+        knn_k = min(max(top_k * overfetch, top_k), cap)
         knn_cypher = (
             f"CALL db.idx.vector.queryNodes("
             f"'{MEMORY_LABEL}', 'embedding', $k, vecf32($qv)) "
@@ -815,7 +825,7 @@ class GraphitiStorageBackend:
             f"MATCH (b:{ENTITY_LABEL} {{id: $to_entity}}) "
             f"CREATE (a)-[r:{RELATES_TYPE} {{id: $id, from_entity: $from_entity, "
             "to_entity: $to_entity, relation: $relation, weight: $weight, "
-            "valid_from: $valid_from, valid_to: $valid_to}}]->(b) RETURN r",
+            "valid_from: $valid_from, valid_to: $valid_to}]->(b) RETURN r",
             **self._edge_props(edge),
         )
         return edge

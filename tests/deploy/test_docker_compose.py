@@ -79,6 +79,27 @@ def test_falkordb_has_named_persistence_volume() -> None:
     ), "falkordb does not mount the falkordb-data volume at /data"
 
 
+def test_falkordb_image_is_pinned_to_verified_tag() -> None:
+    """FalkorDB is pinned to an explicit, non-floating tag verified to support the
+    index-backed KNN seam FR-RET-2 depends on (``CALL db.idx.vector.queryNodes``).
+
+    The Live phase verified ``v4.18.10`` (graph module ver 41810, Redis 8.6.3 —
+    identical digest to ``falkordb/falkordb:latest`` on 2026-06-10) runs the
+    queryNodes probe. The tag must NOT float to ``latest``/``edge`` so a deploy
+    can't silently land on an image without the vector index. Bump deliberately
+    and re-run the probe.
+    """
+    compose = _load_compose()
+    image = compose["services"]["falkordb"]["image"]
+    # short-form is `${FALKORDB_IMAGE:-falkordb/falkordb:<tag>}`; take the default.
+    default = image.split(":-", 1)[1].rstrip("}") if ":-" in image else image
+    assert default == "falkordb/falkordb:v4.18.10", (
+        f"FalkorDB image default must be the verified pin, got {default!r}"
+    )
+    tag = default.rsplit(":", 1)[1]
+    assert tag not in {"latest", "edge"}, f"FalkorDB tag must not float: {tag!r}"
+
+
 def test_every_long_running_service_has_a_healthcheck() -> None:
     """Healthchecks on every long-running service.
 

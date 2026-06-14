@@ -41,6 +41,7 @@ from mnemozine.maintenance.audit import AuditJob
 from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.migrate_index import MigrateIndexJob
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,62 @@ def _cmd_serve() -> None:
         asyncio.run(runner.serve_forever())
     except (KeyboardInterrupt, asyncio.CancelledError):  # graceful Ctrl-C
         typer.echo("mnemozine-maintenance: scheduler stopped.")
+
+
+async def _run_migrate_index(*, force: bool) -> MaintenanceReport:
+    """Build the wired migrate-index job from the live container and run it (OQ3).
+
+    The job needs the FalkorDB vector-index admin seam, which lives on the
+    :class:`~mnemozine.storage.graphiti_client.GraphitiClient` composed inside the
+    storage backend. ``GraphitiStorageBackend`` exposes that client as ``_client``;
+    we read it back here rather than threading a new public accessor, keeping the
+    OQ3 path within the existing contract (no StorageBackend Protocol change).
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    embeddings = container.build_embedding_provider()
+    index_admin = getattr(storage, "_client", None)
+    if index_admin is None:  # pragma: no cover - only a mis-wired backend hits this
+        raise RuntimeError(
+            "migrate-index requires the Graphiti/FalkorDB backend (no vector-index "
+            "admin seam on the configured storage backend)."
+        )
+    job = MigrateIndexJob(
+        storage, index_admin, embeddings, settings=settings, force=force
+    )
+    try:
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("migrate-index")
+def _cmd_migrate_index(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Re-embed the hot tier even when the index dimension is unchanged "
+            "(use after an embedding MODEL change that kept the same width)."
+        ),
+    ),
+) -> None:
+    """Migrate the vector index + re-embed on an embedding dimension change (OQ3).
+
+    Detects a configured-vs-actual vector-index dimension mismatch, drops +
+    recreates the FalkorDB vector index at the configured width, and re-embeds all
+    hot memories through the embedding provider. Idempotent and safe to re-run: a
+    no-op when the dimension already matches (unless ``--force``).
+    """
+
+    report = asyncio.run(_run_migrate_index(force=force))
+    typer.echo(f"[{report.job_name}] reembedded={report.consolidated}")
+    for note in report.notes:
+        typer.echo(f"    - {note}")
 
 
 def run_maintenance() -> None:

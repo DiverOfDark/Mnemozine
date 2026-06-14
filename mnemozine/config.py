@@ -225,6 +225,61 @@ class MaintenanceSettings(BaseModel):
 class IngestSettings(BaseModel):
     """Ingestion-layer settings (FR-ING-*, §6.6)."""
 
+    # --- source enablement (which sources the ingest loop wires up) ---------
+    # The ingest loop (app.py `_run_ingest`) consults these to decide which
+    # IngestSource(s) to wire into the source -> chunk -> extract -> store
+    # pipeline. Claude Code is the Phase-1 default-on path (FR-ING-2); the
+    # gateway (FR-ING-3) and Hermes (FR-ING-4) are Phase-2 and default off so a
+    # fresh install does not require a running LiteLLM proxy or Hermes VM.
+    enable_claude_code: bool = Field(
+        default=True,
+        description="Enable the Claude Code JSONL watcher source (FR-ING-2); on by default.",
+    )
+    enable_gateway: bool = Field(
+        default=False,
+        description="Enable the LiteLLM gateway source (FR-ING-3); off by default (Phase 2).",
+    )
+    enable_hermes: bool = Field(
+        default=False,
+        description="Enable the Hermes ingestion source (FR-ING-4). Off by default (Phase 2).",
+    )
+
+    # --- gateway (FR-ING-3) connection / queue settings ---------------------
+    # The in-process GatewayCallback buffers emitted events on an asyncio.Queue
+    # and stamps a default `project` when an agent does not thread one through
+    # LiteLLM metadata. These let the ingest loop construct it without magic
+    # numbers; the model base_url(s) themselves live in the LiteLLM proxy
+    # config.yaml (os.environ/MNEMOZINE_GATEWAY_*), not here.
+    gateway_default_project: str = Field(
+        default="default",
+        description="Fallback `project` for gateway turns lacking LiteLLM metadata (FR-ING-3).",
+    )
+    gateway_queue_max: int = Field(
+        default=10_000,
+        description="Max buffered events in the in-process gateway callback queue (FR-ING-3).",
+    )
+
+    # --- Hermes (FR-ING-4) connection / queue settings ----------------------
+    # Direct VM instrumentation is preferred (HermesAdapter, an in-process
+    # queue); `hermes_base_url` is for the fallback path that FRONTS Hermes'
+    # OpenAI-compatible endpoint through the gateway (hermes_gateway_source).
+    hermes_base_url: str = Field(
+        default="https://hermes-agent.nousresearch.com/",
+        description="Hermes OpenAI-compatible base URL for the FR-ING-4 gateway-fronting fallback.",
+    )
+    hermes_api_key: str = Field(
+        default="not-needed",
+        description="API key for the Hermes endpoint when fronted via the gateway (FR-ING-4).",
+    )
+    hermes_default_project: str = Field(
+        default="hermes",
+        description="Fallback `project` for Hermes turns lacking an explicit project (FR-ING-4).",
+    )
+    hermes_queue_max: int = Field(
+        default=10_000,
+        description="Max buffered events in the in-process Hermes adapter queue (FR-ING-4).",
+    )
+
     # §6.6 `chunk.max_size` — episode size, calibrate vs Qwen context (FR-ING-6).
     chunk_max_chars: int = Field(
         default=8000,
@@ -280,6 +335,21 @@ class RetrievalSettings(BaseModel):
             "Entity-neighborhood traversal depth (hops) for FR-RET-2 scoped "
             "retrieve; bounds the searched subset."
         ),
+    )
+    # FR-RET-2 index-backed KNN over-fetch tuning (§6.6 "config, not constants").
+    # FalkorDB's `db.idx.vector.queryNodes` applies the scope/tier/entity WHERE
+    # *after* the KNN cut, so the backend over-fetches K = top_k * factor so the
+    # post-filter is not starved by nearer out-of-scope neighbours, bounded by an
+    # absolute cap so a large top_k can't ask the index for an effectively
+    # unbounded scan (which would defeat the flat-search-space Goal-5). Previously
+    # hard-coded as `_KNN_OVERFETCH`/`_KNN_MAX_K` in storage/backend.py.
+    knn_overfetch_factor: int = Field(
+        default=10,
+        description="KNN over-fetch multiple of top_k before the scope/tier filter (FR-RET-2).",
+    )
+    knn_overfetch_cap: int = Field(
+        default=512,
+        description="Absolute cap on the over-fetched KNN K, bounding the index scan (FR-RET-2).",
     )
 
 

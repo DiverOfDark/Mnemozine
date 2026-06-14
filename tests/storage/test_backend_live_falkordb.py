@@ -29,6 +29,8 @@ import pytest
 from mnemozine.config import FalkorDBSettings, MaintenanceSettings
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
+    Edge,
+    Entity,
     MemoryType,
     MemoryUnit,
     Provenance,
@@ -224,3 +226,39 @@ async def test_scoped_query_emits_index_backed_knn_cypher(
     assert "vecf32(" in knn[0]
     # The index name the client created is the one being queried (label-based).
     assert MEMORY_VECTOR_INDEX  # name is exported for ops reference
+
+
+async def test_upsert_edge_create_and_reassert_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """Edge CREATE + re-assert run against REAL FalkorDB (relationship write path).
+
+    Regression guard: the in-process fake does not parse Cypher, so a malformed
+    relationship-CREATE statement (an unbalanced property-map brace) passed every
+    offline contract test yet was rejected by real FalkorDB the moment a real
+    extraction emitted a relationship (the FR-EXT/FR-ING 4-way write calls
+    ``upsert_edge``). This exercises the create path live, asserts the edge is
+    readable back, and that a re-assert bumps the weight rather than erroring or
+    duplicating.
+    """
+
+    a = Entity(canonical_name="black", type="tool")
+    b = Entity(canonical_name="python", type="language")
+    await live_backend.upsert_entity(a)
+    await live_backend.upsert_entity(b)
+
+    edge = Edge(from_entity=a.id, to_entity=b.id, relation="formats", weight=1.0)
+    created = await live_backend.upsert_edge(edge)
+    assert created.from_entity == a.id and created.to_entity == b.id
+
+    # The edge is readable back from the real graph (proves the CREATE landed).
+    incident = await live_backend.edges_for_entity(a.id)
+    assert any(e.relation == "formats" for e in incident), incident
+
+    # Re-asserting the same active relation bumps the weight (no duplicate, no error).
+    reassert = await live_backend.upsert_edge(
+        Edge(from_entity=a.id, to_entity=b.id, relation="formats", weight=2.5)
+    )
+    assert reassert.weight == pytest.approx(2.5)
+    incident2 = await live_backend.edges_for_entity(a.id)
+    assert sum(1 for e in incident2 if e.relation == "formats") == 1, incident2

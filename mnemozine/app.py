@@ -116,6 +116,7 @@ class Container:
                 embeddings,
                 contradicts=make_contradiction_fn(self.build_llm_provider()),
                 maintenance=self.settings.maintenance,
+                retrieval=self.settings.retrieval,
             )
         return self._storage
 
@@ -203,18 +204,26 @@ ingest_app = typer.Typer(help="Mnemozine ingestion service (FR-ING-*).", add_com
 
 
 async def _run_ingest(container: Container, *, backfill: bool) -> None:
-    """Consume the Claude Code source, chunking + extracting + storing (FR-ING-*).
+    """Drive all enabled ingest sources into the shared pipeline (FR-ING-2/3/4).
 
     Installs the hook ``services_loader`` (so the Stop/PreCompact/SessionStart
-    hooks share this process's wired retriever + ingest service) and then drives
-    the source: ``backfill`` replays existing transcripts once and exits;
-    otherwise ``stream`` tails new turns indefinitely. Each completed chunk is
-    extracted and persisted via the FR-MNT-1 4-way write.
+    hooks share this process's wired retriever + ingest service), builds the
+    enabled sources from the ``ingest.enable_*`` config flags (Claude Code,
+    FR-ING-3 LiteLLM gateway, FR-ING-4 Hermes), and runs them **concurrently**
+    through one shared ``ChunkAccumulator -> ingest_service`` pipeline (see
+    :mod:`mnemozine.ingestion.loop`): ``backfill`` replays each source's backlog
+    once and exits; otherwise the sources tail/stream indefinitely. Each completed
+    chunk is extracted and persisted via the FR-MNT-1 4-way write.
+
+    The gateway callback built here is the same in-process
+    :class:`~mnemozine.ingestion.gateway.callback.GatewayCallback` instance a
+    co-hosted LiteLLM proxy should register (its in-process queue is what the loop
+    drains), and the Hermes adapter is the instance the instrumented VM feeds.
     """
 
-    from mnemozine.ingestion.claude_code import ClaudeCodeSource
     from mnemozine.ingestion.claude_code.chunker import ChunkAccumulator
     from mnemozine.ingestion.claude_code.hooks import runtime as hook_runtime
+    from mnemozine.ingestion.loop import build_ingest_sources, run_ingest_loop
 
     storage = await container.build_storage()
     ingest_service = container.build_ingest_service(storage)
@@ -227,16 +236,18 @@ async def _run_ingest(container: Container, *, backfill: bool) -> None:
         settings=container.settings,
     )
 
-    source = ClaudeCodeSource(container.settings)
-    accumulator = ChunkAccumulator(container.settings.ingest)
-    events = source.backfill() if backfill else source.stream()
+    sources = build_ingest_sources(container.settings)
+    if not sources:
+        logger.warning("mnemozine-ingest: no ingest sources enabled; exiting")
+        return
+    logger.info(
+        "mnemozine-ingest: %d source(s) enabled: %s",
+        len(sources),
+        ", ".join(s.source_name for s in sources.sources),
+    )
 
-    async for event in events:
-        for chunk in accumulator.add(event):
-            await ingest_service.ingest_chunk(chunk)
-    # Flush any in-flight remainder (always for backfill; stream() never returns).
-    for chunk in accumulator.flush():
-        await ingest_service.ingest_chunk(chunk)
+    accumulator = ChunkAccumulator(container.settings.ingest)
+    await run_ingest_loop(sources, accumulator, ingest_service, backfill=backfill)
 
 
 @ingest_app.callback(invoke_without_command=True)
@@ -320,6 +331,36 @@ def _maintenance_serve_cmd() -> None:
         typer.echo("mnemozine-maintenance: scheduler stopped.")
     finally:
         asyncio.run(container.close())
+
+
+@maintenance_app.command("migrate-index")
+def _maintenance_migrate_index_cmd(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Re-embed the hot tier even when the index dimension is unchanged "
+            "(use after an embedding MODEL change that kept the same width)."
+        ),
+    ),
+) -> None:
+    """Migrate the vector index + re-embed on an embedding dimension change (OQ3).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_migrate_index` onto the live
+    ``mnemozine-maintenance`` console app so the OQ3 migration is reachable through
+    the real entrypoint (the runner's own Typer app is not wired to a script). The
+    job detects a configured-vs-actual vector-index dimension mismatch, drops +
+    recreates the FalkorDB vector index at the configured width, and re-embeds all
+    hot memories. Idempotent: a no-op when the dimension already matches (unless
+    ``--force``).
+    """
+
+    from mnemozine.maintenance.runner import _run_migrate_index
+
+    report = asyncio.run(_run_migrate_index(force=force))
+    typer.echo(f"[{report.job_name}] reembedded={report.consolidated}")
+    for note in report.notes:
+        typer.echo(f"    - {note}")
 
 
 # ---------------------------------------------------------------------------
