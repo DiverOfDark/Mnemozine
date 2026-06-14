@@ -3,15 +3,17 @@
 # Use alongside the main compose file:
 #   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.gpu.yml up -d
 #
-# Requires the NVIDIA Container Toolkit on the host (nvidia-ctk / CDI). Modern
-# Docker Compose translates the `driver: nvidia` reservation to a CDI device
-# request automatically. Without a GPU, just omit this file (Ollama runs on CPU).
+# This host exposes the GPU via CDI (nvidia-ctk; `docker info` shows
+# `cdi: nvidia.com/gpu=all`) and has NO legacy `nvidia` runtime, so we request
+# the GPU as a CDI device. On hosts with the classic nvidia runtime instead, use
+# `driver: nvidia` + `count: all`. Without a GPU, omit this file (Ollama -> CPU).
 services:
   ollama:
     deploy:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: all
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=all
               capabilities: [gpu]

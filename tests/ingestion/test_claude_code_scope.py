@@ -157,3 +157,18 @@ def test_derivation_never_yields_global_for_a_project_transcript(subseg: bool) -
         scope = derive_scope_from_transcript(path, settings)
         assert not scope.is_global
         assert scope.project_id == PROJECT
+
+
+def test_subagent_worktree_cwd_rolls_up_to_project() -> None:
+    """A subagent that ran in a git worktree (cwd = ``<project>/.claude/worktrees/<id>``)
+    rolls up to ``<project>`` — never the opaque worktree id. Regression for the
+    ``project:agent-XXXX`` scopes seen in live data: the per-event ``cwd`` is a
+    worktree whose basename is the agent id, so derivation must strip it."""
+    path = (
+        "/h/.claude/projects/-var-home-diverofdark-Projects-AppBahn2/"
+        "01bc76f7/subagents/agent-a05dd62d18ac425e8.jsonl"
+    )
+    cwd = "/var/home/diverofdark/Projects/AppBahn2/.claude/worktrees/agent-a05dd62d18ac425e8"
+    scope = derive_scope_from_transcript(path, Settings(), cwd=cwd)
+    assert scope == Scope.project("AppBahn2")
+    assert "agent-" not in scope.as_str()

@@ -75,7 +75,15 @@ def derive_project(path: str | Path, *, cwd: str | None = None) -> str:
     """
 
     if cwd:
-        name = Path(cwd).name
+        # A subagent/workflow may run in a git worktree at
+        # ``<project>/.claude/worktrees/<id>`` — the basename there is the opaque
+        # worktree id, so roll the scope up to ``<project>`` (FR-EXT-3: never an
+        # opaque ``project:agent-XXXX`` scope).
+        cwd_str = str(cwd)
+        marker = "/.claude/worktrees/"
+        if marker in cwd_str:
+            cwd_str = cwd_str.split(marker, 1)[0]
+        name = Path(cwd_str).name
         if name:
             return name
 
@@ -173,7 +181,14 @@ def derive_scope_from_transcript(
     # 2. Project name: the literal cwd leaf wins; else decode the encoded dir.
     project_name: str | None = None
     if cwd:
-        leaf = Path(cwd).name
+        # Strip a git-worktree suffix (``<project>/.claude/worktrees/<id>``) so a
+        # subagent/workflow that ran in a worktree rolls up to ``<project>``, not
+        # the opaque worktree id (FR-EXT-3: never a ``project:agent-XXXX`` scope).
+        cwd_str = str(cwd)
+        marker = "/.claude/worktrees/"
+        if marker in cwd_str:
+            cwd_str = cwd_str.split(marker, 1)[0]
+        leaf = Path(cwd_str).name
         if leaf:
             project_name = leaf
     if project_name is None and project_dir is not None:
