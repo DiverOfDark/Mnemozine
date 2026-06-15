@@ -586,6 +586,50 @@ class StoreStatsResponse(BaseModel):
     entity_count: int = 0
 
 
+class GrowthResponse(BaseModel):
+    """Store-growth trend for the Dashboard sparkline (GET /api/stats/growth).
+
+    Derived from each memory's ``valid_from`` creation timestamp (NOT the optional
+    activity log), so it reflects real existing history even when the activity log
+    is empty. The three parallel arrays are aligned and DENSE — one entry per
+    calendar day across the requested window, zero-filled for days with no new
+    memories — so the frontend renders the sparkline directly with no gap handling.
+
+    The window is anchored on a SINGLE UTC ``today`` shared by the label list and
+    the backend's ``$since`` lower bound (the route pins it once and passes it to
+    :meth:`StorageBackend.memory_growth`), so ``daily``, ``cumulative`` and
+    ``total`` are derived from one consistent day window — no UTC-midnight race can
+    drop or duplicate an edge bucket between them.
+
+    * ``days``       — ``YYYY-MM-DD`` labels, oldest-first, length == window size.
+    * ``daily``      — memories created on each ``days[i]`` (parallel, same length).
+    * ``cumulative`` — running total of ``daily`` up to and including ``days[i]``.
+    * ``total``      — sum of ``daily`` over the densified window, hence exactly
+      ``cumulative[-1]`` (memories created within the whole window). NOTE this is
+      the windowed total, NOT the whole-store memory count.
+    """
+
+    days: list[str] = Field(
+        default_factory=list,
+        description="YYYY-MM-DD day labels, oldest-first; one per day in the window.",
+    )
+    daily: list[int] = Field(
+        default_factory=list,
+        description="Memories created on each day (parallel to days, zero-filled).",
+    )
+    cumulative: list[int] = Field(
+        default_factory=list,
+        description="Running total of daily up to each day (parallel to days).",
+    )
+    total: int = Field(
+        default=0,
+        description=(
+            "Total memories created within the window: sum of daily over the "
+            "densified window, equal to cumulative[-1] (NOT the whole-store count)."
+        ),
+    )
+
+
 # Resolve forward references (MaintenanceJobStatus -> MaintenanceReportOut;
 # ScopeTreeNode -> ScopeTreeNode for the recursive children list).
 MaintenanceJobStatus.model_rebuild()
@@ -640,5 +684,6 @@ __all__ = [
     "ComponentHealth",
     "HealthResponse",
     "StoreStatsResponse",
+    "GrowthResponse",
     "ScopeKind",
 ]

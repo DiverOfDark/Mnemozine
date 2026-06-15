@@ -34,7 +34,7 @@ ranking/cosine/decision logic is real and shared.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from mnemozine.config import MaintenanceSettings, RetrievalSettings, get_settings
@@ -55,6 +55,7 @@ from mnemozine.interfaces import (
 from mnemozine.migrations import CURRENT_DATA_VERSION, record_data_version
 from mnemozine.schema.models import (
     DEFAULT_CATEGORY,
+    SCOPE_DELIMITER,
     Edge,
     Entity,
     MemoryUnit,
@@ -831,6 +832,66 @@ class GraphitiStorageBackend:
         return await self._count_by(
             f"MATCH (m:{MEMORY_LABEL}) RETURN m.scope AS k, count(m) AS n"
         )
+
+    async def memory_growth(
+        self, *, scope: Scope | None = None, days: int = 14, today: date | None = None
+    ) -> list[tuple[str, int]]:
+        """Memories created per DAY over the trailing ``days`` window (Dashboard trend).
+
+        A single grouped Cypher count over ``valid_from`` — the canonical creation
+        timestamp — never a row stream and never the embedding. ``valid_from`` is
+        stored as an ISO-8601 string that sorts lexically, so the window is bounded
+        by a ``$since`` ISO lower bound and the day key is its first 10 chars
+        (``YYYY-MM-DD``). With a NON-GLOBAL ``scope`` set, the count is filtered to
+        that exact scope OR any descendant (a scope-string prefix test using the
+        same delimiter ``scope.as_str()`` joins with) so a project rolls up its
+        sub-scopes. The GLOBAL root (``scope.segments == []``) is the universal
+        ancestor of every scope, so it (like ``scope=None``) counts the WHOLE store
+        rather than only the literal ``global`` scope. Returns ``[(day, count)]``
+        oldest-first; days with zero memories are absent (the web layer zero-fills
+        the gap).
+        """
+
+        since = self._growth_since(days, today=today)
+        where = ["m.valid_from >= $since"]
+        params: dict[str, Any] = {"since": since}
+        # Exact-or-descendant roll-up (matches Scope.is_descendant_of and the
+        # interface docstring). The GLOBAL ROOT (segments == []) is the universal
+        # ancestor of every scope, so it emits NO scope clause and counts the whole
+        # store — a string prefix test on "global" would (wrongly) match only the
+        # literal 'global' scope and exclude every 'project:*' memory.
+        if scope is not None and scope.segments:
+            # Non-global scope: the stored scope equals this scope OR starts with
+            # this scope's string + the path delimiter (so 'project:P' rolls up
+            # 'project:P/auth' but never the unrelated 'project:Pulse'). The prefix
+            # delimiter MUST be the same one scope.as_str() joins segments with, so
+            # a config-overridden delimiter keeps roll-up matching sub-scopes.
+            scope_str = scope.as_str()
+            where.append("(m.scope = $scope OR m.scope STARTS WITH $scope_prefix)")
+            params["scope"] = scope_str
+            params["scope_prefix"] = f"{scope_str}{SCOPE_DELIMITER}"
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) WHERE {' AND '.join(where)} "
+            "RETURN left(toString(m.valid_from), 10) AS day, count(m) AS n "
+            "ORDER BY day ASC",
+            **params,
+        )
+        return [(str(r[0]), int(r[1])) for r in rows if r[0] is not None]
+
+    @staticmethod
+    def _growth_since(days: int, *, today: date | None = None) -> str:
+        """ISO lower bound: midnight UTC ``days - 1`` days before ``today``.
+
+        Spans exactly ``days`` calendar days up to and including ``today`` (the UTC
+        anchor day; defaults to ``datetime.now(UTC).date()`` when the caller does
+        not pin one). Returned as an ISO string so it compares lexically against the
+        stored ``valid_from``.
+        """
+
+        span = days if days >= 1 else 1
+        anchor = today if today is not None else datetime.now(UTC).date()
+        start = anchor - timedelta(days=span - 1)
+        return datetime(start.year, start.month, start.day, tzinfo=UTC).isoformat()
 
     async def _count_by(self, cypher: str, **params: Any) -> dict[str, int]:
         """Run a grouped ``RETURN <key> AS k, count(...) AS n`` into a count map."""

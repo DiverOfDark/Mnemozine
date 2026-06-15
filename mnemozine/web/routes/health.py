@@ -17,14 +17,18 @@ rather than raising.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
+from typing import Annotated
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from mnemozine.web.deps import ContainerDep, SettingsDep, StorageDep
+from mnemozine.web.routes._read import scope_to_obj
 from mnemozine.web.schemas import (
     ComponentHealth,
+    GrowthResponse,
     HealthResponse,
     StoreStatsResponse,
 )
@@ -146,6 +150,64 @@ async def stats(storage: StorageDep) -> StoreStatsResponse:
         active_count=s.active_count,
         superseded_count=s.superseded_count,
         entity_count=s.entity_count,
+    )
+
+
+@router.get(
+    "/stats/growth",
+    response_model=GrowthResponse,
+    summary="Dashboard store-growth trend",
+)
+async def stats_growth(
+    storage: StorageDep,
+    scope: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Filter to scope + descendants ('global'/'project:<id>'/bare id). "
+                "'global' is the universal ancestor and rolls up the WHOLE store."
+            )
+        ),
+    ] = None,
+    days: Annotated[int, Query(ge=1, le=365, description="Trailing window size in days.")] = 14,
+) -> GrowthResponse:
+    """Store-growth trend for the Dashboard sparkline (PRD §4.1).
+
+    Derives the trend DIRECTLY from each memory's ``valid_from`` via
+    :meth:`StorageBackend.memory_growth` (a single cheap grouped Cypher count),
+    NOT from the optional activity log — so the sparkline shows real existing
+    history even when the activity log is empty. The backend returns only the days
+    that have memories; this route DENSIFIES that into a full ``days``-length,
+    zero-filled, oldest-first series so the frontend renders it with no gap
+    handling and an empty store yields an all-zero sparkline (no misleading
+    "enable the activity log" message).
+    """
+
+    scope_obj = scope_to_obj(scope)
+    # Pin ONE UTC anchor day and pass it to the backend so the densified window
+    # labels below and the backend's ``$since`` lower bound derive from the same
+    # ``today`` — otherwise, across a UTC-midnight boundary between the two
+    # ``now()`` reads, they could disagree by a day and drop/duplicate an edge
+    # bucket, breaking the daily/cumulative/total invariant.
+    today = datetime.now(UTC).date()
+    raw = await storage.memory_growth(scope=scope_obj, days=days, today=today)
+    counts = {day: n for day, n in raw}
+
+    window = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    labels = [d.isoformat() for d in window]
+    daily = [counts.get(label, 0) for label in labels]
+
+    cumulative: list[int] = []
+    running = 0
+    for n in daily:
+        running += n
+        cumulative.append(running)
+
+    return GrowthResponse(
+        days=labels,
+        daily=daily,
+        cumulative=cumulative,
+        total=sum(daily),
     )
 
 

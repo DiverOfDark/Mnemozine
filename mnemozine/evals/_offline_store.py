@@ -16,7 +16,7 @@ shape and are no-ops/raise. Tests still use the richer conftest fake.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from mnemozine.interfaces import (
@@ -200,6 +200,25 @@ class OfflineStorage:
             s = m.scope.as_str()
             counts[s] = counts.get(s, 0) + 1
         return counts
+
+    async def memory_growth(
+        self, *, scope: Scope | None = None, days: int = 14, today: date | None = None
+    ) -> list[tuple[str, int]]:
+        span = days if days >= 1 else 1
+        anchor = today if today is not None else datetime.now(UTC).date()
+        start = anchor - timedelta(days=span - 1)
+        counts: dict[str, int] = {}
+        for m in self.memories.values():
+            if m.valid_from.date() < start:
+                continue
+            # Exact-or-descendant roll-up; the global root (segments == []) is the
+            # universal ancestor, so scope=global counts the whole store. This
+            # mirrors GraphitiStorageBackend.memory_growth exactly.
+            if scope is not None and not m.scope.is_descendant_of(scope):
+                continue
+            day = m.valid_from.date().isoformat()
+            counts[day] = counts.get(day, 0) + 1
+        return sorted(counts.items())
 
     async def query_memories(
         self,

@@ -1209,3 +1209,107 @@ async def test_query_memories_source_filter_matches_via_provenance_blob() -> Non
     assert {v.id for v in oai.items} == {"m3"}
     cc = await store.query_memories(source="claude_code")
     assert "m3" not in {v.id for v in cc.items}
+
+
+# ---------------------------------------------------------------------------
+# memory_growth scope roll-up (global = universal ancestor) + window anchor
+# ---------------------------------------------------------------------------
+
+
+def _dated(memory: MemoryUnit, *, day: datetime) -> MemoryUnit:
+    """Pin a memory's ``valid_from`` (creation timestamp) to a fixed instant."""
+
+    return memory.model_copy(update={"valid_from": day})
+
+
+async def test_memory_growth_global_scope_rolls_up_whole_store() -> None:
+    """``scope=global`` is the universal ancestor: it counts EVERY scope.
+
+    Locks the canonical exact-or-descendant semantic (matching
+    ``Scope.is_descendant_of`` and the in-memory fakes) against the real backend.
+    The old string-prefix test (``STARTS WITH "global/"``) returned ONLY memories
+    literally tagged ``global`` and excluded every ``project:*`` memory; this pins
+    that ``scope=global`` instead rolls up the whole store, identical to
+    ``scope=None``.
+    """
+
+    # All memories share one creation day so the whole window collapses to a single
+    # bucket whose count is exactly "how many scopes rolled up".
+    today = datetime.now(UTC).date()
+    anchor = datetime(today.year, today.month, today.day, 12, 0, tzinfo=UTC)
+    store = _backend(dedup_threshold=1.0)
+    seeds = [
+        _memory(content="g0 global pref", scope=Scope.global_(), entities=["a"]),
+        _memory(content="p1 project fact", scope=Scope.project("Mnemozine"), entities=["b"]),
+        _memory(
+            content="p1sub auth fact",
+            scope=Scope.project("Mnemozine", "auth"),
+            entities=["c"],
+        ),
+        _memory(content="p2 other project", scope=Scope.project("Pulse"), entities=["d"]),
+    ]
+    for s in seeds:
+        await store.upsert_memory(_dated(s, day=anchor))
+
+    day_key = today.isoformat()
+
+    # scope=global must roll up the WHOLE store (all four), NOT just literal-global.
+    glob = await store.memory_growth(scope=Scope.global_(), days=7, today=today)
+    assert dict(glob) == {day_key: 4}
+
+    # scope=None counts everything too — global must match it exactly.
+    none = await store.memory_growth(scope=None, days=7, today=today)
+    assert dict(none) == dict(glob)
+
+
+async def test_memory_growth_non_global_scope_rolls_up_only_its_subtree() -> None:
+    """A non-global scope counts itself + descendants, never a sibling project."""
+
+    today = datetime.now(UTC).date()
+    anchor = datetime(today.year, today.month, today.day, 12, 0, tzinfo=UTC)
+    store = _backend(dedup_threshold=1.0)
+    for s in [
+        _memory(content="g global", scope=Scope.global_(), entities=["a"]),
+        _memory(content="mz root", scope=Scope.project("Mnemozine"), entities=["b"]),
+        _memory(content="mz auth", scope=Scope.project("Mnemozine", "auth"), entities=["c"]),
+        _memory(content="pulse sibling", scope=Scope.project("Pulse"), entities=["d"]),
+    ]:
+        await store.upsert_memory(_dated(s, day=anchor))
+
+    day_key = today.isoformat()
+
+    # project:Mnemozine rolls up itself + its 'auth' sub-scope (2), but never the
+    # unrelated sibling project:Pulse and never the global memory.
+    mz = await store.memory_growth(scope=Scope.project("Mnemozine"), days=7, today=today)
+    assert dict(mz) == {day_key: 2}
+
+    # The sub-scope sees only itself (1).
+    auth = await store.memory_growth(
+        scope=Scope.project("Mnemozine", "auth"), days=7, today=today
+    )
+    assert dict(auth) == {day_key: 1}
+
+
+async def test_memory_growth_today_anchor_bounds_window() -> None:
+    """The explicit ``today`` anchor pins the trailing-window lower bound.
+
+    A memory created 3 days before the anchor is INCLUDED in a 7-day window but
+    EXCLUDED from a 2-day window, proving ``$since`` derives from the passed anchor
+    rather than a second wall-clock read.
+    """
+
+    store = _backend(dedup_threshold=1.0)
+    anchor_day = datetime(2026, 6, 10, tzinfo=UTC).date()
+    three_days_back = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
+    await store.upsert_memory(
+        _dated(
+            _memory(content="older edge memory", scope=Scope.global_(), entities=["x"]),
+            day=three_days_back,
+        )
+    )
+
+    wide = await store.memory_growth(days=7, today=anchor_day)
+    assert dict(wide) == {"2026-06-07": 1}
+
+    narrow = await store.memory_growth(days=2, today=anchor_day)
+    assert dict(narrow) == {}

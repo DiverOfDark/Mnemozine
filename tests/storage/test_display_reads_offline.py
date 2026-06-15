@@ -28,6 +28,7 @@ The three load-bearing properties (mirroring the task acceptance criteria):
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC, datetime
 
 import pytest
 
@@ -327,3 +328,191 @@ async def test_graph_snapshot_scope_filter_bounds_idea_seeds(Fake) -> None:
     # but the global idea seed surfaces when scoped to global
     glob = await store.graph_snapshot(scope=Scope.global_())
     assert {n.id for n in glob.nodes if n.kind == "idea_seed"} == {"m4"}
+
+
+# ---------------------------------------------------------------------------
+# memory_growth: per-day grouping + trailing window + scope roll-up
+#
+# Mirrors the FalkorDB contract test (tests/storage/test_backend_contract.py) on
+# BOTH in-memory fakes so the Dashboard growth-trend source of truth (each
+# memory's valid_from) stays consistent across every StorageBackend. The series
+# is SPARSE by contract (days with zero memories are ABSENT — the web layer
+# zero-fills); these tests assert the sparse shape, the web densification is
+# pinned separately in tests/web/test_health_stats.py.
+# ---------------------------------------------------------------------------
+
+
+def _growth_memory(
+    *,
+    content: str,
+    day: datetime,
+    scope: Scope | None = None,
+    entities: list[str] | None = None,
+    mid: str | None = None,
+) -> MemoryUnit:
+    """A memory pinned to a fixed ``valid_from`` (the canonical creation day)."""
+
+    m = _memory(
+        content=content,
+        scope=scope,
+        entities=entities if entities is not None else ["rust"],
+        mid=mid,
+    )
+    return m.model_copy(update={"valid_from": day})
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_groups_by_day_oldest_first(Fake) -> None:
+    """Counts are grouped by the valid_from DAY, returned oldest-first + sparse.
+
+    Two memories share day-2 and one lands on day-0; the day with no memory
+    (day-1) is ABSENT from the result (sparse by contract — the web layer
+    zero-fills it), and the rows come back ascending by day.
+    """
+
+    store = Fake()
+    today = datetime(2026, 6, 14, tzinfo=UTC).date()
+    d0 = datetime(2026, 6, 12, 9, 0, tzinfo=UTC)
+    d2 = datetime(2026, 6, 14, 8, 0, tzinfo=UTC)
+    await store.upsert_memory(_growth_memory(content="a", day=d0, mid="g1"))
+    await store.upsert_memory(_growth_memory(content="b", day=d2, mid="g2"))
+    await store.upsert_memory(_growth_memory(content="c", day=d2, mid="g3"))
+
+    rows = await store.memory_growth(days=7, today=today)
+    # Oldest-first; the empty middle day (2026-06-13) is absent (sparse).
+    assert rows == [("2026-06-12", 1), ("2026-06-14", 2)]
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_window_excludes_before_since(Fake) -> None:
+    """The trailing ``days`` window is bounded by the ``today`` anchor.
+
+    A memory created 3 days before the anchor is IN a 7-day window but OUT of a
+    2-day window, proving ``$since`` derives from the explicit anchor and the
+    fake mirrors the backend's window math.
+    """
+
+    store = Fake()
+    anchor = datetime(2026, 6, 10, tzinfo=UTC).date()
+    three_back = datetime(2026, 6, 7, 9, 0, tzinfo=UTC)
+    await store.upsert_memory(
+        _growth_memory(content="older edge", day=three_back, mid="g1")
+    )
+
+    wide = await store.memory_growth(days=7, today=anchor)
+    assert dict(wide) == {"2026-06-07": 1}
+
+    narrow = await store.memory_growth(days=2, today=anchor)
+    assert dict(narrow) == {}
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_empty_store_is_empty(Fake) -> None:
+    """An empty store yields an empty (sparse) series — the web layer all-zeros it."""
+
+    rows = await Fake().memory_growth(days=14, today=datetime(2026, 6, 14, tzinfo=UTC).date())
+    assert rows == []
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_global_scope_rolls_up_whole_store(Fake) -> None:
+    """``scope=global`` is the universal ancestor: it counts every scope == scope=None.
+
+    The global root (segments == []) is an ancestor of every scope, so it must
+    roll up project + sub-scope memories, identical to ``scope=None`` — NOT only
+    the literally-global ones.
+    """
+
+    store = Fake()
+    today = datetime(2026, 6, 14, tzinfo=UTC).date()
+    day = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
+    await store.upsert_memory(
+        _growth_memory(content="g", day=day, scope=Scope.global_(), entities=["a"], mid="g1")
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="p", day=day, scope=Scope.project("Mnemozine"), entities=["b"], mid="g2"
+        )
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="psub",
+            day=day,
+            scope=Scope.project("Mnemozine", "auth"),
+            entities=["c"],
+            mid="g3",
+        )
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="p2", day=day, scope=Scope.project("Pulse"), entities=["d"], mid="g4"
+        )
+    )
+
+    key = "2026-06-14"
+    glob = await store.memory_growth(scope=Scope.global_(), days=7, today=today)
+    assert dict(glob) == {key: 4}
+    none = await store.memory_growth(scope=None, days=7, today=today)
+    assert dict(none) == dict(glob)
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_non_global_scope_rolls_up_only_subtree(Fake) -> None:
+    """A non-global scope counts itself + descendants, never a sibling project."""
+
+    store = Fake()
+    today = datetime(2026, 6, 14, tzinfo=UTC).date()
+    day = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
+    await store.upsert_memory(
+        _growth_memory(content="g", day=day, scope=Scope.global_(), entities=["a"], mid="g1")
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="mz", day=day, scope=Scope.project("Mnemozine"), entities=["b"], mid="g2"
+        )
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="mzauth",
+            day=day,
+            scope=Scope.project("Mnemozine", "auth"),
+            entities=["c"],
+            mid="g3",
+        )
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="pulse", day=day, scope=Scope.project("Pulse"), entities=["d"], mid="g4"
+        )
+    )
+
+    key = "2026-06-14"
+    # project:Mnemozine rolls up itself + 'auth' (2), never the Pulse sibling or
+    # the global memory.
+    mz = await store.memory_growth(scope=Scope.project("Mnemozine"), days=7, today=today)
+    assert dict(mz) == {key: 2}
+    # The sub-scope sees only itself.
+    auth = await store.memory_growth(
+        scope=Scope.project("Mnemozine", "auth"), days=7, today=today
+    )
+    assert dict(auth) == {key: 1}
+
+
+@pytest.mark.parametrize("Fake", FAKES)
+async def test_memory_growth_zero_days_clamps_to_one_day(Fake) -> None:
+    """``days <= 0`` clamps to a single-day window (mirrors the backend guard)."""
+
+    store = Fake()
+    today = datetime(2026, 6, 14, tzinfo=UTC).date()
+    await store.upsert_memory(
+        _growth_memory(
+            content="today", day=datetime(2026, 6, 14, 1, 0, tzinfo=UTC), mid="g1"
+        )
+    )
+    await store.upsert_memory(
+        _growth_memory(
+            content="yesterday", day=datetime(2026, 6, 13, 1, 0, tzinfo=UTC), mid="g2"
+        )
+    )
+    rows = await store.memory_growth(days=0, today=today)
+    assert dict(rows) == {"2026-06-14": 1}

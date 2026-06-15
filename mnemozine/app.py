@@ -324,6 +324,12 @@ async def _run_ingest(container: Container, *, backfill: bool) -> None:
     storage = await container.build_storage()
     ingest_service = container.build_ingest_service(storage)
     retriever = await container.build_retriever()
+    # WEBUI Q3 observability seam: build the activity log (async — it may open the
+    # shared storage connection when web.enable_activity_log is set) and thread it
+    # into the loop so newly-ingested chunks are recorded on the feed. The default
+    # NullActivityLog keeps this a no-op when the activity log is disabled, so the
+    # existing ingest path is unchanged.
+    activity_log = await container.build_activity_log()
 
     # Share this process's wired services with the hook entrypoints.
     hook_runtime.services_loader = lambda: hook_runtime.HookServices(
@@ -343,7 +349,13 @@ async def _run_ingest(container: Container, *, backfill: bool) -> None:
     )
 
     accumulator = ChunkAccumulator(container.settings.ingest)
-    await run_ingest_loop(sources, accumulator, ingest_service, backfill=backfill)
+    await run_ingest_loop(
+        sources,
+        accumulator,
+        ingest_service,
+        backfill=backfill,
+        activity_log=activity_log,
+    )
 
 
 @ingest_app.callback(invoke_without_command=True)

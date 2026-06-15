@@ -16,6 +16,7 @@ import type {
 export const queryKeys = {
   health: () => ["health"] as const,
   stats: () => ["stats"] as const,
+  growth: (scope: string | null, days: number) => ["stats", "growth", scope, days] as const,
 
   memories: {
     all: () => ["memories"] as const,

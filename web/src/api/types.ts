@@ -426,6 +426,24 @@ export interface StoreStatsResponse {
   entity_count: number;
 }
 
+/**
+ * GET /api/stats/growth → memory-creation trend over a trailing `days` window.
+ * Arrays are DENSE / parallel / oldest-first and the same length as `days`
+ * (zero-filled by the server); `total === sum(daily)`. Backed by a cheap grouped
+ * count of memories by DAY of valid_from — real retroactive data, independent of
+ * the activity log.
+ */
+export interface GrowthResponse {
+  /** Day labels (YYYY-MM-DD), oldest → newest, length == window. */
+  days: string[];
+  /** Memories created per day, oldest → newest (parallel to `days`). */
+  daily: number[];
+  /** Running cumulative total of `daily`, oldest → newest. */
+  cumulative: number[];
+  /** Sum of `daily` over the window. */
+  total: number;
+}
+
 // ---------------------------------------------------------------------------
 // Query-param shapes (the filter objects the hooks accept)
 // ---------------------------------------------------------------------------

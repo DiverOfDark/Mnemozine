@@ -42,6 +42,7 @@ import type {
   EvalSummaryResponse,
   GraphQuery,
   GraphResponse,
+  GrowthResponse,
   HealthResponse,
   MaintenanceJobName,
   MaintenanceRunResponse,
@@ -80,6 +81,29 @@ export function useStats(opts?: QueryOpts<StoreStatsResponse>): UseQueryResult<S
   return useQuery({
     queryKey: queryKeys.stats(),
     queryFn: ({ signal }) => api.get<StoreStatsResponse>("/stats", undefined, signal),
+    ...opts,
+  });
+}
+
+/**
+ * GET /api/stats/growth → GrowthResponse (Dashboard store-growth trend). Returns a
+ * dense, zero-filled, oldest-first series of memories created per day over the
+ * trailing `days` window. `scope` accepts the canonical scope string
+ * ("global" | "project:<id>") and rolls up sub-scopes; omit / null for all scopes.
+ */
+export function useGrowth(
+  scope: string | null,
+  days = 14,
+  opts?: QueryOpts<GrowthResponse>,
+): UseQueryResult<GrowthResponse> {
+  return useQuery({
+    queryKey: queryKeys.growth(scope, days),
+    queryFn: ({ signal }) =>
+      api.get<GrowthResponse>(
+        "/stats/growth",
+        { ...(scope ? { scope } : {}), days },
+        signal,
+      ),
     ...opts,
   });
 }

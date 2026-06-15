@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -611,6 +611,52 @@ class StorageBackend(Protocol):
         ``{scope-string: count}`` — NEVER a whole-store stream. The web layer folds
         these into the hierarchical scope tree (with descendant roll-ups), so the
         Memories-page scope navigator costs one aggregation, not a full table load.
+        """
+        ...
+
+    async def memory_growth(
+        self, *, scope: Scope | None = None, days: int = 14, today: date | None = None
+    ) -> list[tuple[str, int]]:
+        """Memories created per DAY over the trailing ``days`` window (Dashboard trend).
+
+        Derives the store-growth sparkline DIRECTLY from each memory's
+        ``valid_from`` — the canonical creation timestamp — NOT from the optional
+        activity log. The activity log starts empty and can never reconstruct
+        pre-existing history, so the Dashboard growth trend must come from the
+        memories themselves; this is that source of truth.
+
+        Computed as a single cheap Cypher grouped count, never a row stream and
+        never the embedding: the ~handful of day-bucket rows are aggregated in
+        FalkorDB. Because ``valid_from`` is persisted as an ISO-8601 string that
+        sorts lexically (e.g. ``2026-06-14T21:07:04+00:00``), the window is bounded
+        by a ``$since`` ISO-string lower bound (``m.valid_from >= $since``) and the
+        day key is the first 10 chars (``left(toString(m.valid_from), 10)`` ->
+        ``YYYY-MM-DD``), grouped with ``count(m)``.
+
+        ``days`` is the trailing window size (default 14): ``$since`` is midnight
+        UTC ``days - 1`` days before ``today``, so the window spans exactly ``days``
+        calendar days up to and including ``today``. ``today`` is the (UTC) anchor
+        day of the trailing window; it defaults to ``datetime.now(UTC).date()`` but
+        the caller SHOULD pass an explicit anchor so the densified window/labels it
+        builds and the backend's ``$since`` share one ``today`` — otherwise, across
+        a UTC-midnight boundary between the two ``now()`` reads, the window and the
+        query can disagree by a day and drop/duplicate an edge bucket.
+
+        When ``scope`` is given the count
+        is filtered to that EXACT scope OR ANY DESCENDANT of it (so selecting a
+        project rolls up its sub-scopes, matching the scope-tree roll-up and
+        :meth:`Scope.is_descendant_of`). The GLOBAL root scope
+        (``scope.segments == []``) is the universal ancestor of every scope, so
+        ``scope=global`` rolls up the WHOLE store (every ``project:*`` memory),
+        identically to ``scope=None`` — NOT just memories tagged literally
+        ``global``. For a non-global scope the roll-up is a scope-string prefix
+        test using the same delimiter ``Scope.as_str()`` joins segments with.
+
+        Returns ``[(YYYY-MM-DD, count)]`` ordered OLDEST-FIRST. Only days that have
+        at least one memory appear (days with zero memories are absent); the web
+        layer densifies the series to a full ``days``-length zero-filled run before
+        rendering, so an empty store yields an all-zero sparkline rather than the
+        old misleading "enable the activity log to populate this trend" message.
         """
         ...
 

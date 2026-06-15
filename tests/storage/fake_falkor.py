@@ -120,6 +120,30 @@ class FakeFalkorDriver:
         if "m.provenance AS prov, count(m) AS n" in c:
             return self._group_count(lambda m: m.get("provenance"))
 
+        # --- memory_growth: per-day grouped count over valid_from -------------
+        # ``MATCH (m:MnemozineMemory) WHERE m.valid_from >= $since [AND scope...]
+        # RETURN left(toString(m.valid_from), 10) AS day, count(m) AS n
+        # ORDER BY day ASC``. ``valid_from`` is an ISO string that sorts lexically,
+        # so the $since lower bound and the STARTS WITH scope roll-up are applied
+        # exactly as the real Cypher would (global emits NO scope clause).
+        if "left(toString(m.valid_from), 10) AS day" in c:
+            since = str(p.get("since", ""))
+            scope_eq = p.get("scope")
+            scope_prefix = p.get("scope_prefix")
+            day_counts: dict[str, int] = {}
+            for m in self.memories.values():
+                vf = str(m.get("valid_from") or "")
+                if not vf or vf < since:
+                    continue
+                if scope_eq is not None or scope_prefix is not None:
+                    sc = str(m.get("scope") or "")
+                    if not (sc == scope_eq or sc.startswith(str(scope_prefix))):
+                        continue
+                day = vf[:10]
+                day_counts[day] = day_counts.get(day, 0) + 1
+            rows_g = sorted(day_counts.items())
+            return _Result([[day, n] for day, n in rows_g])
+
         # --- query_memories: count over the filtered set ----------------------
         if "RETURN count(m) AS n" in c and "SET" not in c and "$src" not in c:
             n = sum(

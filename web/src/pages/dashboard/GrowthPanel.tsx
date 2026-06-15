@@ -1,8 +1,9 @@
 /**
  * Store-growth panel (PRD §4.1). Page-local to the Dashboard. Wraps the local
  * Sparkline with a derived growth series (useGrowthSeries) and a small legend.
- * Honest about provenance: the curve is reconstructed from the activity log, so it
- * shows a "needs the activity log" hint when that log is disabled / empty.
+ * The curve is backed by GET /api/stats/growth — a real, retroactive grouped count
+ * of memories by creation day — so it renders the genuine trend with no caveats; it
+ * only falls back to the Sparkline's "not enough data" state for an empty store.
  */
 
 import { Panel } from "@/components/primitives";
@@ -25,11 +26,6 @@ export function GrowthPanel({ scope, windowDays = 14 }: { scope: string | null; 
             +{series.total.toLocaleString()}
           </span>
           <span className="text-2xs uppercase tracking-wide text-text-faint">writes / {windowDays}d</span>
-          {series.empty && (
-            <span className="mt-1 max-w-[14rem] text-2xs text-text-faint">
-              growth is reconstructed from the activity log — enable it to populate this trend
-            </span>
-          )}
         </div>
         <div className="shrink-0">
           {series.empty ? (

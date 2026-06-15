@@ -314,3 +314,61 @@ async def test_run_all_no_components_closes_and_returns() -> None:
     # No components -> early return before the run loop; close() is not reached in
     # that branch (nothing was opened), so the connection is left as-is.
     assert container.closed == 0
+
+
+# ---------------------------------------------------------------------------
+# _run_ingest wires the activity log into the loop (the real WEBUI Q3 bug)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_ingest_threads_activity_log_into_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_run_ingest`` must build the activity log and pass it to ``run_ingest_loop``.
+
+    The bug this guards: ``_run_ingest`` built the retriever + ingest service but
+    never built ``container.build_activity_log()`` nor threaded it into
+    ``run_ingest_loop``, so ingest never emitted activity events even when the
+    persisted log was enabled. We inject a sentinel activity log onto the container
+    and capture the kwarg the loop is actually called with — it must be that exact
+    instance (identity), not None.
+    """
+
+    from mnemozine import app as app_mod
+    from mnemozine.activity.log import InMemoryActivityLog
+    from mnemozine.ingestion import loop as loop_mod
+    from mnemozine.ingestion.claude_code.source import ClaudeCodeSource
+
+    c = _offline_container()
+    sentinel = InMemoryActivityLog()
+    # Pre-fill the memoized activity slot so build_activity_log() returns our
+    # sentinel without opening any connection (it is memoized on _activity).
+    c._activity = sentinel
+
+    # A non-empty source set so _run_ingest does not early-return ("no sources").
+    sources = loop_mod.IngestSources(
+        sources=[ClaudeCodeSource(c.settings)],
+        claude_code=ClaudeCodeSource(c.settings),
+    )
+    monkeypatch.setattr(loop_mod, "build_ingest_sources", lambda settings: sources)
+
+    captured: dict[str, object] = {}
+
+    async def _fake_loop(
+        srcs: object,
+        accumulator: object,
+        ingest_service: object,
+        *,
+        backfill: bool = False,
+        activity_log: object | None = None,
+    ) -> None:
+        captured["activity_log"] = activity_log
+        captured["backfill"] = backfill
+
+    monkeypatch.setattr(loop_mod, "run_ingest_loop", _fake_loop)
+
+    await app_mod._run_ingest(c, backfill=True)  # type: ignore[arg-type]
+
+    # The loop received OUR activity log (the wiring), not None.
+    assert captured["activity_log"] is sentinel
+    assert captured["backfill"] is True
