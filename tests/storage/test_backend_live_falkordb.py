@@ -350,3 +350,179 @@ async def test_activity_log_append_and_query_against_real_falkordb(
     # ref_memory_id filtering (Python-side over the JSON array) works end-to-end.
     filtered = await log.query(ActivityQuery(ref_memory_id="m-live-1", limit=10))
     assert [e.summary for e in filtered] == ["ingested live chunk"]
+
+
+# ---------------------------------------------------------------------------
+# Display reads (the WebUI READ surface) against REAL FalkorDB.
+#
+# The four embedding-free display methods (store_stats / query_memories /
+# get_memory_display / graph_snapshot) back the slow WebUI endpoints. The offline
+# contract tests only exercise them against the in-process fake, which is not a
+# real Cypher engine — so the aggregation Cypher, the ``CONTAINS '"source":"..."'``
+# provenance-blob filter, the embedding-free view projection map, and the bounded
+# graph_snapshot edge/idea-seed scan are unproven against a real engine. These
+# tests close that gap (the user-flagged "no live test for the new methods").
+# ---------------------------------------------------------------------------
+
+
+async def _seed_display_live(backend: GraphitiStorageBackend) -> None:
+    """Seed a small live store covering every display-read axis (mirror of the fake seed)."""
+
+    await backend.upsert_entity(
+        Entity(id="ent-rust", canonical_name="rust", type="language")
+    )
+    await backend.upsert_entity(
+        Entity(id="ent-tokio", canonical_name="tokio", type="library")
+    )
+    await backend.upsert_edge(
+        Edge(
+            id="e-live",
+            from_entity="ent-rust",
+            to_entity="ent-tokio",
+            relation="uses",
+            weight=0.7,
+        )
+    )
+    # active global preference (claude_code source).
+    await backend.upsert_memory(
+        _memory("north", scope=Scope.global_(), entities=["rust"], category="preference")
+    )
+    # project-scoped decision from a DIFFERENT source (openai) — exercises the
+    # provenance-blob source filter against the real engine.
+    proj = _memory(
+        "east",
+        scope=Scope.project("rust-cli"),
+        entities=["tokio"],
+        category="decision",
+    )
+    proj.provenance = Provenance(source="openai", session_id="sess-2")
+    await backend.upsert_memory(proj)
+    # archived cross-ref idea seed (tier=archive) for the graph idea-seed node.
+    idea = MemoryUnit(
+        content="up",
+        scope=Scope.global_(),
+        category="idea",
+        cross_ref_candidate=True,
+        entities=["tokio", "rust"],
+        confidence=0.7,
+        provenance=Provenance(source=Source.CLAUDE_CODE.value, session_id="sess-3"),
+    )
+    await backend.upsert_memory(idea)
+
+
+async def test_store_stats_aggregates_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """store_stats COUNT/grouping aggregates run against the real engine."""
+
+    await _seed_display_live(live_backend)
+    stats = await live_backend.store_stats()
+    assert stats.total_memories == 3
+    assert stats.by_category == {"preference": 1, "decision": 1, "idea": 1}
+    assert stats.by_scope_decision == {"global": 2, "project": 1}
+    assert stats.active_count == 3
+    assert stats.superseded_count == 0
+    # by_source decodes the provenance blob per distinct value — proves the real
+    # grouped read + JSON decode, not just the fake's stored-dict shortcut.
+    assert stats.by_source == {"claude_code": 2, "openai": 1}
+    assert stats.entity_count == 2
+
+
+async def test_query_memories_filters_and_source_blob_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """query_memories pushes filters/paging into real Cypher; source matches the blob.
+
+    The headline regression for the flagged fragility: ``source='openai'`` is
+    matched via ``m.provenance CONTAINS '"source":"openai"'`` over the real stored
+    ``model_dump_json()`` blob — this proves the compact-JSON dependency holds on a
+    live engine, not just in the substring-matching fake.
+    """
+
+    await _seed_display_live(live_backend)
+
+    page = await live_backend.query_memories()
+    assert page.total == 3 and len(page.items) == 3
+    # The view is embedding-free but carries the decoded scalar source.
+    assert {v.source for v in page.items} == {"claude_code", "openai"}
+
+    oai = await live_backend.query_memories(source="openai")
+    assert oai.total == 1
+    assert [v.content for v in oai.items] == ["east"]
+    assert oai.items[0].source == "openai"
+
+    # category + scope + entity filters all land in Cypher.
+    decision = await live_backend.query_memories(category="decision")
+    assert [v.content for v in decision.items] == ["east"]
+    scoped = await live_backend.query_memories(scope=Scope.project("rust-cli"))
+    assert [v.content for v in scoped.items] == ["east"]
+    tok = await live_backend.query_memories(entity="Tokio")
+    assert {v.content for v in tok.items} == {"east", "up"}
+
+
+async def test_query_memories_never_selects_embedding_live(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """The list read's Cypher never names the embedding (proven on the real path)."""
+
+    await _seed_display_live(live_backend)
+    captured: list[str] = []
+    real_execute = live_backend._client.execute_query
+
+    async def _spy(cypher: str, **params: object) -> object:
+        captured.append(cypher)
+        return await real_execute(cypher, **params)
+
+    live_backend._client.execute_query = _spy  # type: ignore[method-assign]
+    await live_backend.query_memories(category="preference", limit=10)
+    assert captured, "query_memories ran no Cypher"
+    assert all("embedding" not in c for c in captured), captured
+
+
+async def test_get_memory_display_embedding_free_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """get_memory_display keys a unit by id and returns the embedding-free view."""
+
+    await _seed_display_live(live_backend)
+    page = await live_backend.query_memories(category="preference")
+    mid = page.items[0].id
+    view = await live_backend.get_memory_display(mid)
+    assert view is not None
+    assert view.id == mid
+    assert view.content == "north"
+    assert view.is_active is True
+    assert view.scope_decision.value == "global"
+    assert view.source == "claude_code"
+    assert await live_backend.get_memory_display("does-not-exist") is None
+
+
+async def test_graph_snapshot_bounded_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """graph_snapshot returns the bounded entity/idea-seed subgraph from real Cypher.
+
+    Proves the single aggregate edge query, the idea-seed/memory_count scan (now
+    LIMIT-bounded), and the truncated sentinel against the real engine.
+    """
+
+    await _seed_display_live(live_backend)
+    snap = await live_backend.graph_snapshot()
+    ent_ids = {n.id for n in snap.nodes if n.kind == "entity"}
+    assert ent_ids == {"ent-rust", "ent-tokio"}
+    idea_ids = {n.id for n in snap.nodes if n.kind == "idea_seed"}
+    assert idea_ids  # the archived cross-ref candidate is an idea-seed node
+    relates = [e for e in snap.edges if e.kind == "relates"]
+    assert any(
+        {e.source, e.target} == {"ent-rust", "ent-tokio"} for e in relates
+    ), relates
+    mentions = [e for e in snap.edges if e.kind == "mentions"]
+    assert mentions  # idea-seed -> entity mention edges
+    # Exactly node_limit entities (2) must NOT be a false-positive truncation.
+    assert snap.truncated is False
+    full = await live_backend.graph_snapshot(node_limit=2)
+    assert full.truncated is False
+    # One fewer than the entity count DOES truncate.
+    cut = await live_backend.graph_snapshot(node_limit=1)
+    assert len([n for n in cut.nodes if n.kind == "entity"]) == 1
+    assert cut.truncated is True

@@ -40,9 +40,15 @@ from typing import TYPE_CHECKING, Any
 from mnemozine.config import MaintenanceSettings, RetrievalSettings, get_settings
 from mnemozine.interfaces import (
     EmbeddingProvider,
+    GraphSnapshot,
+    GraphSnapshotEdge,
+    GraphSnapshotNode,
     MaintenanceReport,
+    MemoryPage,
+    MemoryView,
     Neighbor,
     RetrievedMemory,
+    StoreStats,
     WriteDecision,
     WriteResult,
 )
@@ -90,6 +96,14 @@ ContradictsFn = Callable[[MemoryUnit, list[MemoryUnit]], Awaitable[list[MemoryUn
 # defaults used when no ``RetrievalSettings`` is supplied.
 _KNN_OVERFETCH = 10
 _KNN_MAX_K = 512
+
+# graph_snapshot bounds the per-entity memory_count + idea-seed scan IN CYPHER: a
+# popular entity (e.g. 'rust') could otherwise pull every linking memory into
+# Python. We cap that scan at a generous multiple of the node cap so a normal
+# subgraph is never cut while a pathological slice stays bounded. The
+# memory_count/idea-seed view this feeds is itself node-bounded, so bounding the
+# linked-memory rows proportionally to the node cap is coherent.
+_GRAPH_SNAPSHOT_MEMORY_FACTOR = 25
 
 # Substrings FalkorDB uses when the vector index/procedure is unavailable. Used to
 # distinguish "index genuinely absent -> fall back to the bounded scan" from a
@@ -303,6 +317,68 @@ class GraphitiStorageBackend:
         """Convert a returned graph node (Node/dict) into a MemoryUnit."""
 
         return self._row_to_memory(self._props(node))
+
+    # -- display-read projection (EMBEDDING-FREE) -----------------------------
+
+    # The exact display fields a MemoryView needs, RETURNed as a Cypher map so the
+    # 1024-float embedding is NEVER transferred or parsed for a display read. The
+    # nested provenance JSON blob is one scalar property; we decode just the few
+    # scalar provenance fields the wire models use rather than the whole vector.
+    _VIEW_FIELDS = (
+        "id",
+        "content",
+        "scope",
+        "category",
+        "cross_ref_candidate",
+        "entities",
+        "confidence",
+        "tier",
+        "valid_from",
+        "valid_to",
+        "last_accessed",
+        "access_count",
+        "provenance",
+    )
+
+    @classmethod
+    def _view_projection(cls, var: str = "m") -> str:
+        """A Cypher map literal selecting only the display fields of node ``var``.
+
+        Used as the RETURN of every display read so the embedding stays in the
+        store. E.g. ``RETURN {id: m.id, content: m.content, ...} AS v``.
+        """
+
+        pairs = ", ".join(f"{f}: {var}.{f}" for f in cls._VIEW_FIELDS)
+        return "{" + pairs + "}"
+
+    @staticmethod
+    def _props_to_view(props: dict[str, Any]) -> MemoryView:
+        """Rebuild an embedding-free :class:`MemoryView` from a RETURNed field map."""
+
+        provenance_raw = props.get("provenance")
+        provenance = (
+            Provenance.model_validate_json(provenance_raw)
+            if provenance_raw
+            else Provenance.classify_sentinel()
+        )
+        return MemoryView(
+            id=props["id"],
+            content=props["content"],
+            scope=Scope.parse(props["scope"]),
+            category=str(props.get("category") or DEFAULT_CATEGORY),
+            cross_ref_candidate=bool(props.get("cross_ref_candidate", False)),
+            entities=list(props.get("entities") or []),
+            confidence=float(props.get("confidence", 1.0)),
+            tier=Tier(props.get("tier", Tier.HOT.value)),
+            valid_from=_from_iso(props.get("valid_from")) or datetime.now(UTC),
+            valid_to=_from_iso(props.get("valid_to")),
+            last_accessed=_from_iso(props.get("last_accessed")),
+            access_count=int(props.get("access_count", 0)),
+            source=provenance.source,
+            session_id=provenance.session_id,
+            chunk_hash=provenance.chunk_hash,
+            raw_path=provenance.raw_path,
+        )
 
     # -- the FR-MNT-1 4-way write decision ------------------------------------
 
@@ -661,6 +737,395 @@ class GraphitiStorageBackend:
         if not rows:
             return None
         return await self._node_to_memory(rows[0][0])
+
+    # -- display reads (WebUI READ surface; EMBEDDING-FREE, Cypher-paged) ------
+
+    async def store_stats(self) -> StoreStats:
+        """Aggregate store statistics for the top bar / Dashboard (PRD §4.1).
+
+        A few Cypher aggregation queries (``count`` / grouped ``count``) — never a
+        whole-store stream. The embedding is never read: every aggregate is over
+        scalar properties. ``by_scope_decision`` keys on whether the stored scope
+        string is exactly ``'global'`` (the controlled global/project decision);
+        ``by_source`` decodes only the ``source`` field out of each distinct
+        provenance JSON blob (one small grouped read, not a per-row parse).
+        """
+
+        global_scope = Scope.global_().as_str()
+        # 1) memory totals + active/superseded in one pass.
+        totals = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "RETURN count(m) AS total, "
+            "sum(CASE WHEN m.valid_to IS NULL THEN 1 ELSE 0 END) AS active"
+        )
+        total_memories = int(totals[0][0]) if totals and totals[0][0] is not None else 0
+        active_count = int(totals[0][1]) if totals and totals[0][1] is not None else 0
+        superseded_count = total_memories - active_count
+
+        by_category = await self._count_by(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "RETURN coalesce(m.category, $default) AS k, count(m) AS n",
+            default=DEFAULT_CATEGORY,
+        )
+        by_tier = await self._count_by(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            f"RETURN coalesce(m.tier, $default) AS k, count(m) AS n",
+            default=Tier.HOT.value,
+        )
+        # scope_decision: global iff the stored scope string is exactly 'global'.
+        scope_rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "RETURN CASE WHEN m.scope = $global THEN $g ELSE $p END AS k, count(m) AS n",
+            **{
+                "global": global_scope,
+                "g": ScopeDecision.GLOBAL.value,
+                "p": ScopeDecision.PROJECT.value,
+            },
+        )
+        by_scope_decision = {
+            str(r[0]): int(r[1]) for r in scope_rows if r[0] is not None
+        }
+        # by_source: group by the distinct provenance JSON blob, decode source once
+        # per distinct blob rather than parsing every row.
+        src_rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}) "
+            "RETURN m.provenance AS prov, count(m) AS n"
+        )
+        by_source: dict[str, int] = {}
+        for row in src_rows:
+            source = self._source_of(row[0])
+            by_source[source] = by_source.get(source, 0) + int(row[1])
+
+        entity_rows = await self._query(
+            f"MATCH (e:{ENTITY_LABEL}) RETURN count(e) AS n"
+        )
+        entity_count = (
+            int(entity_rows[0][0]) if entity_rows and entity_rows[0][0] is not None else 0
+        )
+        chunk_rows = await self._query(
+            f"MATCH (c:{RAW_CHUNK_LABEL}) RETURN count(c) AS n"
+        )
+        raw_chunk_count = (
+            int(chunk_rows[0][0]) if chunk_rows and chunk_rows[0][0] is not None else 0
+        )
+
+        return StoreStats(
+            total_memories=total_memories,
+            by_category=by_category,
+            by_scope_decision=by_scope_decision,
+            by_tier=by_tier,
+            by_source=by_source,
+            active_count=active_count,
+            superseded_count=superseded_count,
+            entity_count=entity_count,
+            raw_chunk_count=raw_chunk_count,
+        )
+
+    async def _count_by(self, cypher: str, **params: Any) -> dict[str, int]:
+        """Run a grouped ``RETURN <key> AS k, count(...) AS n`` into a count map."""
+
+        rows = await self._query(cypher, **params)
+        return {str(r[0]): int(r[1]) for r in rows if r[0] is not None}
+
+    @staticmethod
+    def _source_of(provenance_raw: Any) -> str:
+        """Decode just the ``source`` scalar out of a stored provenance JSON blob."""
+
+        if not provenance_raw:
+            return Provenance.classify_sentinel().source
+        return Provenance.model_validate_json(provenance_raw).source
+
+    def _memory_filter_clauses(
+        self,
+        *,
+        category: str | None,
+        scope: Scope | None,
+        tier: Tier | None,
+        entity: str | None,
+        source: str | None,
+        active: bool | None,
+        q: str | None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Build the shared WHERE clauses + params for the Memories table filters.
+
+        Shared by :meth:`query_memories`'s page query and its ``COUNT`` so the two
+        stay in lock-step. Filtering is pushed entirely into Cypher (no Python
+        post-filter). ``category`` is normalized like
+        :class:`~mnemozine.schema.models.MemoryUnit` (lowercased/trimmed); ``q``
+        and ``entity`` are matched case-insensitively.
+        """
+
+        where: list[str] = []
+        params: dict[str, Any] = {}
+        if category is not None:
+            where.append("m.category = $category")
+            params["category"] = category.strip().lower()
+        if scope is not None:
+            where.append("m.scope = $scope")
+            params["scope"] = scope.as_str()
+        if tier is not None:
+            where.append("m.tier = $tier")
+            params["tier"] = tier.value
+        if source is not None:
+            where.append("m.provenance CONTAINS $source_needle")
+            # Provenance is a JSON blob; match the source field token precisely so
+            # 'openai' does not match a substring of another field's value.
+            params["source_needle"] = f'"source":"{source}"'
+        if active is not None:
+            where.append(
+                "m.valid_to IS NULL" if active else "m.valid_to IS NOT NULL"
+            )
+        if entity is not None:
+            where.append(
+                "any(e IN m.entities WHERE toLower(e) = $entity)"
+            )
+            params["entity"] = entity.lower()
+        if q:
+            where.append("toLower(m.content) CONTAINS $q")
+            params["q"] = q.lower()
+        return where, params
+
+    async def query_memories(
+        self,
+        *,
+        category: str | None = None,
+        scope: Scope | None = None,
+        tier: Tier | None = None,
+        entity: str | None = None,
+        source: str | None = None,
+        active: bool | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> MemoryPage:
+        """Filter / order / page the Memories table IN CYPHER (PRD §4.2).
+
+        All filters AND-combine in the WHERE; ordering is newest-first by
+        ``valid_from``; paging is ``SKIP $offset LIMIT $limit`` — all in FalkorDB.
+        The page query RETURNs only the embedding-free display field map (never the
+        node, never the vector); ``total`` is a cheap ``count(m)`` over the same
+        filtered set so the caller never re-scans the store.
+        """
+
+        where, params = self._memory_filter_clauses(
+            category=category,
+            scope=scope,
+            tier=tier,
+            entity=entity,
+            source=source,
+            active=active,
+            q=q,
+        )
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+
+        total_rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}){clause} RETURN count(m) AS n", **params
+        )
+        total = int(total_rows[0][0]) if total_rows and total_rows[0][0] is not None else 0
+
+        page_rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL}){clause} "
+            f"RETURN {self._view_projection('m')} AS v "
+            "ORDER BY v.valid_from DESC SKIP $offset LIMIT $limit",
+            offset=offset,
+            limit=limit,
+            **params,
+        )
+        items = [self._props_to_view(self._props(row[0])) for row in page_rows]
+        return MemoryPage(items=items, total=total)
+
+    async def get_memory_display(self, memory_id: str) -> MemoryView | None:
+        """Read ONE memory for display, EMBEDDING-FREE (detail / non-vector read).
+
+        RETURNs the display field map only (never the node / its vector). Returns
+        ``None`` for an unknown id.
+        """
+
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL} {{id: $id}}) "
+            f"RETURN {self._view_projection('m')} AS v",
+            id=memory_id,
+        )
+        if not rows:
+            return None
+        return self._props_to_view(self._props(rows[0][0]))
+
+    async def graph_snapshot(
+        self,
+        *,
+        scope: Scope | None = None,
+        entity: str | None = None,
+        entity_type: str | None = None,
+        include_idea_seeds: bool = True,
+        node_limit: int = 200,
+    ) -> GraphSnapshot:
+        """A bounded entity/idea-seed subgraph for the explorer (PRD §4.4).
+
+        Entity nodes are selected (optionally centered on ``entity``'s one-hop
+        neighborhood, optionally filtered by ``entity_type``) and capped at
+        ``node_limit`` IN CYPHER (via a ``LIMIT $cap+1`` sentinel over-fetch so
+        ``truncated`` reports "more exist" accurately, never a false positive at
+        exactly ``node_limit``). Structural edges among the kept entities come from
+        a SINGLE aggregate edge query (no per-entity N+1). When
+        ``include_idea_seeds``, cross-ref-candidate memories in ``scope`` are added
+        as ``idea_seed`` nodes (embedding-free projection) with ``mentions`` edges
+        to the entities they reference; per-entity ``memory_count`` is the in-scope
+        link count, computed in Cypher and BOUNDED (the scan that feeds it is
+        ``LIMIT``-capped so a popular entity cannot pull an unbounded slice).
+        """
+
+        # Sentinel over-fetch: ask for one more than the cap so we can tell a
+        # full-but-not-truncated page (== node_limit) from a truncated one (> it),
+        # then trim back to node_limit. Avoids the boundary false-positive where
+        # exactly node_limit entities would otherwise report truncated=True.
+        over_cap = node_limit + 1
+
+        # --- entity nodes (bounded, optional center + type filter) -----------
+        ent_where: list[str] = []
+        ent_params: dict[str, Any] = {"cap": over_cap}
+        if entity_type is not None:
+            ent_where.append("e.type = $entity_type")
+            ent_params["entity_type"] = entity_type
+
+        if entity is not None:
+            center = await self.get_entity(entity)
+            if center is None:
+                return GraphSnapshot(nodes=[], edges=[], truncated=False)
+            # Center + its one-hop neighbors in a single traversal (no N+1).
+            type_clause = " AND o.type = $entity_type" if entity_type is not None else ""
+            ent_params["center"] = center.id
+            ent_rows = await self._query(
+                f"MATCH (c:{ENTITY_LABEL} {{id: $center}}) "
+                f"OPTIONAL MATCH (c)-[:{RELATES_TYPE}]-(o:{ENTITY_LABEL}) "
+                f"WHERE o IS NULL OR (true{type_clause}) "
+                "WITH collect(DISTINCT c) + collect(DISTINCT o) AS ents "
+                "UNWIND ents AS e WITH DISTINCT e WHERE e IS NOT NULL "
+                "RETURN e LIMIT $cap",
+                **ent_params,
+            )
+        else:
+            clause = f" WHERE {' AND '.join(ent_where)}" if ent_where else ""
+            ent_rows = await self._query(
+                f"MATCH (e:{ENTITY_LABEL}){clause} RETURN e LIMIT $cap",
+                **ent_params,
+            )
+
+        all_entities = [self._row_to_entity(row[0]) for row in ent_rows]
+        # The sentinel row (node_limit+1-th) means more entities exist than the cap.
+        truncated = len(all_entities) > node_limit
+        entities = all_entities[:node_limit]
+        entity_by_id = {e.id: e for e in entities}
+        entity_id_by_name = {e.canonical_name.lower(): e.id for e in entities}
+        kept_ids = list(entity_by_id)
+
+        # --- per-entity in-scope memory_count + idea-seed memories -----------
+        # BOUNDED IN CYPHER: a popular entity (e.g. 'rust') could link a huge slice
+        # of the store, so this scan is capped at $mem_cap (a generous multiple of
+        # the node cap). The result feeds the node-bounded memory_count + idea-seed
+        # view, so bounding the linked-memory rows proportionally is coherent and
+        # keeps /api/graph flat as the store grows.
+        mem_where = ["any(e IN m.entities WHERE toLower(e) IN $names)"]
+        mem_params: dict[str, Any] = {
+            "names": list(entity_id_by_name),
+            "mem_cap": node_limit * _GRAPH_SNAPSHOT_MEMORY_FACTOR,
+        }
+        if scope is not None:
+            mem_where.append("m.scope = $scope")
+            mem_params["scope"] = scope.as_str()
+        memory_count: dict[str, int] = dict.fromkeys(kept_ids, 0)
+        idea_nodes: list[GraphSnapshotNode] = []
+        mentions_edges: list[GraphSnapshotEdge] = []
+        if kept_ids:
+            mem_rows = await self._query(
+                f"MATCH (m:{MEMORY_LABEL}) WHERE {' AND '.join(mem_where)} "
+                f"RETURN {self._view_projection('m')} AS v, "
+                "coalesce(m.cross_ref_candidate, false) AS seed "
+                "LIMIT $mem_cap",
+                **mem_params,
+            )
+            for row in mem_rows:
+                view = self._props_to_view(self._props(row[0]))
+                linked_ids = {
+                    entity_id_by_name[name.lower()]
+                    for name in view.entities
+                    if name.lower() in entity_id_by_name
+                }
+                for eid in linked_ids:
+                    memory_count[eid] = memory_count.get(eid, 0) + 1
+                is_seed = bool(row[1]) if len(row) > 1 else False
+                if include_idea_seeds and is_seed and linked_ids:
+                    idea_nodes.append(self._idea_seed_node(view))
+                    for eid in linked_ids:
+                        mentions_edges.append(
+                            GraphSnapshotEdge(
+                                id=f"mentions:{view.id}:{eid}",
+                                source=view.id,
+                                target=eid,
+                                relation="mentions",
+                                weight=1.0,
+                                active=view.is_active,
+                                kind="mentions",
+                            )
+                        )
+
+        entity_nodes = [
+            GraphSnapshotNode(
+                id=e.id,
+                label=e.canonical_name,
+                kind="entity",
+                entity_type=e.type,
+                memory_count=memory_count.get(e.id, 0),
+            )
+            for e in entities
+        ]
+
+        # --- structural edges among kept entities (SINGLE aggregate query) ---
+        struct_edges: list[GraphSnapshotEdge] = []
+        if kept_ids:
+            edge_rows = await self._query(
+                f"MATCH (a:{ENTITY_LABEL})-[r:{RELATES_TYPE}]->(b:{ENTITY_LABEL}) "
+                "WHERE a.id IN $ids AND b.id IN $ids "
+                "RETURN r",
+                ids=kept_ids,
+            )
+            seen: set[str] = set()
+            for row in edge_rows:
+                edge = self._row_to_edge(row[0])
+                if edge.id in seen:
+                    continue
+                seen.add(edge.id)
+                struct_edges.append(
+                    GraphSnapshotEdge(
+                        id=edge.id,
+                        source=edge.from_entity,
+                        target=edge.to_entity,
+                        relation=edge.relation,
+                        weight=edge.weight,
+                        active=edge.is_active,
+                        kind="relates",
+                    )
+                )
+
+        return GraphSnapshot(
+            nodes=entity_nodes + idea_nodes,
+            edges=struct_edges + mentions_edges,
+            truncated=truncated,
+        )
+
+    @staticmethod
+    def _idea_seed_node(view: MemoryView) -> GraphSnapshotNode:
+        """Build a compact ``idea_seed`` node from an embedding-free memory view."""
+
+        snippet = " ".join(view.content.split())
+        if len(snippet) > 80:
+            snippet = snippet[:79].rstrip() + "…"
+        return GraphSnapshotNode(
+            id=view.id,
+            label=snippet,
+            kind="idea_seed",
+            scope=view.scope.as_str(),
+            memory_count=1,
+        )
 
     async def _return_one(self, rows: list[list[Any]], memory_id: str) -> MemoryUnit:
         if not rows:

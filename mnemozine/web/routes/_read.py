@@ -27,7 +27,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
-from mnemozine.interfaces import StorageBackend
+from mnemozine.interfaces import MemoryView, StorageBackend
 from mnemozine.schema.models import GLOBAL_SCOPE, MemoryUnit, Scope
 from mnemozine.web.schemas import (
     MemoryDetail,
@@ -203,6 +203,136 @@ def memory_to_detail(
     )
 
 
+# ---------------------------------------------------------------------------
+# View-based projections (EMBEDDING-FREE display reads)
+# ---------------------------------------------------------------------------
+#
+# The list/detail routes now read the embedding-free
+# :class:`~mnemozine.interfaces.MemoryView` projection (via
+# :meth:`StorageBackend.query_memories` / :meth:`get_memory_display`) instead of
+# streaming full :class:`MemoryUnit`s. These mirror the unit-based projections
+# above but read a ``MemoryView`` — every display field the wire models need is
+# present on the view (provenance is pre-flattened to its scalar fields), so a
+# route never has to reconstruct a full unit or touch the 1024-float embedding.
+
+
+def view_to_list_item(view: MemoryView) -> MemoryListItem:
+    """Project an embedding-free :class:`MemoryView` onto the table-row wire model."""
+
+    return MemoryListItem(
+        id=view.id,
+        category=view.category,
+        cross_ref_candidate=view.cross_ref_candidate,
+        scope_decision=view.scope_decision,
+        content=view.content,
+        scope=view.scope.as_str(),
+        entities=list(view.entities),
+        confidence=view.confidence,
+        tier=view.tier,
+        active=view.is_active,
+        valid_from=view.valid_from,
+        valid_to=view.valid_to,
+        last_accessed=view.last_accessed,
+        access_count=view.access_count,
+        source=view.source,
+    )
+
+
+def _view_supersession_link(view: MemoryView) -> SupersessionLink:
+    """Project a related view onto one end of a supersession chain link."""
+
+    return SupersessionLink(
+        memory_id=view.id,
+        content=view.content,
+        valid_from=view.valid_from,
+        valid_to=view.valid_to,
+    )
+
+
+def derive_supersession_chain_views(
+    view: MemoryView, universe: Sequence[MemoryView]
+) -> tuple[list[SupersessionLink], list[SupersessionLink]]:
+    """Derive the (supersedes, superseded_by) chain for ``view`` (PRD §2/§4.3).
+
+    The embedding-free analogue of :func:`derive_supersession_chain`: supersession
+    is not a stored edge (FR-MNT-1), so the chain is reconstructed temporally from
+    the same-scope / same-category / overlapping-entity neighborhood. ``universe``
+    is that neighborhood as embedding-free :class:`MemoryView`s (the route fetches
+    it with :meth:`StorageBackend.query_memories`, never a whole-store stream).
+    """
+
+    scope = view.scope.as_str()
+    related = [
+        m
+        for m in universe
+        if m.id != view.id
+        and m.scope.as_str() == scope
+        and m.category == view.category
+        and _overlaps(m.entities, view.entities)
+    ]
+
+    supersedes: list[MemoryView] = []
+    superseded_by: list[MemoryView] = []
+
+    for other in related:
+        if (
+            other.valid_to is not None
+            and other.valid_from <= view.valid_from
+            and other.valid_to <= view.valid_from
+        ):
+            supersedes.append(other)
+            continue
+        if view.valid_to is not None and other.valid_from >= view.valid_to:
+            superseded_by.append(other)
+
+    supersedes.sort(key=lambda m: m.valid_from, reverse=True)
+    superseded_by.sort(key=lambda m: m.valid_from)
+    return (
+        [_view_supersession_link(m) for m in supersedes],
+        [_view_supersession_link(m) for m in superseded_by],
+    )
+
+
+def view_to_detail(
+    view: MemoryView, universe: Sequence[MemoryView]
+) -> MemoryDetail:
+    """Project an embedding-free :class:`MemoryView` (+ peers) onto the detail model.
+
+    ``universe`` is the same-scope neighborhood (as :class:`MemoryView`s) the
+    supersession chain is derived against. The provenance link is read straight
+    off the view's flattened scalar fields — the nested blob and the embedding are
+    never transferred for a display read.
+    """
+
+    supersedes, superseded_by = derive_supersession_chain_views(view, universe)
+    return MemoryDetail(
+        id=view.id,
+        category=view.category,
+        cross_ref_candidate=view.cross_ref_candidate,
+        scope_decision=view.scope_decision,
+        content=view.content,
+        scope=view.scope.as_str(),
+        entities=list(view.entities),
+        confidence=view.confidence,
+        tier=view.tier,
+        validity=ValidityWindow(
+            valid_from=view.valid_from,
+            valid_to=view.valid_to,
+            active=view.is_active,
+        ),
+        provenance=Provenance(
+            source=view.source,
+            session_id=view.session_id,
+            chunk_hash=view.chunk_hash,
+            raw_path=view.raw_path,
+        ),
+        supersedes=supersedes,
+        superseded_by=superseded_by,
+        last_accessed=view.last_accessed,
+        access_count=view.access_count,
+    )
+
+
 def build_scope_tree(memories: Iterable[MemoryUnit]) -> ScopeTreeNode:
     """Build the hierarchical project/sub-scope tree with per-node counts.
 
@@ -285,6 +415,9 @@ __all__ = [
     "memory_to_list_item",
     "memory_to_detail",
     "derive_supersession_chain",
+    "view_to_list_item",
+    "view_to_detail",
+    "derive_supersession_chain_views",
     "build_scope_tree",
     "collect_memories",
 ]

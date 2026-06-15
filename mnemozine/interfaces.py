@@ -42,6 +42,7 @@ from mnemozine.schema.models import (
     Scope,
     ScopeDecision,
     SourceSession,
+    Tier,
 )
 
 # ---------------------------------------------------------------------------
@@ -178,6 +179,179 @@ class Neighbor:
 
     entity: Entity
     edge: Edge
+
+
+# ---------------------------------------------------------------------------
+# Display-read value objects (web-API performance: embedding-free projections)
+# ---------------------------------------------------------------------------
+#
+# These back the WebUI READ surface (/api/stats, /api/memories[/{id}], /api/graph).
+# They exist so the read paths NEVER transfer or parse the 1024-float bge-m3
+# embedding (only :meth:`StorageBackend.scoped_query`'s KNN needs it) and so
+# filtering / ordering / paging / aggregation are pushed into FalkorDB Cypher
+# instead of loading the whole store into Python. A display read returns a
+# :class:`MemoryView` (a lightweight, embedding-free projection of a
+# :class:`~mnemozine.schema.models.MemoryUnit`) rather than a full unit.
+
+
+@dataclass(slots=True)
+class MemoryView:
+    """A lightweight, EMBEDDING-FREE projection of a memory for display reads.
+
+    The web read paths (list table, detail, graph idea-seeds, any non-vector
+    read) need every display field of a :class:`~mnemozine.schema.models.MemoryUnit`
+    EXCEPT the 1024-float embedding. Selecting/parsing that vector for every row
+    is what made ``/api/memories`` and ``/api/stats`` slow as the store grew, so
+    the display contract returns this projection — the query RETURNs a map of just
+    these fields (or RETURNs the node and drops ``embedding``), never the vector.
+
+    Carries exactly the fields the wire models
+    (:class:`~mnemozine.web.schemas.MemoryListItem` / ``MemoryDetail``) project,
+    so a route can build either from one ``MemoryView`` with no further store
+    round-trip. ``scope_decision`` and ``is_active`` mirror the same-named
+    :class:`MemoryUnit` properties (derived from ``scope`` / ``valid_to``) so a
+    caller never has to reconstruct a full unit to read them.
+    """
+
+    id: str
+    content: str
+    scope: Scope
+    category: str
+    cross_ref_candidate: bool
+    entities: list[str]
+    confidence: float
+    tier: Tier
+    valid_from: datetime
+    valid_to: datetime | None
+    last_accessed: datetime | None
+    access_count: int
+    # Provenance, flattened to the few scalar fields the wire ``Provenance`` /
+    # ``MemoryListItem.source`` need — never the whole nested provenance blob and
+    # never the embedding.
+    source: str
+    session_id: str = ""
+    chunk_hash: str | None = None
+    raw_path: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """True when the validity window is open (mirrors ``MemoryUnit.is_active``)."""
+
+        return self.valid_to is None
+
+    @property
+    def scope_decision(self) -> ScopeDecision:
+        """Controlled global/project decision implied by the scope (FR-EXT-3)."""
+
+        return ScopeDecision.GLOBAL if self.scope.is_global else ScopeDecision.PROJECT
+
+
+@dataclass(slots=True)
+class MemoryPage:
+    """A paged slice of display memories + the total of the filtered set.
+
+    Returned by :meth:`StorageBackend.query_memories`. ``items`` is the requested
+    page (already filtered, ordered newest-first by ``valid_from``, and sliced by
+    ``offset``/``limit`` IN CYPHER), each an embedding-free :class:`MemoryView`.
+    ``total`` is the count of the WHOLE filtered set before paging (a cheap Cypher
+    ``COUNT``, not ``len(items)``), so the wire :class:`~mnemozine.web.schemas.Page`
+    can report it without a second whole-store scan.
+    """
+
+    items: list[MemoryView]
+    total: int
+
+
+@dataclass(slots=True)
+class StoreStats:
+    """Aggregate store statistics for the top bar / Dashboard (PRD §4.1).
+
+    Returned by :meth:`StorageBackend.store_stats`. Every field is computed by
+    Cypher ``COUNT`` / aggregation (one or a few grouping queries) — NEVER by
+    streaming rows into Python — so it stays cheap as the store grows. The dict
+    fields map a key to its count; absent keys mean zero.
+
+    * ``total_memories``  — all memory nodes (active + superseded, all tiers).
+    * ``by_category``     — count per free-form ``category`` over all memories.
+    * ``by_scope_decision`` — count per controlled decision: ``'global'`` vs
+      ``'project'`` (the :class:`ScopeDecision` value), derived from whether the
+      stored scope string is exactly ``'global'``.
+    * ``by_tier``         — count per ``tier`` value (``'hot'`` / ``'archive'``).
+    * ``by_source``       — count per ingest source (from each memory's
+      provenance ``source``).
+    * ``active_count`` / ``superseded_count`` — open vs closed validity windows
+      (``valid_to IS NULL`` vs not).
+    * ``entity_count``    — total entity nodes.
+    * ``raw_chunk_count`` — total retained raw-chunk nodes (the raw tier).
+    """
+
+    total_memories: int = 0
+    by_category: dict[str, int] = field(default_factory=dict)
+    by_scope_decision: dict[str, int] = field(default_factory=dict)
+    by_tier: dict[str, int] = field(default_factory=dict)
+    by_source: dict[str, int] = field(default_factory=dict)
+    active_count: int = 0
+    superseded_count: int = 0
+    entity_count: int = 0
+    raw_chunk_count: int = 0
+
+
+@dataclass(slots=True)
+class GraphSnapshotNode:
+    """One bounded node in a :class:`GraphSnapshot` (entity or idea-seed memory).
+
+    ``kind`` is ``'entity'`` for an entity node or ``'idea_seed'`` for a
+    cross-ref-candidate memory node. ``label`` is the display label (an entity's
+    canonical name, or a memory content snippet — the snapshot may pre-truncate
+    long content). ``entity_type`` is set only for entity nodes; ``scope`` only
+    for memory nodes. ``memory_count`` is how many in-scope memories link an
+    entity node (always 1 for an idea-seed node). The route maps these onto the
+    wire :class:`~mnemozine.web.schemas.GraphNode` (prefixing the id).
+    """
+
+    id: str
+    label: str
+    kind: str
+    entity_type: str | None = None
+    scope: str | None = None
+    memory_count: int = 0
+
+
+@dataclass(slots=True)
+class GraphSnapshotEdge:
+    """One bounded edge in a :class:`GraphSnapshot`.
+
+    A structural entity-entity relationship (``kind='relates'``) or an idea-seed
+    ``mentions`` link from a memory node to an entity it mentions
+    (``kind='mentions'``). ``source``/``target`` are the bare node ids
+    (entity id or memory id) — the route prefixes them to the Cytoscape node-id
+    namespace and overlays explainable cross-reference edges separately (the
+    FR-RET-6 overlay is a CrossReferencer concern, not part of this snapshot).
+    """
+
+    id: str
+    source: str
+    target: str
+    relation: str
+    weight: float
+    active: bool
+    kind: str = "relates"
+
+
+@dataclass(slots=True)
+class GraphSnapshot:
+    """A bounded entity/idea-seed subgraph for the explorer (PRD §4.4).
+
+    Returned by :meth:`StorageBackend.graph_snapshot`. Computed in Cypher with a
+    ``LIMIT`` and a SINGLE aggregate edge query (NEVER a per-entity N+1 neighbor
+    loop), so /api/graph stays bounded as the store grows. ``nodes`` are the
+    capped entity + idea-seed nodes; ``edges`` are the structural + mentions edges
+    among those nodes; ``truncated`` is True when the node cap fired (more exist).
+    """
+
+    nodes: list[GraphSnapshotNode] = field(default_factory=list)
+    edges: list[GraphSnapshotEdge] = field(default_factory=list)
+    truncated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +578,118 @@ class StorageBackend(Protocol):
 
     async def record_access(self, memory_id: str) -> None:
         """Bump ``last_accessed``/``access_count`` for decay ranking (FR-MNT-3)."""
+        ...
+
+    # --- display reads (WebUI READ surface; EMBEDDING-FREE, Cypher-paged) --
+    #
+    # These four methods back the slow WebUI read endpoints. They exist so the
+    # read paths push filtering / ordering / paging / aggregation into FalkorDB
+    # Cypher and NEVER select or parse the 1024-float bge-m3 embedding for a
+    # display read (only :meth:`scoped_query`'s KNN needs the vector). The
+    # enumeration methods below (:meth:`iter_memories` et al.) remain the
+    # maintenance/whole-store seam and still yield full :class:`MemoryUnit`s; the
+    # display reads return the embedding-free :class:`MemoryView` projection.
+
+    async def store_stats(self) -> StoreStats:
+        """Aggregate store statistics for the top bar / Dashboard (PRD §4.1).
+
+        Computed by Cypher ``COUNT`` / aggregation (one or a few grouping
+        queries), NEVER by streaming every row into Python. Returns a
+        :class:`StoreStats`: ``total_memories``; ``by_category`` /
+        ``by_scope_decision`` (``'global'`` vs ``'project'``) / ``by_tier`` /
+        ``by_source`` count maps; ``active_count`` vs ``superseded_count`` (open
+        vs closed validity window); ``entity_count``; and ``raw_chunk_count``.
+        The embedding is never touched — these are pure aggregates over scalar
+        properties. Replaces the old ``/api/stats`` whole-store stream.
+        """
+        ...
+
+    async def query_memories(
+        self,
+        *,
+        category: str | None = None,
+        scope: Scope | None = None,
+        tier: Tier | None = None,
+        entity: str | None = None,
+        source: str | None = None,
+        active: bool | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> MemoryPage:
+        """Filter / order / page the Memories table IN CYPHER (PRD §4.2).
+
+        The performant replacement for "stream the whole store, filter + sort +
+        slice in Python". All filtering, the newest-first ordering, and the
+        ``SKIP``/``LIMIT`` paging happen in FalkorDB; the embedding is projected
+        out so it is never transferred for a list read.
+
+        Filters (all optional, AND-combined):
+
+        * ``category`` — exact free-form category (normalized lowercased/trimmed,
+          matching :class:`~mnemozine.schema.models.MemoryUnit` normalization).
+        * ``scope`` — EXACT stored scope string (no ancestor composition; this is
+          a table filter, not a retrieval query, so it keeps the existing list
+          semantics where selecting a scope shows memories stored at that scope).
+        * ``tier`` — ``hot`` / ``archive``.
+        * ``entity`` — case-insensitive membership in the memory's ``entities``.
+        * ``source`` — exact provenance source.
+        * ``active`` — ``True`` = open window only, ``False`` = closed only,
+          ``None`` = both.
+        * ``q`` — case-insensitive substring of ``content``.
+
+        Ordering is newest-first by ``valid_from`` (freshest facts lead). Returns
+        a :class:`MemoryPage`: ``items`` is the ``offset``/``limit`` slice as
+        embedding-free :class:`MemoryView`s, and ``total`` is a cheap Cypher
+        ``COUNT`` of the WHOLE filtered set (before paging) so the caller can
+        report the page total without a second scan.
+        """
+        ...
+
+    async def get_memory_display(self, memory_id: str) -> MemoryView | None:
+        """Read ONE memory for display, EMBEDDING-FREE (list detail / non-vector).
+
+        The keyed display read: returns the :class:`MemoryView` for ``memory_id``
+        (every field the detail wire model needs) WITHOUT selecting or parsing the
+        embedding, or ``None`` if the id is unknown. Use this for the detail page
+        and any non-vector keyed read; reserve the full-unit
+        :meth:`scoped_query` vector path for retrieval. (Contrast the maintenance
+        keyed read used internally, which may load the full unit including its
+        vector for re-embed.)
+        """
+        ...
+
+    async def graph_snapshot(
+        self,
+        *,
+        scope: Scope | None = None,
+        entity: str | None = None,
+        entity_type: str | None = None,
+        include_idea_seeds: bool = True,
+        node_limit: int = 200,
+    ) -> GraphSnapshot:
+        """A bounded entity/idea-seed subgraph for the explorer (PRD §4.4).
+
+        The performant replacement for "load every entity + every memory, then run
+        a per-entity neighbor query (N+1)". Bounds the result IN CYPHER:
+
+        * Entity nodes (optionally filtered by ``entity_type``, optionally centered
+          on ``entity``'s one-hop neighborhood) are capped at ``node_limit``.
+        * Structural entity-entity edges among the kept nodes come from a SINGLE
+          aggregate edge query (NO per-entity N+1 loop).
+        * When ``include_idea_seeds``, cross-ref-candidate memories in ``scope``
+          (exact scope when given) are added as ``idea_seed`` nodes with
+          ``mentions`` edges to the entities they reference; the embedding is
+          never selected for these.
+        * ``memory_count`` on each entity node is the count of in-scope memories
+          that link it (computed in Cypher).
+
+        Returns a :class:`GraphSnapshot` (``nodes`` + ``edges`` + ``truncated``).
+        ``truncated`` is True when the node cap fired. The FR-RET-6 cross-reference
+        overlay is NOT part of this snapshot — it is a :class:`CrossReferencer`
+        concern the route overlays on top, so the snapshot stays a pure,
+        bounded structural read.
+        """
         ...
 
     # --- enumeration / scan (FR-MNT-2/3/4, R5 audit) ----------------------

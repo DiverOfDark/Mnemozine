@@ -21,9 +21,15 @@ from typing import Any
 
 from mnemozine.interfaces import (
     Extractor,
+    GraphSnapshot,
+    GraphSnapshotEdge,
+    GraphSnapshotNode,
     MaintenanceReport,
+    MemoryPage,
+    MemoryView,
     Neighbor,
     RetrievedMemory,
+    StoreStats,
     WriteDecision,
     WriteResult,
 )
@@ -128,6 +134,209 @@ class OfflineStorage:
         m = self.memories[memory_id]
         m.access_count += 1
         m.last_accessed = datetime.now(UTC)
+
+    # --- display reads (WebUI READ surface; EMBEDDING-FREE) ------------------
+    #
+    # The four embedding-free display reads, mirrored from the conftest
+    # ``InMemoryStorage`` fake so the two in-memory ``StorageBackend`` fakes stay
+    # behaviourally consistent with each other and with the FalkorDB backend's
+    # Cypher contract. They never touch an embedding (the dict store does not even
+    # keep one) and project onto the lightweight :class:`MemoryView`.
+
+    @staticmethod
+    def _to_view(m: MemoryUnit) -> MemoryView:
+        """Project a stored unit onto the embedding-free display view."""
+
+        return MemoryView(
+            id=m.id,
+            content=m.content,
+            scope=m.scope,
+            category=m.category,
+            cross_ref_candidate=m.cross_ref_candidate,
+            entities=list(m.entities),
+            confidence=m.confidence,
+            tier=m.tier,
+            valid_from=m.valid_from,
+            valid_to=m.valid_to,
+            last_accessed=m.last_accessed,
+            access_count=m.access_count,
+            source=m.provenance.source,
+            session_id=m.provenance.session_id,
+            chunk_hash=m.provenance.chunk_hash,
+            raw_path=m.provenance.raw_path,
+        )
+
+    async def store_stats(self) -> StoreStats:
+        by_category: dict[str, int] = {}
+        by_scope_decision: dict[str, int] = {}
+        by_tier: dict[str, int] = {}
+        by_source: dict[str, int] = {}
+        active = 0
+        for m in self.memories.values():
+            by_category[m.category] = by_category.get(m.category, 0) + 1
+            decision = m.scope_decision.value
+            by_scope_decision[decision] = by_scope_decision.get(decision, 0) + 1
+            by_tier[m.tier.value] = by_tier.get(m.tier.value, 0) + 1
+            src = m.provenance.source
+            by_source[src] = by_source.get(src, 0) + 1
+            if m.is_active:
+                active += 1
+        total = len(self.memories)
+        return StoreStats(
+            total_memories=total,
+            by_category=by_category,
+            by_scope_decision=by_scope_decision,
+            by_tier=by_tier,
+            by_source=by_source,
+            active_count=active,
+            superseded_count=total - active,
+            entity_count=len(self.entities),
+            raw_chunk_count=len(self.raw_chunks),
+        )
+
+    async def query_memories(
+        self,
+        *,
+        category: str | None = None,
+        scope: Scope | None = None,
+        tier: Tier | None = None,
+        entity: str | None = None,
+        source: str | None = None,
+        active: bool | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> MemoryPage:
+        scope_str = scope.as_str() if scope is not None else None
+        cat = category.strip().lower() if category is not None else None
+        ent = entity.lower() if entity is not None else None
+        ql = q.lower() if q else None
+        matched = [
+            m
+            for m in self.memories.values()
+            if (cat is None or m.category == cat)
+            and (scope_str is None or m.scope.as_str() == scope_str)
+            and (tier is None or m.tier is tier)
+            and (source is None or m.provenance.source == source)
+            and (active is None or m.is_active is active)
+            and (ent is None or ent in {e.lower() for e in m.entities})
+            and (ql is None or ql in m.content.lower())
+        ]
+        matched.sort(key=lambda m: m.valid_from, reverse=True)
+        total = len(matched)
+        page = matched[offset : offset + limit]
+        return MemoryPage(items=[self._to_view(m) for m in page], total=total)
+
+    async def get_memory_display(self, memory_id: str) -> MemoryView | None:
+        m = self.memories.get(memory_id)
+        return self._to_view(m) if m is not None else None
+
+    async def graph_snapshot(
+        self,
+        *,
+        scope: Scope | None = None,
+        entity: str | None = None,
+        entity_type: str | None = None,
+        include_idea_seeds: bool = True,
+        node_limit: int = 200,
+    ) -> GraphSnapshot:
+        scope_str = scope.as_str() if scope is not None else None
+        entities = [
+            e
+            for e in self.entities.values()
+            if entity_type is None or (e.type or "") == entity_type
+        ]
+        if entity is not None:
+            center = await self.get_entity(entity)
+            if center is None:
+                return GraphSnapshot(nodes=[], edges=[], truncated=False)
+            keep = {center.id}
+            for nb in await self.neighbors(center.canonical_name, active_only=False):
+                keep.add(nb.entity.id)
+            entities = [e for e in entities if e.id in keep]
+        # Over-fetch sentinel: truncated iff the selected set exceeds node_limit
+        # (mirrors the backend's LIMIT $cap+1 over-fetch), so exactly node_limit
+        # entities is NOT a false-positive truncation.
+        truncated = len(entities) > node_limit
+        entities = entities[:node_limit]
+
+        entity_by_id = {e.id: e for e in entities}
+        entity_id_by_name = {e.canonical_name.lower(): e.id for e in entities}
+
+        memory_count: dict[str, int] = dict.fromkeys(entity_by_id, 0)
+        idea_nodes: list[GraphSnapshotNode] = []
+        mentions_edges: list[GraphSnapshotEdge] = []
+        for m in self.memories.values():
+            if scope_str is not None and m.scope.as_str() != scope_str:
+                continue
+            linked = {
+                entity_id_by_name[name.lower()]
+                for name in m.entities
+                if name.lower() in entity_id_by_name
+            }
+            for eid in linked:
+                memory_count[eid] = memory_count.get(eid, 0) + 1
+            if include_idea_seeds and m.cross_ref_candidate and linked:
+                snippet = " ".join(m.content.split())
+                if len(snippet) > 80:
+                    snippet = snippet[:79].rstrip() + "…"
+                idea_nodes.append(
+                    GraphSnapshotNode(
+                        id=m.id,
+                        label=snippet,
+                        kind="idea_seed",
+                        scope=m.scope.as_str(),
+                        memory_count=1,
+                    )
+                )
+                for eid in linked:
+                    mentions_edges.append(
+                        GraphSnapshotEdge(
+                            id=f"mentions:{m.id}:{eid}",
+                            source=m.id,
+                            target=eid,
+                            relation="mentions",
+                            weight=1.0,
+                            active=m.is_active,
+                            kind="mentions",
+                        )
+                    )
+
+        entity_nodes = [
+            GraphSnapshotNode(
+                id=e.id,
+                label=e.canonical_name,
+                kind="entity",
+                entity_type=e.type,
+                memory_count=memory_count.get(e.id, 0),
+            )
+            for e in entities
+        ]
+
+        struct_edges: list[GraphSnapshotEdge] = []
+        seen: set[str] = set()
+        for edge in self.edges.values():
+            if edge.id in seen:
+                continue
+            if edge.from_entity in entity_by_id and edge.to_entity in entity_by_id:
+                seen.add(edge.id)
+                struct_edges.append(
+                    GraphSnapshotEdge(
+                        id=edge.id,
+                        source=edge.from_entity,
+                        target=edge.to_entity,
+                        relation=edge.relation,
+                        weight=edge.weight,
+                        active=edge.is_active,
+                        kind="relates",
+                    )
+                )
+
+        return GraphSnapshot(
+            nodes=entity_nodes + idea_nodes,
+            edges=struct_edges + mentions_edges,
+            truncated=truncated,
+        )
 
     async def iter_memories(
         self,

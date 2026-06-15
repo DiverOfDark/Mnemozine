@@ -6,11 +6,13 @@ reports each as ``ok`` / ``degraded`` / ``down`` / ``unknown`` without ever
 failing the request (a console that 500s because Ollama is down is useless). The
 overall status is the worst component status, ``ok`` when all are healthy.
 
-Stats compute the top-bar / Dashboard totals from the live store: per-type,
-per-tier, and per-source counts plus active/superseded/entity counts, streamed
-off :meth:`StorageBackend.iter_memories` / :meth:`iter_entities`. Both run
-identically against the in-memory fake in tests; the infra probes degrade to
-``down``/``unknown`` offline rather than raising.
+Stats compute the top-bar / Dashboard totals from the live store via
+:meth:`StorageBackend.store_stats` — per-category, per-scope-decision, per-tier,
+and per-source counts plus active/superseded/entity/raw-chunk counts, all from
+Cypher ``COUNT`` / grouping aggregates (NEVER a whole-store stream that
+loads/parses the 1024-float embedding). Both run identically against the
+in-memory fake in tests; the infra probes degrade to ``down``/``unknown`` offline
+rather than raising.
 """
 
 from __future__ import annotations
@@ -129,43 +131,21 @@ async def health(container: ContainerDep, settings: SettingsDep) -> HealthRespon
 async def stats(storage: StorageDep) -> StoreStatsResponse:
     """Live store totals for the top bar + Dashboard (PRD §4.1).
 
-    Streams the store once and tallies per-category / per-scope-decision / per-tier
-    / per-source counts plus active vs superseded; entities off ``iter_entities``.
+    Delegates to :meth:`StorageBackend.store_stats`, which computes every total
+    with Cypher ``COUNT`` / grouping aggregates over scalar properties — the
+    embedding is never touched and the store is never streamed into Python.
     """
 
-    by_category: dict[str, int] = {}
-    by_scope_decision: dict[str, int] = {}
-    by_tier: dict[str, int] = {}
-    by_source: dict[str, int] = {}
-    total = 0
-    active = 0
-    superseded = 0
-    async for memory in storage.iter_memories():
-        total += 1
-        by_category[memory.category] = by_category.get(memory.category, 0) + 1
-        decision = memory.scope_decision.value
-        by_scope_decision[decision] = by_scope_decision.get(decision, 0) + 1
-        by_tier[memory.tier.value] = by_tier.get(memory.tier.value, 0) + 1
-        src = memory.provenance.source
-        by_source[src] = by_source.get(src, 0) + 1
-        if memory.is_active:
-            active += 1
-        else:
-            superseded += 1
-
-    entity_count = 0
-    async for _entity in storage.iter_entities():
-        entity_count += 1
-
+    s = await storage.store_stats()
     return StoreStatsResponse(
-        total_memories=total,
-        by_category=by_category,
-        by_scope_decision=by_scope_decision,
-        by_tier=by_tier,
-        by_source=by_source,
-        active_count=active,
-        superseded_count=superseded,
-        entity_count=entity_count,
+        total_memories=s.total_memories,
+        by_category=s.by_category,
+        by_scope_decision=s.by_scope_decision,
+        by_tier=s.by_tier,
+        by_source=s.by_source,
+        active_count=s.active_count,
+        superseded_count=s.superseded_count,
+        entity_count=s.entity_count,
     )
 
 

@@ -1010,3 +1010,202 @@ async def test_re_extract_from_raw_chunks_bumps_chunk_data_version() -> None:
     assert store._client.driver.raw_chunks["rx"]["data_version"] == CURRENT_DATA_VERSION  # type: ignore[attr-defined]
     reread = [c async for c in store.iter_raw_chunks()]
     assert reread[0].data_version == CURRENT_DATA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Display reads (WebUI READ surface): embedding-free, Cypher-paged/aggregated
+# ---------------------------------------------------------------------------
+
+
+async def _seed_display_store() -> GraphitiStorageBackend:
+    """A small store covering every display-read filter axis + a raw chunk."""
+
+    store = _backend(dedup_threshold=0.999)
+    await store.upsert_entity(Entity(id="ent-rust", canonical_name="rust", type="language"))
+    await store.upsert_entity(Entity(id="ent-tokio", canonical_name="tokio", type="library"))
+    await store.upsert_edge(
+        Edge(id="e1", from_entity="ent-rust", to_entity="ent-tokio", relation="uses", weight=0.7)
+    )
+    # active global preference
+    await store.upsert_memory(
+        _memory(content="prefers thiserror", scope=Scope.global_(), entities=["rust"], mid="m1")
+    )
+    # superseded global preference
+    await store.upsert_memory(
+        _memory(content="prefers anyhow", scope=Scope.global_(), entities=["rust"], mid="m2")
+    )
+    await store.close_validity_window("m2")
+    # project-scoped decision from a different source
+    proj = _memory(
+        content="pins tokio 1.38", scope=Scope.project("rust-cli"), entities=["tokio"],
+        category="decision", mid="m3",
+    )
+    proj.provenance = Provenance(source="openai", session_id="sess-2")
+    await store.upsert_memory(proj)
+    # archived cross-ref idea seed
+    idea = _memory(
+        content="idea: async cli streaming logs", scope=Scope.global_(),
+        entities=["tokio", "rust"], category="idea", cross_ref_candidate=True, mid="m4",
+    )
+    await store.upsert_memory(idea)
+    await store.archive("m4")
+    await store.persist_raw_chunk(_raw_chunk(content_hash="rc1", scope=Scope.global_()))
+    return store
+
+
+async def test_store_stats_aggregates_in_cypher() -> None:
+    store = await _seed_display_store()
+    stats = await store.store_stats()
+    assert stats.total_memories == 4
+    assert stats.by_category == {"preference": 2, "decision": 1, "idea": 1}
+    assert stats.by_scope_decision == {"global": 3, "project": 1}
+    assert stats.by_tier == {"hot": 3, "archive": 1}
+    assert stats.by_source == {"claude_code": 3, "openai": 1}
+    assert stats.active_count == 3
+    assert stats.superseded_count == 1
+    assert stats.entity_count == 2
+    assert stats.raw_chunk_count == 1
+
+
+async def test_store_stats_never_selects_embedding() -> None:
+    store = await _seed_display_store()
+    before = len(store._client.driver.queries)  # type: ignore[attr-defined]
+    await store.store_stats()
+    new_queries = store._client.driver.queries[before:]  # type: ignore[attr-defined]
+    assert new_queries  # it did run Cypher
+    assert all("embedding" not in q for q in new_queries)
+    assert all("RETURN m\n" not in q and not q.endswith("RETURN m") for q in new_queries)
+
+
+async def test_query_memories_filters_orders_pages_in_cypher() -> None:
+    store = await _seed_display_store()
+    page = await store.query_memories()
+    assert page.total == 4
+    # newest-first by valid_from (all default to ~now; just assert shape + count)
+    assert len(page.items) == 4
+    assert all(isinstance(v.source, str) for v in page.items)
+
+    # category filter
+    pref = await store.query_memories(category="Preference")
+    assert pref.total == 2 and {v.id for v in pref.items} == {"m1", "m2"}
+    # active-only
+    active = await store.query_memories(active=True)
+    assert "m2" not in {v.id for v in active.items}
+    # superseded-only
+    superseded = await store.query_memories(active=False)
+    assert {v.id for v in superseded.items} == {"m2"}
+    # scope (exact)
+    scoped = await store.query_memories(scope=Scope.project("rust-cli"))
+    assert {v.id for v in scoped.items} == {"m3"}
+    # tier
+    arch = await store.query_memories(tier=Tier.ARCHIVE)
+    assert {v.id for v in arch.items} == {"m4"}
+    # source
+    oai = await store.query_memories(source="openai")
+    assert {v.id for v in oai.items} == {"m3"}
+    # entity (case-insensitive)
+    tok = await store.query_memories(entity="Tokio")
+    assert {v.id for v in tok.items} == {"m3", "m4"}
+    # free-text substring
+    txt = await store.query_memories(q="tokio")
+    assert {v.id for v in txt.items} == {"m3"}
+
+
+async def test_query_memories_paging_total_is_full_count() -> None:
+    store = await _seed_display_store()
+    first = await store.query_memories(limit=2, offset=0)
+    second = await store.query_memories(limit=2, offset=2)
+    assert first.total == 4 and second.total == 4
+    assert len(first.items) == 2 and len(second.items) == 2
+    assert {v.id for v in first.items}.isdisjoint({v.id for v in second.items})
+
+
+async def test_query_memories_never_selects_embedding() -> None:
+    store = await _seed_display_store()
+    before = len(store._client.driver.queries)  # type: ignore[attr-defined]
+    await store.query_memories(category="preference", limit=10)
+    new_queries = store._client.driver.queries[before:]  # type: ignore[attr-defined]
+    assert all("embedding" not in q for q in new_queries)
+
+
+async def test_get_memory_display_is_embedding_free() -> None:
+    store = await _seed_display_store()
+    view = await store.get_memory_display("m1")
+    assert view is not None
+    assert view.id == "m1"
+    assert view.content == "prefers thiserror"
+    assert view.is_active is True
+    assert view.scope_decision.value == "global"
+    assert view.source == "claude_code"
+    assert await store.get_memory_display("nope") is None
+
+
+async def test_graph_snapshot_bounded_no_n_plus_one() -> None:
+    store = await _seed_display_store()
+    snap = await store.graph_snapshot()
+    ent_ids = {n.id for n in snap.nodes if n.kind == "entity"}
+    assert ent_ids == {"ent-rust", "ent-tokio"}
+    # the archived idea-seed is an idea_seed node with mentions edges
+    idea_ids = {n.id for n in snap.nodes if n.kind == "idea_seed"}
+    assert idea_ids == {"m4"}
+    relates = [e for e in snap.edges if e.kind == "relates"]
+    assert any(e.source == "ent-rust" and e.target == "ent-tokio" for e in relates)
+    mentions = [e for e in snap.edges if e.kind == "mentions"]
+    assert mentions and all(e.source == "m4" for e in mentions)
+    assert snap.truncated is False
+    # per-entity in-scope memory_count computed in the snapshot
+    by_id = {n.id: n for n in snap.nodes}
+    assert by_id["ent-tokio"].memory_count >= 1
+
+
+async def test_graph_snapshot_node_limit_truncates() -> None:
+    store = await _seed_display_store()
+    snap = await store.graph_snapshot(node_limit=1)
+    assert len([n for n in snap.nodes if n.kind == "entity"]) == 1
+    assert snap.truncated is True
+
+
+async def test_graph_snapshot_truncated_not_false_positive_at_exact_limit() -> None:
+    """Exactly ``node_limit`` entities must NOT report ``truncated`` (boundary fix).
+
+    Regression guard for the ``len(entities) >= node_limit`` false positive: the
+    seed store has exactly 2 entities, so ``node_limit=2`` returns all of them and
+    nothing was cut — ``truncated`` must be False. (The over-fetch sentinel only
+    flips it True when a (node_limit+1)-th entity actually exists.)
+    """
+
+    store = await _seed_display_store()  # exactly 2 entities (rust, tokio)
+    snap = await store.graph_snapshot(node_limit=2)
+    assert len([n for n in snap.nodes if n.kind == "entity"]) == 2
+    assert snap.truncated is False
+
+
+def test_provenance_source_serialization_is_compact_for_filter() -> None:
+    """Pin the JSON shape the ``source`` filter substring-matches against.
+
+    ``query_memories(source=...)`` filters in Cypher with
+    ``m.provenance CONTAINS '"source":"<value>"'`` over the stored
+    ``Provenance.model_dump_json()`` blob. That match silently depends on the
+    serialization being COMPACT (no space after the colon / comma). This pins it so
+    a pydantic config change that started emitting ``"source": "..."`` (with a
+    space) fails here loudly instead of silently breaking the live filter.
+    """
+
+    blob = Provenance(source="openai", session_id="s").model_dump_json()
+    assert '"source":"openai"' in blob  # compact token the filter needle expects
+    assert '"source": "openai"' not in blob  # no space => needle stays valid
+
+
+async def test_query_memories_source_filter_matches_via_provenance_blob() -> None:
+    """End-to-end: the source filter actually selects the right row through Cypher.
+
+    Complements the serialization pin above by exercising the real backend filter
+    path (the ``CONTAINS '"source":"<value>"'`` clause) against the stored blob, so
+    the contract covers BOTH the JSON shape and the filter wiring that relies on it.
+    """
+
+    store = await _seed_display_store()
+    oai = await store.query_memories(source="openai")
+    assert {v.id for v in oai.items} == {"m3"}
+    cc = await store.query_memories(source="claude_code")
+    assert "m3" not in {v.id for v in cc.items}

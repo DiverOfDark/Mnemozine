@@ -1,13 +1,16 @@
 """Memories list + detail routes (PRD §4.2 / §4.3, §6 GET /api/memories[/{id}]).
 
-The core read surface. The list endpoint streams the store
-(:meth:`StorageBackend.iter_memories`, the Protocol's only whole-store entry
-point) and applies the PRD §4.2 table filters — type / scope / tier / entity /
-active-vs-superseded / source / free-text — in Python, then pages. Detail keys a
-single unit by id and reconstructs its **provenance + validity window +
-supersession chain** (the signature temporal feature, PRD §2/§4.3) from the
-same-scope/entity neighborhood (supersession is not a stored edge — it is the
-temporal adjacency a closed validity window leaves behind, FR-MNT-1).
+The core read surface. The list endpoint pushes the PRD §4.2 table filters — type
+/ scope / tier / entity / active-vs-superseded / source / free-text — the
+newest-first ordering, and the paging entirely into FalkorDB via
+:meth:`StorageBackend.query_memories`, which returns embedding-free
+:class:`~mnemozine.interfaces.MemoryView`s + a Cypher ``COUNT`` total (NEVER a
+whole-store stream that loads/parses the 1024-float embedding per row). Detail
+keys a single unit by id with :meth:`get_memory_display` (also embedding-free) and
+reconstructs its **provenance + validity window + supersession chain** (the
+signature temporal feature, PRD §2/§4.3) from a bounded same-scope/category
+neighborhood (supersession is not a stored edge — it is the temporal adjacency a
+closed validity window leaves behind, FR-MNT-1).
 
 Bound to the live ``StorageBackend`` via the Container; runs identically against
 the in-memory fake in tests. Read-only — the HITL writes live in ``mutations.py``.
@@ -19,14 +22,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from mnemozine.schema.models import MemoryUnit, Tier
+from mnemozine.schema.models import Tier
 from mnemozine.web.deps import StorageDep
 from mnemozine.web.routes._read import (
     build_scope_tree,
     collect_memories,
-    memory_to_detail,
-    memory_to_list_item,
     scope_to_obj,
+    view_to_detail,
+    view_to_list_item,
 )
 from mnemozine.web.schemas import (
     CategoryFacet,
@@ -38,36 +41,6 @@ from mnemozine.web.schemas import (
 )
 
 router = APIRouter(prefix="/api/memories", tags=["memories"])
-
-
-def _matches(
-    memory: MemoryUnit,
-    *,
-    category: str | None,
-    tier: Tier | None,
-    entity: str | None,
-    source: str | None,
-    active: bool | None,
-    q: str | None,
-) -> bool:
-    """Apply the in-memory table filters to one unit (PRD §4.2)."""
-
-    if category is not None and memory.category != category.strip().lower():
-        return False
-    if tier is not None and memory.tier != tier:
-        return False
-    if active is not None and memory.is_active != active:
-        return False
-    if source is not None and memory.provenance.source != source:
-        return False
-    if entity is not None:
-        wanted = entity.lower()
-        if wanted not in {e.lower() for e in memory.entities}:
-            return False
-    if q:
-        if q.lower() not in memory.content.lower():
-            return False
-    return True
 
 
 @router.get("", response_model=MemoryListResponse, summary="List/filter memories")
@@ -91,33 +64,29 @@ async def list_memories(
 ) -> MemoryListResponse:
     """Filterable, paged Memories table (PRD §4.2).
 
-    Scope filtering is pushed into ``iter_memories`` (the backend bounds it); the
-    remaining filters are applied in Python over the streamed units. Results are
-    ordered newest-first by ``valid_from`` so the freshest facts lead the table,
-    then sliced by ``offset``/``limit`` after computing the unfiltered total.
+    Every filter, the newest-first ordering (by ``valid_from``), and the
+    ``offset``/``limit`` paging are pushed into FalkorDB via
+    :meth:`StorageBackend.query_memories`; the embedding is projected out so it is
+    never transferred for a list read, and ``total`` is a cheap Cypher ``COUNT`` of
+    the whole filtered set (not a second whole-store scan). The route's query
+    signature is identical to ``query_memories`` — a drop-in pass-through.
     """
 
     scope_obj = scope_to_obj(scope)
-    units = await collect_memories(storage, scope=scope_obj)
-    matched = [
-        m
-        for m in units
-        if _matches(
-            m,
-            category=category,
-            tier=tier,
-            entity=entity,
-            source=source,
-            active=active,
-            q=q,
-        )
-    ]
-    matched.sort(key=lambda m: m.valid_from, reverse=True)
-    total = len(matched)
-    page = matched[offset : offset + limit]
-    items = [memory_to_list_item(m) for m in page]
+    page = await storage.query_memories(
+        category=category,
+        scope=scope_obj,
+        tier=tier,
+        entity=entity,
+        source=source,
+        active=active,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+    items = [view_to_list_item(v) for v in page.items]
     return MemoryListResponse(
-        items=items, page=Page(total=total, limit=limit, offset=offset)
+        items=items, page=Page(total=page.total, limit=limit, offset=offset)
     )
 
 
@@ -164,22 +133,25 @@ async def scope_tree(storage: StorageDep) -> ScopeTreeResponse:
 async def get_memory(memory_id: str, storage: StorageDep) -> MemoryDetail:
     """Full memory detail + provenance + validity + supersession chain (PRD §4.3).
 
-    Streams the store to key the unit by id (the Protocol has no key-read), then
-    derives the supersession chain against the unit's own scope neighborhood. 404
-    when the id is unknown.
+    Keys the unit by id with the embedding-free
+    :meth:`StorageBackend.get_memory_display` (404 when unknown), then derives the
+    supersession chain against the unit's own same-scope/category neighborhood —
+    fetched with :meth:`query_memories` (embedding-free, Cypher-paged), exactly the
+    FR-MNT-1 comparison set the supersede write used, never a whole-store stream.
     """
 
-    units = await collect_memories(storage)
-    target = next((m for m in units if m.id == memory_id), None)
+    target = await storage.get_memory_display(memory_id)
     if target is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="memory not found"
         )
-    # Derive the chain against the same-scope neighborhood only (cheaper + exactly
-    # the FR-MNT-1 comparison set the supersede write used).
-    scope = target.scope.as_str()
-    universe = [m for m in units if m.scope.as_str() == scope]
-    return memory_to_detail(target, universe)
+    # Derive the chain against the same-scope/category neighborhood only (cheaper +
+    # exactly the FR-MNT-1 comparison set the supersede write used). Bounded by the
+    # route's max page size; the entity-overlapping same-category set is small.
+    neighborhood = await storage.query_memories(
+        scope=target.scope, category=target.category, limit=500, offset=0
+    )
+    return view_to_detail(target, neighborhood.items)
 
 
 __all__ = ["router"]

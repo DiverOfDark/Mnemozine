@@ -97,6 +97,66 @@ class FakeFalkorDriver:
             self.memories[props["id"]] = props
             return _Result([[props]])
 
+        # --- store_stats aggregates (EMBEDDING-FREE Cypher COUNT/grouping) ----
+        # totals + active in one pass.
+        if "count(m) AS total" in c and "THEN 1 ELSE 0 END) AS active" in c:
+            total = len(self.memories)
+            active = sum(
+                1 for m in self.memories.values() if m.get("valid_to") is None
+            )
+            return _Result([[total, active]])
+        # grouped count: category / tier / scope-decision.
+        if "coalesce(m.category, $default) AS k" in c:
+            return self._group_count(
+                lambda m: m.get("category") or p.get("default")
+            )
+        if "coalesce(m.tier, $default) AS k" in c:
+            return self._group_count(lambda m: m.get("tier") or p.get("default"))
+        if "CASE WHEN m.scope = $global THEN $g ELSE $p END AS k" in c:
+            return self._group_count(
+                lambda m: p["g"] if m.get("scope") == p["global"] else p["p"]
+            )
+        # by_source: group by the raw provenance blob (backend decodes source).
+        if "m.provenance AS prov, count(m) AS n" in c:
+            return self._group_count(lambda m: m.get("provenance"))
+
+        # --- query_memories: count over the filtered set ----------------------
+        if "RETURN count(m) AS n" in c and "SET" not in c and "$src" not in c:
+            n = sum(
+                1 for m in self.memories.values() if self._memory_matches(c, m, p)
+            )
+            return _Result([[n]])
+
+        # --- query_memories page / get_memory_display / graph idea-seeds ------
+        # The display reads RETURN a field map (``{id: m.id, ...} AS v``); the
+        # fake returns the stored props dict (the backend's _props() reads it as a
+        # mapping), never selecting the embedding for the assertion's sake.
+        if "AS v" in c and "RETURN {" in c:
+            want_seed = "AS seed" in c
+            rows = [
+                m for m in self.memories.values() if self._memory_matches(c, m, p)
+            ]
+            # Keyed detail read: {id: $id} filter.
+            if "{id: $id}" in c:
+                rows = [m for m in self.memories.values() if m.get("id") == p.get("id")]
+            if "ORDER BY v.valid_from DESC" in c:
+                rows.sort(key=lambda m: str(m.get("valid_from") or ""), reverse=True)
+            if "SKIP $offset" in c:
+                off = int(p.get("offset", 0))
+                rows = rows[off:]
+            if "LIMIT $limit" in c:
+                rows = rows[: int(p.get("limit", len(rows)))]
+            # graph_snapshot idea-seed/memory_count scan is bounded in Cypher.
+            if "LIMIT $mem_cap" in c:
+                rows = rows[: int(p.get("mem_cap", len(rows)))]
+            out: list[list[Any]] = []
+            for m in rows:
+                if want_seed:
+                    out.append([m, bool(m.get("cross_ref_candidate", False))])
+                else:
+                    out.append([m])
+            return _Result(out)
+
         # --- category registry (list_categories / merge_categories) ----------
         # ``list_categories``: count active memories grouped by category. Emitted
         # as ``... WHERE m.valid_to IS NULL RETURN m.category AS category,
@@ -205,6 +265,15 @@ class FakeFalkorDriver:
             rows = rows[: p["cap"]]
         return _Result(rows)
 
+    def _group_count(self, key: Any) -> _Result:
+        """Group the memory store by ``key(m)`` and return ``[k, count]`` rows."""
+
+        counts: dict[Any, int] = {}
+        for m in self.memories.values():
+            k = key(m)
+            counts[k] = counts.get(k, 0) + 1
+        return _Result([[k, n] for k, n in counts.items()])
+
     def _vector_knn(self, c: str, p: dict[str, Any]) -> _Result:
         """Interpret the index-backed KNN scoped_query against the dict store.
 
@@ -238,12 +307,32 @@ class FakeFalkorDriver:
             return False
         if "m.valid_to IS NULL" in c and m.get("valid_to") is not None:
             return False
+        if "m.valid_to IS NOT NULL" in c and m.get("valid_to") is None:
+            return False
         if "m.tier = $hot" in c and m.get("tier") != p.get("hot"):
             return False
         if "m.tier = $tier" in c and m.get("tier") != p.get("tier"):
             return False
         if "any(e IN m.entities WHERE e IN $entities)" in c:
             if not (set(m.get("entities") or []) & set(p.get("entities") or [])):
+                return False
+        # --- Memories-table display filters (query_memories) -----------------
+        if "m.category = $category" in c and m.get("category") != p.get("category"):
+            return False
+        if "m.provenance CONTAINS $source_needle" in c:
+            if str(p.get("source_needle", "")) not in str(m.get("provenance") or ""):
+                return False
+        if "any(e IN m.entities WHERE toLower(e) = $entity)" in c:
+            wanted = str(p.get("entity", "")).lower()
+            if wanted not in {str(e).lower() for e in (m.get("entities") or [])}:
+                return False
+        if "toLower(m.content) CONTAINS $q" in c:
+            if str(p.get("q", "")).lower() not in str(m.get("content") or "").lower():
+                return False
+        # graph_snapshot idea-seed scan: memories linking a kept entity by name.
+        if "any(e IN m.entities WHERE toLower(e) IN $names)" in c:
+            names = {str(n).lower() for n in (p.get("names") or [])}
+            if not ({str(e).lower() for e in (m.get("entities") or [])} & names):
                 return False
         if "m.valid_from < $valid_before" in c:
             vf = m.get("valid_from")
@@ -278,6 +367,12 @@ class FakeFalkorDriver:
             props = dict(p["props"])
             self.raw_chunks[props["content_hash"]] = props
             return _Result([[props]])
+
+        # --- store_stats: total raw-chunk nodes ------------------------------
+        # Guard against set_chunk_data_version, which also RETURNs count(c) AS n
+        # but mutates (SET c.data_version) and has its own handler below.
+        if "RETURN count(c) AS n" in c and "SET" not in c:
+            return _Result([[len(self.raw_chunks)]])
 
         # --- data-versioning: min over the raw-chunk tier (min_data_version) ---
         # ``MATCH (c:MnemozineRawChunk) RETURN min(coalesce(c.data_version, 0)) AS
@@ -329,6 +424,55 @@ class FakeFalkorDriver:
     # -- entity / edge --------------------------------------------------------
 
     def _entity_or_edge(self, c: str, p: dict[str, Any]) -> _Result:
+        # --- store_stats: total entity nodes ---------------------------------
+        if "RETURN count(e) AS n" in c:
+            return _Result([[len(self.entities)]])
+
+        # --- graph_snapshot: bounded entity selection ------------------------
+        # Centered traversal: center + one-hop neighbors, capped at $cap.
+        if "(c:MnemozineEntity {id: $center})" in c and "RETURN e LIMIT $cap" in c:
+            keep: dict[str, dict[str, Any]] = {}
+            center = self.entities.get(p["center"])
+            if center is not None:
+                keep[center["id"]] = center
+                for edge in self.edges.values():
+                    other_id = None
+                    if edge["from_entity"] == center["id"]:
+                        other_id = edge["to_entity"]
+                    elif edge["to_entity"] == center["id"]:
+                        other_id = edge["from_entity"]
+                    if other_id is None:
+                        continue
+                    o = self.entities.get(other_id)
+                    if o is None:
+                        continue
+                    if "o.type = $entity_type" in c and o.get("type") != p.get(
+                        "entity_type"
+                    ):
+                        continue
+                    keep[o["id"]] = o
+            rows = [[e] for e in list(keep.values())[: p["cap"]]]
+            return _Result(rows)
+        # Plain bounded entity list (optional type filter), capped at $cap.
+        if c.startswith("MATCH (e:MnemozineEntity)") and "RETURN e LIMIT $cap" in c:
+            ents = [
+                e
+                for e in self.entities.values()
+                if "e.type = $entity_type" not in c
+                or e.get("type") == p.get("entity_type")
+            ]
+            return _Result([[e] for e in ents[: p["cap"]]])
+
+        # --- graph_snapshot: structural edges among kept entities (1 query) --
+        if "a.id IN $ids AND b.id IN $ids" in c and "RETURN r" in c:
+            ids = set(p.get("ids") or [])
+            rows = [
+                [e]
+                for e in self.edges.values()
+                if e["from_entity"] in ids and e["to_entity"] in ids
+            ]
+            return _Result(rows)
+
         if c.startswith("MERGE (e:MnemozineEntity {id: $id})"):
             e = self.entities.setdefault(p["id"], {"id": p["id"]})
             e["canonical_name"] = p["canonical_name"]
