@@ -24,7 +24,7 @@ Why iterate rather than key-read for detail/counts? The
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from mnemozine.interfaces import MemoryView, StorageBackend
@@ -333,11 +333,12 @@ def view_to_detail(
     )
 
 
-def build_scope_tree(memories: Iterable[MemoryUnit]) -> ScopeTreeNode:
+def build_scope_tree(scope_counts: Mapping[str, int]) -> ScopeTreeNode:
     """Build the hierarchical project/sub-scope tree with per-node counts.
 
-    Walks every memory's stored :class:`~mnemozine.schema.models.Scope` path and
-    materializes the ordered-segment hierarchy as a tree rooted at ``global``.
+    Folds a ``{scope-string: count}`` aggregation (a cheap Cypher grouped count
+    over the ~handful of distinct scopes — NOT a whole-store memory stream) into
+    the ordered-segment hierarchy as a tree rooted at ``global``.
     Each :class:`~mnemozine.web.schemas.ScopeTreeNode` records:
 
     * ``count``       — memories stored *exactly* at that scope, and
@@ -361,11 +362,11 @@ def build_scope_tree(memories: Iterable[MemoryUnit]) -> ScopeTreeNode:
 
     root = _N(segment=GLOBAL_SCOPE, path=GLOBAL_SCOPE, depth=0)
 
-    for mem in memories:
-        segments = mem.scope.segments
+    for scope_str, count in scope_counts.items():
+        segments = Scope.parse(scope_str).segments
         node = root
         if not segments:
-            node.count += 1
+            node.count += count
             continue
         for i, seg in enumerate(segments):
             child = node.children.get(seg)
@@ -374,7 +375,7 @@ def build_scope_tree(memories: Iterable[MemoryUnit]) -> ScopeTreeNode:
                 child = _N(segment=seg, path=path, depth=i + 1)
                 node.children[seg] = child
             node = child
-        node.count += 1
+        node.count += count
 
     def _to_node(scratch: _N) -> ScopeTreeNode:
         children = [_to_node(c) for c in scratch.children.values()]

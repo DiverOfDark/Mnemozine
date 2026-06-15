@@ -384,6 +384,13 @@ class InMemoryStorage:
             raw_chunk_count=len(self.raw_chunks),
         )
 
+    async def scope_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for m in self.memories.values():
+            s = m.scope.as_str()
+            counts[s] = counts.get(s, 0) + 1
+        return counts
+
     async def query_memories(
         self,
         *,

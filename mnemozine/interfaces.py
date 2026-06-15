@@ -604,6 +604,16 @@ class StorageBackend(Protocol):
         """
         ...
 
+    async def scope_counts(self) -> dict[str, int]:
+        """Memory count grouped by exact stored scope string (the scope navigator).
+
+        A single Cypher grouped ``count`` over the ~handful of distinct scopes —
+        ``{scope-string: count}`` — NEVER a whole-store stream. The web layer folds
+        these into the hierarchical scope tree (with descendant roll-ups), so the
+        Memories-page scope navigator costs one aggregation, not a full table load.
+        """
+        ...
+
     async def query_memories(
         self,
         *,

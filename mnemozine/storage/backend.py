@@ -821,6 +821,17 @@ class GraphitiStorageBackend:
             raw_chunk_count=raw_chunk_count,
         )
 
+    async def scope_counts(self) -> dict[str, int]:
+        """Memory count per exact stored scope (one grouped Cypher count).
+
+        ~A handful of rows (the distinct scopes), never a whole-store stream and
+        never the embedding — the scope navigator folds these into its tree.
+        """
+
+        return await self._count_by(
+            f"MATCH (m:{MEMORY_LABEL}) RETURN m.scope AS k, count(m) AS n"
+        )
+
     async def _count_by(self, cypher: str, **params: Any) -> dict[str, int]:
         """Run a grouped ``RETURN <key> AS k, count(...) AS n`` into a count map."""
 

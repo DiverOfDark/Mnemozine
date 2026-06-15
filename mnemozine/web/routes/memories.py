@@ -26,7 +26,6 @@ from mnemozine.schema.models import Tier
 from mnemozine.web.deps import StorageDep
 from mnemozine.web.routes._read import (
     build_scope_tree,
-    collect_memories,
     scope_to_obj,
     view_to_detail,
     view_to_list_item,
@@ -125,8 +124,7 @@ async def scope_tree(storage: StorageDep) -> ScopeTreeResponse:
     from its subtree (no-leak: a node never counts a sibling subtree).
     """
 
-    units = await collect_memories(storage)
-    return ScopeTreeResponse(root=build_scope_tree(units))
+    return ScopeTreeResponse(root=build_scope_tree(await storage.scope_counts()))
 
 
 @router.get("/{memory_id}", response_model=MemoryDetail, summary="Memory detail")
