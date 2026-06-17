@@ -405,7 +405,8 @@ async def _maintenance_run_once(container: Container) -> None:
     for r in reports:
         typer.echo(
             f"[{r.job_name}] consolidated={r.consolidated} merged={r.entities_merged} "
-            f"archived={r.archived} pruned={r.edges_pruned}"
+            f"archived={r.archived} pruned={r.edges_pruned} "
+            f"edges_added={r.edges_added} relations_merged={r.relations_merged}"
         )
         for note in r.notes:
             typer.echo(f"    - {note}")
@@ -496,6 +497,116 @@ def _maintenance_merge_categories_cmd(
     from mnemozine.maintenance.runner import _echo_report, _run_merge_categories
 
     report = asyncio.run(_run_merge_categories(dry_run=dry_run))
+    _echo_report(report)
+
+
+@maintenance_app.command("persist-mentions")
+def _maintenance_persist_mentions_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Do not write any edges; only report that the pass would run.",
+    ),
+) -> None:
+    """Persist (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges from m.entities.
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_persist_mentions` onto the
+    live ``mnemozine-maintenance`` console app (the runner's own Typer app is not
+    wired to a script). Turns each memory's ``m.entities`` name list into real,
+    traversable mention edges so the graph becomes navigable
+    memory<->entity<->memory. Idempotent (MERGE, never CREATE): a re-run asserts
+    the same edges and adds nothing new.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_persist_mentions
+
+    report = asyncio.run(_run_persist_mentions(dry_run=dry_run))
+    _echo_report(report)
+
+
+@maintenance_app.command("co-mention")
+def _maintenance_co_mention_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Do not write any edges; only report how many would be asserted.",
+    ),
+    min_shared: int | None = typer.Option(
+        None,
+        "--min-shared",
+        help=(
+            "Minimum shared memories for a co-mention edge "
+            "(overrides graph.co_mention_min_shared for this run)."
+        ),
+    ),
+) -> None:
+    """Derive weighted entity-entity co-mention edges from the mention layer.
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_co_mention` onto the live
+    ``mnemozine-maintenance`` console app (the runner's own Typer app is not wired
+    to a script). Links entities mentioned by the same memory, TF-IDF-style
+    down-weights ultra-frequent hub entities, and caps the edges added per node so
+    the layer does not become a hairball. Idempotent (MERGE, weight re-asserted not
+    summed). Use ``--dry-run`` to preview the count first.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_co_mention
+
+    report = asyncio.run(_run_co_mention(dry_run=dry_run, min_shared=min_shared))
+    _echo_report(report)
+
+
+@maintenance_app.command("normalize-relations")
+def _maintenance_normalize_relations_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only print the proposed (source -> canonical) relabels; apply nothing.",
+    ),
+) -> None:
+    """Collapse the fragmented MNEMOZINE_RELATES label vocabulary (FR-MNT-2/4).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_normalize_relations` onto the
+    live ``mnemozine-maintenance`` console app (the runner's own Typer app is not
+    wired to a script). The relation analogue of ``merge-categories``: maps each
+    in-use relation label through a controlled vocabulary and folds every
+    non-canonical label into its canonical one, combining parallel-edge weights and
+    never leaving a duplicate parallel edge. Deterministic, embedding-free,
+    idempotent. Use ``--dry-run`` to review the proposed relabels first.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_normalize_relations
+
+    report = asyncio.run(_run_normalize_relations(dry_run=dry_run))
+    _echo_report(report)
+
+
+@maintenance_app.command("dedup-entities")
+def _maintenance_dedup_entities_cmd(
+    mode: str = typer.Option(
+        "exact",
+        "--mode",
+        help=(
+            "Duplicate-detection mode: 'exact' (lower(canonical_name) collisions, "
+            "default), 'alias' (also fold alias-linked entities), or 'embedding' "
+            "(also fold near-dup names above graph.entity_dedup_similarity_threshold)."
+        ),
+    ),
+) -> None:
+    """Merge true-duplicate entities, repointing ALL edge types (FR-MNT-4).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_dedup_entities` onto the live
+    ``mnemozine-maintenance`` console app (the runner's own Typer app is not wired
+    to a script). Groups duplicate ENTITY nodes, picks a deterministic survivor,
+    and folds each duplicate into it via the existing ``merge_entities`` path —
+    which repoints the source's RELATES, MENTIONS, AND CO_MENTIONS edges onto the
+    survivor so no edge type is orphaned. Idempotent: a re-run merges nothing. No
+    memory is ever deleted.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_dedup_entities
+
+    report = asyncio.run(_run_dedup_entities(mode=mode))
     _echo_report(report)
 
 

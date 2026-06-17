@@ -194,6 +194,14 @@ class InMemoryStorage:
         self.memories: dict[str, MemoryUnit] = {}
         self.entities: dict[str, Entity] = {}
         self.edges: dict[str, Edge] = {}
+        # Persisted (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges as a set of
+        # (memory_id, entity_id) pairs — a set so the MERGE is idempotent (a
+        # re-assert is a no-op) and merge_entities can repoint them in place.
+        self.mentions: set[tuple[str, str]] = set()
+        # Weighted entity-entity co-mention edges, keyed on (from_id, to_id) so the
+        # MERGE is idempotent (a re-assert overwrites weight, never duplicates) and
+        # merge_entities can repoint them in place. Value is (weight, shared).
+        self.co_mentions: dict[tuple[str, str], tuple[float, int]] = {}
         self.sessions: list[SourceSession] = []
         # Raw-chunk tier (offline re-extraction/reindex), keyed on content_hash.
         self.raw_chunks: dict[str, RawChunk] = {}
@@ -548,9 +556,26 @@ class InMemoryStorage:
                     )
                 )
 
+        # Weighted entity-entity co-mention layer (kind='co_mention') among kept
+        # entities — the second aggregate edge layer the backend surfaces.
+        co_mention_edges: list[GraphSnapshotEdge] = []
+        for (a, b), (weight, _shared) in self.co_mentions.items():
+            if a in entity_by_id and b in entity_by_id:
+                co_mention_edges.append(
+                    GraphSnapshotEdge(
+                        id=f"comention:{a}:{b}",
+                        source=a,
+                        target=b,
+                        relation="co_mentioned",
+                        weight=weight,
+                        active=True,
+                        kind="co_mention",
+                    )
+                )
+
         return GraphSnapshot(
             nodes=entity_nodes + idea_nodes,
-            edges=struct_edges + mentions_edges,
+            edges=struct_edges + co_mention_edges + mentions_edges,
             truncated=truncated,
         )
 
@@ -603,7 +628,115 @@ class InMemoryStorage:
         source = self.entities.pop(source_id)
         target = self.entities[target_id]
         target.aliases = sorted({*target.aliases, source.canonical_name, *source.aliases})
+        # Repoint mention edges off the source onto the target (set semantics so a
+        # memory that mentioned BOTH collapses to a single edge, no duplicate).
+        repointed = {
+            (mid, target_id if eid == source_id else eid)
+            for (mid, eid) in self.mentions
+        }
+        self.mentions = repointed
+        # Repoint co-mention edges off the source onto the target (both directions).
+        # A self-loop (target<->source) is dropped; a collision keeps the
+        # higher-weight edge so the merge stays idempotent and never duplicates.
+        repointed_co: dict[tuple[str, str], tuple[float, int]] = {}
+        for (a, b), (weight, shared) in self.co_mentions.items():
+            na = target_id if a == source_id else a
+            nb = target_id if b == source_id else b
+            if na == nb:
+                continue
+            # Co-mention is unordered: re-canonicalize (lo < hi) so a repoint that
+            # would reverse an endpoint folds onto the survivor's canonical edge
+            # instead of leaving a parallel reversed duplicate.
+            lo, hi = (na, nb) if na <= nb else (nb, na)
+            prev = repointed_co.get((lo, hi))
+            if prev is None or weight > prev[0]:
+                repointed_co[(lo, hi)] = (weight, shared)
+        self.co_mentions = repointed_co
         return target
+
+    async def persist_mentions(self) -> int:
+        """MERGE (memory)-[:MNEMOZINE_MENTIONS]->(entity) from each m.entities name.
+
+        Resolves each mention name to an entity by case-folded canonical-name or
+        alias match (mirroring :meth:`get_entity`) and asserts the
+        (memory_id, entity_id) pair into the mentions set. Set semantics make the
+        whole pass idempotent: a re-run re-asserts the same pairs and adds none.
+        Returns the number of mention edges asserted (the size of the resolved set
+        for this pass).
+        """
+
+        # Build a lower-cased name -> entity-id resolution table once.
+        name_to_id: dict[str, str] = {}
+        for e in self.entities.values():
+            name_to_id[e.canonical_name.lower()] = e.id
+            for alias in e.aliases:
+                name_to_id.setdefault(alias.lower(), e.id)
+        asserted: set[tuple[str, str]] = set()
+        for m in self.memories.values():
+            for name in m.entities:
+                eid = name_to_id.get(name.lower())
+                if eid is not None:
+                    asserted.add((m.id, eid))
+        self.mentions |= asserted
+        return len(asserted)
+
+    async def co_mention_pairs(
+        self, *, min_shared: int = 2
+    ) -> list[tuple[str, str, int]]:
+        """Entity id pairs co-occurring in >= ``min_shared`` shared memories.
+
+        Derived from the mentions set: group the mention edges by memory, take
+        every entity pair a memory mentions, count the distinct shared memories,
+        and return ``(a, b, shared)`` with ``a < b`` for pairs >= ``min_shared``.
+        """
+
+        by_memory: dict[str, set[str]] = {}
+        for mid, eid in self.mentions:
+            by_memory.setdefault(mid, set()).add(eid)
+        pair_counts: dict[tuple[str, str], int] = {}
+        for eids in by_memory.values():
+            ids = sorted(eids)
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    pair_counts[(ids[i], ids[j])] = pair_counts.get((ids[i], ids[j]), 0) + 1
+        return [
+            (a, b, n) for (a, b), n in pair_counts.items() if n >= min_shared
+        ]
+
+    async def entity_mention_counts(self) -> dict[str, int]:
+        """``{entity_id: distinct-memory mention count}`` over the mentions set."""
+
+        counts: dict[str, int] = {}
+        seen: set[tuple[str, str]] = set()
+        for mid, eid in self.mentions:
+            if (mid, eid) in seen:
+                continue
+            seen.add((mid, eid))
+            counts[eid] = counts.get(eid, 0) + 1
+        return counts
+
+    async def upsert_co_mention(
+        self, from_entity: str, to_entity: str, *, weight: float, shared: int
+    ) -> Edge:
+        """Idempotently MERGE a weighted entity-entity co-mention edge.
+
+        Keyed on (from, to): a re-assert overwrites weight/shared (SET, not sum) so
+        the pass is idempotent and never duplicates. Returns the stored edge.
+        """
+
+        lo, hi = (
+            (from_entity, to_entity)
+            if from_entity <= to_entity
+            else (to_entity, from_entity)
+        )
+        self.co_mentions[(lo, hi)] = (float(weight), int(shared))
+        return Edge(
+            id=f"comention:{lo}:{hi}",
+            from_entity=lo,
+            to_entity=hi,
+            relation="co_mentioned",
+            weight=float(weight),
+        )
 
     async def neighbors(
         self, entity: str, *, max_degree: int | None = None, active_only: bool = True
@@ -813,6 +946,63 @@ class InMemoryStorage:
             if m.category == src:
                 m.category = tgt
                 n += 1
+        return n
+
+    # --- relation registry (relation-label list/merge, FR-MNT-2/4) -------
+
+    async def list_relations(self) -> list[tuple[str, int]]:
+        """``(relation_label, active_edge_count)`` over active relation edges.
+
+        The relation analogue of :meth:`list_categories`, grouped over the active
+        edges (only the LLM-extracted relation edges carry a normalizable label;
+        the co-mention/mention layers live in their own stores).
+        """
+
+        counts: dict[str, int] = {}
+        for e in self.edges.values():
+            if not e.is_active:
+                continue
+            counts[e.relation] = counts.get(e.relation, 0) + 1
+        return list(counts.items())
+
+    async def merge_relations(
+        self, source_relation: str, target_relation: str
+    ) -> int:
+        """Relabel every ``source``-relation edge to ``target`` (relation merge).
+
+        For each active edge with ``relation == source``, fold it onto the
+        ``(from, to, target)`` edge — combining ``weight`` via ``max`` and
+        dropping the redundant parallel source edge so no duplicate parallel edges
+        remain. Idempotent (``source == target`` -> 0). Returns the relabelled
+        count.
+        """
+
+        if source_relation == target_relation:
+            return 0
+        n = 0
+        for edge in list(self.edges.values()):
+            if not edge.is_active or edge.relation != source_relation:
+                continue
+            n += 1
+            # Find an existing target edge between the same endpoints to MERGE onto.
+            target_edge = next(
+                (
+                    e
+                    for e in self.edges.values()
+                    if e.is_active
+                    and e.from_entity == edge.from_entity
+                    and e.to_entity == edge.to_entity
+                    and e.relation == target_relation
+                ),
+                None,
+            )
+            if target_edge is None:
+                # No parallel target edge: relabel the source edge in place.
+                edge.relation = target_relation
+            else:
+                # Parallel target edge exists: combine weight (max), drop source.
+                target_edge.weight = max(target_edge.weight, edge.weight)
+                del self.edges[edge.id]
         return n
 
     async def close(self) -> None:

@@ -192,6 +192,73 @@ class CategorySettings(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Graph connectivity (mention/co-mention layer + entity dedup; FR-MNT-4)
+# ---------------------------------------------------------------------------
+
+
+class GraphSettings(BaseModel):
+    """Graph-connectivity tuning: the co-mention layer + entity-dedup knobs.
+
+    The maintenance layer turns each memory's ``m.entities`` name list into real
+    ``MNEMOZINE_MENTIONS`` edges (MentionsJob) and derives a weighted entity-entity
+    ``MNEMOZINE_CO_MENTIONS`` layer from them (CoMentionJob): two entities mentioned
+    by the same memory co-occur. Left raw, that layer becomes a hairball around a
+    few ultra-frequent hub entities (operator/web/test), so the co-mention job
+    TF-IDF-style down-weights hubs and caps the edges added per node. These are
+    §6.6-style "config, not constants" knobs (env: ``MNEMOZINE_GRAPH__*``).
+
+    The entity-dedup knobs select the duplicate-detection ``mode`` and the cosine
+    cutoff for the optional embedding near-dup mode (read by EntityDedupJob).
+    """
+
+    co_mention_min_shared: int = Field(
+        default=2,
+        description=(
+            "Minimum shared memories before a co-mention edge is considered "
+            "(the configurable threshold; CoMentionJob / co_mention_pairs)."
+        ),
+    )
+    co_mention_hub_downweight: bool = Field(
+        default=True,
+        description=(
+            "Enable the TF-IDF-style down-weight of ultra-frequent hub entities so "
+            "they do not form a hairball (weight = shared / sqrt(df_a * df_b))."
+        ),
+    )
+    co_mention_max_added_degree: int = Field(
+        default=32,
+        description=(
+            "Cap on co-mention edges ADDED per node (keep highest-weight, drop "
+            "overflow); bounds the hairball. Distinct from maintenance."
+            "max_node_degree (which caps RELATES traversal fan-out)."
+        ),
+    )
+    co_mention_min_weight: float = Field(
+        default=0.0,
+        description=(
+            "Floor below which a down-weighted co-mention edge is not written "
+            "(lets the hub-downweight prune trivial links)."
+        ),
+    )
+    entity_dedup_mode: str = Field(
+        default="exact",
+        description=(
+            "Default entity-dedup mode: 'exact' (lower(canonical_name) collisions), "
+            "'alias', or 'embedding' (near-dup behind the flag). Read by "
+            "EntityDedupJob; the CLI --mode overrides it."
+        ),
+    )
+    entity_dedup_similarity_threshold: float = Field(
+        default=0.92,
+        description=(
+            "Cosine cutoff for the optional embedding near-dup mode (only used when "
+            "entity_dedup_mode='embedding'), mirroring "
+            "category.merge_similarity_threshold."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cross-reference engine (FR-RET-6)
 # ---------------------------------------------------------------------------
 
@@ -585,6 +652,7 @@ class Settings(BaseSettings):
     inject: InjectionSettings = Field(default_factory=InjectionSettings)
     scope: ScopeSettings = Field(default_factory=ScopeSettings)
     category: CategorySettings = Field(default_factory=CategorySettings)
+    graph: GraphSettings = Field(default_factory=GraphSettings)
     crossref: CrossRefSettings = Field(default_factory=CrossRefSettings)
     maintenance: MaintenanceSettings = Field(default_factory=MaintenanceSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)

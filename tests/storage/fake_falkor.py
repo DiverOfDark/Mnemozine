@@ -37,6 +37,14 @@ class FakeFalkorDriver:
         self.memories: dict[str, dict[str, Any]] = {}
         self.entities: dict[str, dict[str, Any]] = {}
         self.edges: dict[str, dict[str, Any]] = {}
+        # Persisted (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges as a set of
+        # (memory_id, entity_id) pairs (MERGE set-semantics: idempotent re-assert,
+        # repointed in merge_entities).
+        self.mentions: set[tuple[str, str]] = set()
+        # Weighted entity-entity (entity)-[:MNEMOZINE_CO_MENTIONS]->(entity) edges
+        # keyed on (from_id, to_id) -> {weight, shared, ...} (MERGE: idempotent
+        # re-assert overwrites weight, never duplicates).
+        self.co_mentions: dict[tuple[str, str], dict[str, Any]] = {}
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.suppressions: set[tuple[str, str]] = set()
         # Raw-chunk tier (offline re-extraction/reindex), keyed on content_hash
@@ -121,6 +129,32 @@ class FakeFalkorDriver:
         # --- MnemozineRawChunk (the retained raw tier) -----------------------
         if ":MnemozineRawChunk" in c:
             return self._raw_chunk(c, params)
+        # --- MNEMOZINE_CO_MENTIONS (weighted entity-entity co-mention edges) -
+        # Checked BEFORE the bare :MnemozineEntity branch (the upsert + the
+        # graph_snapshot aggregate both MATCH entity nodes) and BEFORE the
+        # MNEMOZINE_MENTIONS branch (substring-distinct, but routed explicitly).
+        if "MNEMOZINE_CO_MENTIONS" in c:
+            return self._co_mention(c, params)
+        # --- MNEMOZINE_MENTIONS (memory->entity mention edges + co-mention
+        # derivations that read the mention layer) ---------------------------
+        # Checked BEFORE the bare :MnemozineMemory / :MnemozineEntity branches
+        # because the persist_mentions Cypher MATCHes both labels in one
+        # statement; route it (and the mention-derived co_mention_pairs /
+        # entity_mention_counts reads) to the dedicated mention handler.
+        if "MNEMOZINE_MENTIONS" in c:
+            return self._mentions(c, params)
+        # --- relation registry (list_relations / merge_relations) ------------
+        # The relation analogue of the category registry, grouped/merged over
+        # MNEMOZINE_RELATES labels. Routed BEFORE the bare :MnemozineEntity /
+        # MNEMOZINE_RELATES edge branches because the list/count statements have no
+        # :MnemozineEntity label and the merge statement is a relation-relabel (not
+        # an entity merge or an upsert), each recognized by a stable substring.
+        if (
+            ("RETURN coalesce(r.relation, 'relates') AS relation" in c)
+            or ("[r:MNEMOZINE_RELATES {relation: $source}]" in c)
+            or ("MERGE (a)-[nr:MNEMOZINE_RELATES {relation: $target}]" in c)
+        ):
+            return self._relation_norm(c, params)
         # --- MnemozineMemory --------------------------------------------------
         if ":MnemozineMemory" in c:
             return self._memory(c, params)
@@ -499,6 +533,224 @@ class FakeFalkorDriver:
             rows.append([chunk])
         return _Result(rows)
 
+    # -- mentions (memory->entity MNEMOZINE_MENTIONS edges) -------------------
+
+    def _mentions(self, c: str, p: dict[str, Any]) -> _Result:
+        """Interpret the MNEMOZINE_MENTIONS persist + mention-derived reads.
+
+        ``persist_mentions``: resolve every ``m.entities`` name to an entity by
+        case-folded canonical-name OR alias match (mirroring ``get_entity``'s
+        WHERE), MERGE the (memory, entity) edge into the mentions set, and RETURN
+        the asserted count. Set semantics make it idempotent (a re-run re-asserts
+        the same pairs, adds none).
+
+        ``co_mention_pairs``: enumerate entity-id pairs co-mentioned by the same
+        memory with their distinct-shared-memory counts (a<b, >= $min_shared).
+        ``entity_mention_counts``: distinct-memory mention count per entity id.
+        Each recognized by stable substring or it raises.
+        """
+
+        # merge_entities mention repoint: MATCH (m)-[r:MNEMOZINE_MENTIONS]->(s {id:$src})
+        # MATCH (t {id:$tgt}) MERGE (m)-[:MNEMOZINE_MENTIONS]->(t) DELETE r — every
+        # memory that mentioned the duplicate now mentions the survivor (set
+        # semantics collapse a memory that mentioned BOTH onto one edge).
+        if "-[r:MNEMOZINE_MENTIONS]->(s:MnemozineEntity {id: $src})" in c and "DELETE r" in c:
+            src, tgt = p["src"], p["tgt"]
+            self.mentions = {
+                (mid, tgt if eid == src else eid) for (mid, eid) in self.mentions
+            }
+            return _Result([])
+
+        # persist_mentions: MATCH (e)/(m) ... MERGE (m)-[r:MNEMOZINE_MENTIONS]->(e)
+        # RETURN count(r) AS n
+        if "MERGE (m)" in c and "RETURN count(r) AS n" in c:
+            # Lower-cased name -> entity-id resolution (canonical + aliases).
+            name_to_id: dict[str, str] = {}
+            for e in self.entities.values():
+                cn = str(e.get("canonical_name") or "")
+                if cn:
+                    name_to_id[cn.lower()] = e["id"]
+                for alias in e.get("aliases") or []:
+                    name_to_id.setdefault(str(alias).lower(), e["id"])
+            asserted: set[tuple[str, str]] = set()
+            for m in self.memories.values():
+                for name in m.get("entities") or []:
+                    eid = name_to_id.get(str(name).lower())
+                    if eid is not None:
+                        asserted.add((m["id"], eid))
+            self.mentions |= asserted
+            return _Result([[len(asserted)]])
+
+        # co_mention_pairs: ... WITH a.id, b.id, count(DISTINCT m) AS shared
+        # WHERE shared >= $min_shared RETURN aid, bid, shared
+        if "count(DISTINCT m) AS shared" in c and "RETURN aid, bid, shared" in c:
+            by_memory: dict[str, set[str]] = {}
+            for mid, eid in self.mentions:
+                by_memory.setdefault(mid, set()).add(eid)
+            pair_counts: dict[tuple[str, str], int] = {}
+            for eids in by_memory.values():
+                ids = sorted(eids)
+                for i in range(len(ids)):
+                    for j in range(i + 1, len(ids)):
+                        key = (ids[i], ids[j])
+                        pair_counts[key] = pair_counts.get(key, 0) + 1
+            min_shared = int(p.get("min_shared", 2))
+            return _Result(
+                [[a, b, n] for (a, b), n in pair_counts.items() if n >= min_shared]
+            )
+
+        # entity_mention_counts: MATCH (m)-[:MNEMOZINE_MENTIONS]->(e)
+        # RETURN e.id AS eid, count(DISTINCT m) AS df
+        if "count(DISTINCT m) AS df" in c and "RETURN e.id AS eid" in c:
+            counts: dict[str, int] = {}
+            for _mid, eid in self.mentions:
+                counts[eid] = counts.get(eid, 0) + 1
+            return _Result([[eid, df] for eid, df in counts.items()])
+
+        raise AssertionError(f"FakeFalkorDriver: unhandled mentions cypher:\n{c}")
+
+    # -- co-mention (entity-entity MNEMOZINE_CO_MENTIONS edges) ---------------
+
+    def _co_mention(self, c: str, p: dict[str, Any]) -> _Result:
+        """Interpret the MNEMOZINE_CO_MENTIONS upsert + graph_snapshot aggregate.
+
+        ``upsert_co_mention``: MERGE the (from,to) co-mention edge keyed on the
+        endpoint pair, SET weight + shared (re-assert, never sum) so it is
+        idempotent. The graph_snapshot aggregate RETURNs the kept-id co-mention
+        edges with their topology endpoints. Recognized by stable substring.
+        """
+
+        # merge_entities co-mention repoint (both directions) + self-loop drop:
+        # fold every co-mention edge touching the duplicate ($src) onto the survivor
+        # ($tgt), dropping self-loops and keeping the higher-weight edge on a
+        # collision so no duplicate parallel co-mention edge remains.
+        if "[r:MNEMOZINE_CO_MENTIONS]" in c and "DELETE r" in c:
+            self._repoint_co_mention(c, p)
+            return _Result([])
+
+        # upsert_co_mention: MATCH (a {id:$lo})/(b {id:$hi}) MERGE
+        # (a)-[r:MNEMOZINE_CO_MENTIONS {relation: $relation}]->(b) SET r.weight ...
+        # Endpoints arrive canonical (lo <= hi); key on the canonical pair.
+        if "MERGE (a)-[r:MNEMOZINE_CO_MENTIONS" in c and "SET r.weight = $weight" in c:
+            frm, to = p["lo"], p["hi"]
+            key = (frm, to) if frm <= to else (to, frm)
+            existing = self.co_mentions.get(key, {})
+            rec = {
+                "id": existing.get("id") or p["id"],
+                "from_entity": key[0],
+                "to_entity": key[1],
+                "relation": p["relation"],
+                "weight": p["weight"],
+                "shared": p["shared"],
+                "valid_from": existing.get("valid_from") or p["valid_from"],
+                "valid_to": None,
+            }
+            self.co_mentions[key] = rec
+            return _Result([[rec]])
+
+        # graph_snapshot co-mention aggregate: MATCH (a)-[r:MNEMOZINE_CO_MENTIONS]
+        # ->(b) WHERE a.id IN $ids AND b.id IN $ids RETURN a.id AS source, ...
+        if "a.id IN $ids AND b.id IN $ids" in c and "RETURN a.id AS source" in c:
+            ids = set(p.get("ids") or [])
+            rows = [
+                [rec["from_entity"], rec["to_entity"], rec]
+                for rec in self.co_mentions.values()
+                if rec["from_entity"] in ids and rec["to_entity"] in ids
+            ]
+            return _Result(rows)
+
+        raise AssertionError(f"FakeFalkorDriver: unhandled co-mention cypher:\n{c}")
+
+    def _repoint_co_mention(self, c: str, p: dict[str, Any]) -> None:
+        """Repoint co-mention edges off the duplicate ($src) onto the survivor ($tgt).
+
+        Handles all three merge_entities co-mention statements (outgoing repoint,
+        incoming repoint, self-loop drop) by rebuilding the ``co_mentions`` dict
+        with every ``$src`` endpoint rewritten to ``$tgt``: self-loops are dropped
+        and a collision keeps the higher-weight record, so no duplicate parallel
+        co-mention edge survives (idempotent — a re-run with $src already gone is a
+        no-op).
+        """
+
+        src, tgt = p["src"], p["tgt"]
+        repointed: dict[tuple[str, str], dict[str, Any]] = {}
+        for (a, b), rec in self.co_mentions.items():
+            na = tgt if a == src else a
+            nb = tgt if b == src else b
+            if na == nb:  # self-loop (src<->tgt or src->src) — never co-mention self
+                continue
+            # Canonicalize (lo <= hi): a reversing repoint folds onto the survivor's
+            # canonical edge (highest weight kept), never a parallel reversed dup.
+            lo, hi = (na, nb) if na <= nb else (nb, na)
+            new = dict(rec)
+            new["from_entity"], new["to_entity"] = lo, hi
+            prev = repointed.get((lo, hi))
+            if prev is None or new.get("weight", 0.0) > prev.get("weight", 0.0):
+                repointed[(lo, hi)] = new
+        self.co_mentions = repointed
+
+    # -- relation registry (list_relations / merge_relations) -----------------
+
+    def _relation_norm(self, c: str, p: dict[str, Any]) -> _Result:
+        """Interpret the relation-registry list + the relation relabel/merge.
+
+        ``list_relations``: grouped count of active MNEMOZINE_RELATES edges by
+        relation label (label missing -> 'relates').
+        ``merge_relations`` is two statements: first a count of active source-
+        relation edges (the relabelled total), then a MERGE-onto-(a,b,target) +
+        DELETE-source relabel that combines weight via max and never leaves a
+        duplicate parallel edge. Each recognized by stable substring or it raises.
+        """
+
+        active = [e for e in self.edges.values() if e.get("valid_to") is None]
+
+        # list_relations: ... WHERE r.valid_to IS NULL
+        # RETURN coalesce(r.relation, 'relates') AS relation, count(r) AS n
+        if "RETURN coalesce(r.relation, 'relates') AS relation" in c:
+            counts: dict[str, int] = {}
+            for e in active:
+                rel = e.get("relation") or "relates"
+                counts[rel] = counts.get(rel, 0) + 1
+            return _Result([[rel, n] for rel, n in counts.items()])
+
+        # merge_relations count: ...[r:MNEMOZINE_RELATES {relation: $source}]...
+        # WHERE r.valid_to IS NULL RETURN count(r) AS n
+        if "[r:MNEMOZINE_RELATES {relation: $source}]" in c and "count(r) AS n" in c:
+            n = sum(1 for e in active if e.get("relation") == p["source"])
+            return _Result([[n]])
+
+        # merge_relations relabel: MERGE (a)-[nr:MNEMOZINE_RELATES
+        # {relation: $target}]->(b) ... DELETE r
+        if "MERGE (a)-[nr:MNEMOZINE_RELATES {relation: $target}]" in c and "DELETE r" in c:
+            source, target = p["source"], p["target"]
+            for edge in list(self.edges.values()):
+                if edge.get("valid_to") is not None or edge.get("relation") != source:
+                    continue
+                frm, to = edge["from_entity"], edge["to_entity"]
+                existing = next(
+                    (
+                        e
+                        for e in self.edges.values()
+                        if e.get("valid_to") is None
+                        and e["from_entity"] == frm
+                        and e["to_entity"] == to
+                        and e.get("relation") == target
+                    ),
+                    None,
+                )
+                if existing is None:
+                    # No parallel target edge: relabel the source edge in place.
+                    edge["relation"] = target
+                else:
+                    # MERGE found a target edge: combine weight (max), drop source.
+                    existing["weight"] = max(
+                        existing.get("weight", 0.0), edge.get("weight", 0.0)
+                    )
+                    del self.edges[edge["id"]]
+            return _Result([])
+
+        raise AssertionError(f"FakeFalkorDriver: unhandled relation cypher:\n{c}")
+
     # -- entity / edge --------------------------------------------------------
 
     def _entity_or_edge(self, c: str, p: dict[str, Any]) -> _Result:
@@ -620,6 +872,10 @@ class FakeFalkorDriver:
         new = dict(edge)
         new["from_entity"] = frm
         new["to_entity"] = to
+        # Mint a fresh id for the MERGEd (nr) edge so the caller's subsequent
+        # ``del self.edges[edge['id']]`` (deleting the source r) does not clobber
+        # this just-created survivor edge — they would otherwise share one key.
+        new["id"] = f"repoint:{frm}:{to}:{edge['relation']}"
         self.edges[new["id"]] = new
 
     def _edge_only(self, c: str, p: dict[str, Any]) -> _Result:

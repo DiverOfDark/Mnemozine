@@ -57,6 +57,16 @@ class OfflineStorage:
         self.memories: dict[str, MemoryUnit] = {}
         self.entities: dict[str, Entity] = {}
         self.edges: dict[str, Edge] = {}
+        # Persisted (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges as (memory_id,
+        # entity_id) pairs (the §9 eval metrics never exercise the mentions pass,
+        # but the field keeps the offline fake Protocol-conformant and lets
+        # merge_entities repoint them).
+        self.mentions: set[tuple[str, str]] = set()
+        # Weighted entity-entity co-mention edges keyed on (from_id, to_id) ->
+        # (weight, shared). The §9 eval metrics never exercise the co-mention pass,
+        # but the field keeps the offline fake Protocol-conformant and lets
+        # merge_entities repoint them.
+        self.co_mentions: dict[tuple[str, str], tuple[float, int]] = {}
         self.sessions: list[SourceSession] = []
         self.suppressions: set[tuple[str, str]] = set()
         self.raw_chunks: dict[str, RawChunk] = {}
@@ -358,9 +368,25 @@ class OfflineStorage:
                     )
                 )
 
+        # Weighted entity-entity co-mention layer (kind='co_mention') among kept ids.
+        co_mention_edges: list[GraphSnapshotEdge] = []
+        for (a, b), (weight, _shared) in self.co_mentions.items():
+            if a in entity_by_id and b in entity_by_id:
+                co_mention_edges.append(
+                    GraphSnapshotEdge(
+                        id=f"comention:{a}:{b}",
+                        source=a,
+                        target=b,
+                        relation="co_mentioned",
+                        weight=weight,
+                        active=True,
+                        kind="co_mention",
+                    )
+                )
+
         return GraphSnapshot(
             nodes=entity_nodes + idea_nodes,
-            edges=struct_edges + mentions_edges,
+            edges=struct_edges + co_mention_edges + mentions_edges,
             truncated=truncated,
         )
 
@@ -401,7 +427,99 @@ class OfflineStorage:
 
     async def merge_entities(self, source_id: str, target_id: str) -> Entity:
         self.entities.pop(source_id, None)
+        # Repoint mention edges off the source onto the target (set semantics).
+        self.mentions = {
+            (mid, target_id if eid == source_id else eid)
+            for (mid, eid) in self.mentions
+        }
+        # Repoint co-mention edges off the source onto the target (both directions);
+        # drop self-loops, keep the higher-weight edge on a collision so the merge
+        # is idempotent and never duplicates.
+        repointed_co: dict[tuple[str, str], tuple[float, int]] = {}
+        for (a, b), (weight, shared) in self.co_mentions.items():
+            na = target_id if a == source_id else a
+            nb = target_id if b == source_id else b
+            if na == nb:
+                continue
+            # Canonicalize (lo < hi): co-mention is unordered, so a reversing
+            # repoint folds onto the survivor's edge, never a parallel duplicate.
+            lo, hi = (na, nb) if na <= nb else (nb, na)
+            prev = repointed_co.get((lo, hi))
+            if prev is None or weight > prev[0]:
+                repointed_co[(lo, hi)] = (weight, shared)
+        self.co_mentions = repointed_co
         return self.entities[target_id]
+
+    async def persist_mentions(self) -> int:
+        """MERGE (memory)-[:MNEMOZINE_MENTIONS]->(entity) from each m.entities name.
+
+        Thin offline mirror of the backend: resolves each mention name to an
+        entity id by case-folded canonical-name/alias match and asserts the
+        (memory_id, entity_id) pair into the mentions set (idempotent). Returns
+        the number asserted this pass.
+        """
+
+        name_to_id: dict[str, str] = {}
+        for e in self.entities.values():
+            name_to_id[e.canonical_name.lower()] = e.id
+            for alias in e.aliases:
+                name_to_id.setdefault(alias.lower(), e.id)
+        asserted: set[tuple[str, str]] = set()
+        for m in self.memories.values():
+            for name in m.entities:
+                eid = name_to_id.get(name.lower())
+                if eid is not None:
+                    asserted.add((m.id, eid))
+        self.mentions |= asserted
+        return len(asserted)
+
+    async def co_mention_pairs(
+        self, *, min_shared: int = 2
+    ) -> list[tuple[str, str, int]]:
+        """Entity id pairs co-occurring in >= ``min_shared`` shared memories.
+
+        Thin offline mirror: groups the mentions set by memory, counts each
+        entity pair's distinct shared memories, returns ``(a, b, shared)`` with
+        ``a < b`` for pairs at or above ``min_shared``.
+        """
+
+        by_memory: dict[str, set[str]] = {}
+        for mid, eid in self.mentions:
+            by_memory.setdefault(mid, set()).add(eid)
+        pair_counts: dict[tuple[str, str], int] = {}
+        for eids in by_memory.values():
+            ids = sorted(eids)
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    pair_counts[(ids[i], ids[j])] = pair_counts.get((ids[i], ids[j]), 0) + 1
+        return [(a, b, n) for (a, b), n in pair_counts.items() if n >= min_shared]
+
+    async def entity_mention_counts(self) -> dict[str, int]:
+        """``{entity_id: distinct-memory mention count}`` over the mentions set."""
+
+        counts: dict[str, int] = {}
+        for _mid, eid in self.mentions:
+            counts[eid] = counts.get(eid, 0) + 1
+        return counts
+
+    async def upsert_co_mention(
+        self, from_entity: str, to_entity: str, *, weight: float, shared: int
+    ) -> Edge:
+        """Idempotently MERGE a weighted entity-entity co-mention edge (SET, not sum)."""
+
+        lo, hi = (
+            (from_entity, to_entity)
+            if from_entity <= to_entity
+            else (to_entity, from_entity)
+        )
+        self.co_mentions[(lo, hi)] = (float(weight), int(shared))
+        return Edge(
+            id=f"comention:{lo}:{hi}",
+            from_entity=lo,
+            to_entity=hi,
+            relation="co_mentioned",
+            weight=float(weight),
+        )
 
     async def neighbors(
         self, entity: str, *, max_degree: int | None = None, active_only: bool = True
@@ -521,6 +639,58 @@ class OfflineStorage:
             if m.category == src:
                 m.category = tgt
                 n += 1
+        return n
+
+    # --- relation registry (relation-label list/merge, FR-MNT-2/4) -----------
+
+    async def list_relations(self) -> list[tuple[str, int]]:
+        """``(relation_label, active_edge_count)`` over active relation edges.
+
+        Thin offline mirror of the backend's relation registry: a grouped count
+        over the active edges (the §9 eval metrics never exercise the relation
+        normalization pass, so this stays minimal but Protocol-conformant).
+        """
+
+        counts: dict[str, int] = {}
+        for e in self.edges.values():
+            if not e.is_active:
+                continue
+            counts[e.relation] = counts.get(e.relation, 0) + 1
+        return list(counts.items())
+
+    async def merge_relations(
+        self, source_relation: str, target_relation: str
+    ) -> int:
+        """Relabel every active ``source``-relation edge to ``target`` (idempotent).
+
+        Folds each source-relation edge onto the ``(from, to, target)`` edge
+        (max weight, drop the redundant parallel source edge). ``source ==
+        target`` -> 0. Returns the relabelled count.
+        """
+
+        if source_relation == target_relation:
+            return 0
+        n = 0
+        for edge in list(self.edges.values()):
+            if not edge.is_active or edge.relation != source_relation:
+                continue
+            n += 1
+            target_edge = next(
+                (
+                    e
+                    for e in self.edges.values()
+                    if e.is_active
+                    and e.from_entity == edge.from_entity
+                    and e.to_entity == edge.to_entity
+                    and e.relation == target_relation
+                ),
+                None,
+            )
+            if target_edge is None:
+                edge.relation = target_relation
+            else:
+                target_edge.weight = max(target_edge.weight, edge.weight)
+                del self.edges[edge.id]
         return n
 
     # --- data-versioning / in-place migration (mnemozine.migrations) ---------

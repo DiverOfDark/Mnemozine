@@ -41,11 +41,15 @@ from mnemozine.interfaces import (
 )
 from mnemozine.maintenance.audit import AuditJob
 from mnemozine.maintenance.category_merge import CategoryMergeJob
+from mnemozine.maintenance.co_mention import CoMentionJob
 from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob
+from mnemozine.maintenance.entity_dedup import EntityDedupJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.mentions import MentionsJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob
 from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
+from mnemozine.maintenance.relation_norm import RelationNormJob
 from mnemozine.schema.models import Scope
 
 logger = logging.getLogger(__name__)
@@ -61,7 +65,15 @@ def build_default_jobs(
     """Construct the standard maintenance job set in a deterministic run order.
 
     Order matters for a single pass: consolidate first (collapses duplicate
-    facts), resolve entities next (the merged graph), then merge near-duplicate
+    facts), resolve entities next (the merged graph), then persist the
+    memory->entity mention edges (graph connectivity — the substrate later
+    graph-connectivity jobs derive from), then derive the weighted entity-entity
+    co-mention layer from those mention edges (so it MUST run AFTER mentions),
+    then normalize the fragmented relation-label vocabulary into a controlled set
+    (independent of the mention/co-mention layers — it operates on the
+    LLM-extracted RELATES edges), then dedup true-duplicate entity nodes (LAST
+    among the graph-connectivity jobs, AFTER mentions + co-mention so the
+    survivor-repoint covers all three edge types), then merge near-duplicate
     emergent categories (the category analogue of entity resolution), then
     decay/archive (demote the now-quiet hot tier), and finally audit (report on
     the settled state).
@@ -77,6 +89,10 @@ def build_default_jobs(
     return [
         ConsolidationJob(storage, llm, embeddings, settings=settings),
         EntityResolutionJob(storage, llm=llm, settings=settings),
+        MentionsJob(storage, settings=settings),
+        CoMentionJob(storage, settings=settings),
+        RelationNormJob(storage, settings=settings),
+        EntityDedupJob(storage, embeddings=embeddings, settings=settings),
         CategoryMergeJob(storage, embeddings=embeddings, settings=settings),
         DecayJob(storage, settings=settings),
         AuditJob(storage, settings=settings),
@@ -126,7 +142,8 @@ class MaintenanceRunner:
             reports.append(report)
             logger.info(
                 "maintenance job %s: consolidated=%d merged=%d cat_merged=%d "
-                "re_extracted=%d archived=%d pruned=%d",
+                "re_extracted=%d archived=%d pruned=%d edges_added=%d "
+                "relations_merged=%d",
                 report.job_name,
                 report.consolidated,
                 report.entities_merged,
@@ -134,6 +151,8 @@ class MaintenanceRunner:
                 report.re_extracted,
                 report.archived,
                 report.edges_pruned,
+                report.edges_added,
+                report.relations_merged,
             )
             # WEBUI Q3 observability: record each job run on the activity feed.
             # Null-safe + error-swallowing (emit); a no-op unless a log is wired.
@@ -146,7 +165,9 @@ class MaintenanceRunner:
                         f"consolidated={report.consolidated} merged={report.entities_merged} "
                         f"cat_merged={report.categories_merged} "
                         f"re_extracted={report.re_extracted} "
-                        f"archived={report.archived} pruned={report.edges_pruned}"
+                        f"archived={report.archived} pruned={report.edges_pruned} "
+                        f"edges_added={report.edges_added} "
+                        f"relations_merged={report.relations_merged}"
                     ),
                     detail={
                         "consolidated": report.consolidated,
@@ -155,6 +176,8 @@ class MaintenanceRunner:
                         "re_extracted": report.re_extracted,
                         "archived": report.archived,
                         "edges_pruned": report.edges_pruned,
+                        "edges_added": report.edges_added,
+                        "relations_merged": report.relations_merged,
                         "notes": list(report.notes),
                     },
                 ),
@@ -247,7 +270,8 @@ def _echo_report(r: MaintenanceReport) -> None:
     typer.echo(
         f"[{r.job_name}] consolidated={r.consolidated} merged={r.entities_merged} "
         f"cat_merged={r.categories_merged} re_extracted={r.re_extracted} "
-        f"archived={r.archived} pruned={r.edges_pruned}"
+        f"archived={r.archived} pruned={r.edges_pruned} "
+        f"edges_added={r.edges_added} relations_merged={r.relations_merged}"
     )
     for note in r.notes:
         typer.echo(f"    - {note}")
@@ -373,6 +397,262 @@ def _cmd_merge_categories(
     """
 
     report = asyncio.run(_run_merge_categories(dry_run=dry_run))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Persist mentions (mnemozine-maintenance persist-mentions) — graph connectivity
+# ---------------------------------------------------------------------------
+
+
+async def _run_persist_mentions(*, dry_run: bool = False) -> MaintenanceReport:
+    """Build the wired :class:`MentionsJob` from the live container and run it.
+
+    The mentions job needs only the storage backend (it MERGEs the
+    memory->entity edges from each memory's ``m.entities`` name list). When
+    ``dry_run`` is set we report the would-be assertion count via a read-only
+    preview rather than writing edges — but because the persist is a single
+    idempotent set-based MERGE there is no cheap pure proposal to enumerate, so
+    the dry-run simply notes that no edges were written. Lazily imports the
+    composition root to keep tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    job = MentionsJob(storage, settings=settings)
+    try:
+        if dry_run:
+            report = MaintenanceReport(job_name=job.name)
+            report.notes.append(
+                "dry-run: would MERGE memory->entity mention edges from m.entities "
+                "(no edges written)"
+            )
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("persist-mentions")
+def _cmd_persist_mentions(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Do not write any edges; only report that the pass would run.",
+    ),
+) -> None:
+    """Persist (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges from m.entities.
+
+    Turns each memory's ``m.entities`` name list into real, traversable mention
+    edges so the graph becomes navigable memory<->entity<->memory (the substrate
+    the co-mention layer derives from). Idempotent (MERGE, never CREATE): a
+    re-run asserts the same edges and adds nothing new.
+    """
+
+    report = asyncio.run(_run_persist_mentions(dry_run=dry_run))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Co-mention (mnemozine-maintenance co-mention) — graph connectivity
+# ---------------------------------------------------------------------------
+
+
+async def _run_co_mention(
+    *, dry_run: bool = False, min_shared: int | None = None
+) -> MaintenanceReport:
+    """Build the wired :class:`CoMentionJob` from the live container and run it.
+
+    The co-mention job needs only the storage backend (it reads the
+    mention-derived co-occurrence enumeration and upserts the weighted
+    entity-entity edges). ``min_shared`` overrides ``graph.co_mention_min_shared``
+    for this run. When ``dry_run`` is set we report what the pass *would* assert —
+    the ranked/down-weighted/capped surviving pair count — via the read-only
+    enumeration seams WITHOUT writing any edge. Lazily imports the composition
+    root to keep tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    if min_shared is not None:
+        # Override the configured threshold for this run only (CLI --min-shared).
+        settings = settings.model_copy(
+            update={
+                "graph": settings.graph.model_copy(
+                    update={"co_mention_min_shared": min_shared}
+                )
+            }
+        )
+    storage = await container.build_storage()
+    job = CoMentionJob(storage, settings=settings)
+    try:
+        if dry_run:
+            pairs = await storage.co_mention_pairs(
+                min_shared=settings.graph.co_mention_min_shared
+            )
+            df = await storage.entity_mention_counts()
+            kept = job._rank_downweight_and_cap(pairs, df)  # noqa: SLF001 - read-only preview
+            report = MaintenanceReport(job_name=job.name)
+            report.notes.append(
+                f"dry-run: would assert {len(kept)} co-mention edge(s) "
+                f"from {len(pairs)} co-occurring pair(s) (no edges written)"
+            )
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("co-mention")
+def _cmd_co_mention(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Do not write any edges; only report how many would be asserted.",
+    ),
+    min_shared: int | None = typer.Option(
+        None,
+        "--min-shared",
+        help=(
+            "Minimum shared memories for a co-mention edge "
+            "(overrides graph.co_mention_min_shared for this run)."
+        ),
+    ),
+) -> None:
+    """Derive weighted entity-entity co-mention edges from the mention layer.
+
+    Reads the (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges, links entities
+    mentioned by the same memory, TF-IDF-style down-weights ultra-frequent hub
+    entities, and caps the edges added per node so the layer does not become a
+    hairball. Idempotent (MERGE, weight re-asserted not summed): a re-run writes
+    the same edges. Use ``--dry-run`` to preview the count first.
+    """
+
+    report = asyncio.run(_run_co_mention(dry_run=dry_run, min_shared=min_shared))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Relation normalization (mnemozine-maintenance normalize-relations)
+# ---------------------------------------------------------------------------
+
+
+async def _run_normalize_relations(*, dry_run: bool = False) -> MaintenanceReport:
+    """Build the wired :class:`RelationNormJob` from the live container and run it.
+
+    The relation-normalization job needs only the storage backend (it reads the
+    relation registry and relabels the ``MNEMOZINE_RELATES`` edges through the
+    controlled vocabulary). When ``dry_run`` is set, the read-only
+    :meth:`RelationNormJob.propose_merges` proposals are folded into a report's
+    notes without applying any merge — the CLI preview, modeled exactly on
+    ``merge-categories`` --dry-run. Lazily imports the composition root to keep
+    tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    job = RelationNormJob(storage, settings=settings)
+    try:
+        if dry_run:
+            proposals = await job.propose_merges()
+            report = MaintenanceReport(job_name=job.name)
+            for source, target in proposals:
+                report.notes.append(
+                    f"would normalize relation '{source}' -> '{target}'"
+                )
+            report.notes.append(f"dry-run: {len(proposals)} proposed merge(s)")
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("normalize-relations")
+def _cmd_normalize_relations(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only print the proposed (source -> canonical) relabels; apply nothing.",
+    ),
+) -> None:
+    """Collapse the fragmented MNEMOZINE_RELATES label vocabulary (FR-MNT-2/4).
+
+    The relation analogue of ``merge-categories``: maps each in-use relation label
+    through a controlled vocabulary (``uses`` / ``used-in`` / ``used_in`` -> uses;
+    ``depends-on`` / ``requires`` -> depends_on; …) and folds every non-canonical
+    label into its canonical one, combining the parallel edges' weights and never
+    leaving a duplicate parallel edge. Deterministic and embedding-free. Idempotent:
+    a re-run finds every label already canonical and merges nothing. Use
+    ``--dry-run`` to review the proposed relabels first.
+    """
+
+    report = asyncio.run(_run_normalize_relations(dry_run=dry_run))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Entity dedup (mnemozine-maintenance dedup-entities) — graph connectivity
+# ---------------------------------------------------------------------------
+
+
+async def _run_dedup_entities(*, mode: str | None = None) -> MaintenanceReport:
+    """Build the wired :class:`EntityDedupJob` from the live container and run it.
+
+    Merges true-duplicate ENTITY nodes by driving the existing
+    :meth:`StorageBackend.merge_entities` path (which repoints RELATES + MENTIONS +
+    CO_MENTIONS onto the survivor). ``mode`` (CLI ``--mode``) overrides
+    ``graph.entity_dedup_mode`` for this run: ``exact`` (default,
+    ``lower(canonical_name)`` collisions only), ``alias``, or ``embedding`` (the
+    fuzzier near-dup mode, which needs the embedding provider). Lazily imports the
+    composition root to keep tests offline. No memory is ever deleted; only true
+    duplicate entities are merged.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    embeddings = container.build_embedding_provider()
+    job = EntityDedupJob(storage, embeddings=embeddings, settings=settings, mode=mode)
+    try:
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("dedup-entities")
+def _cmd_dedup_entities(
+    mode: str = typer.Option(
+        "exact",
+        "--mode",
+        help=(
+            "Duplicate-detection mode: 'exact' (lower(canonical_name) collisions, "
+            "default), 'alias' (also fold alias-linked entities), or 'embedding' "
+            "(also fold near-dup names above graph.entity_dedup_similarity_threshold)."
+        ),
+    ),
+) -> None:
+    """Merge true-duplicate entities, repointing ALL edge types (FR-MNT-4).
+
+    Groups duplicate ENTITY nodes (case/spacing drift in ``exact`` mode; also
+    alias- or embedding-linked in the fuzzier modes), picks a deterministic
+    survivor, and folds each duplicate into it via the existing
+    ``merge_entities`` path — which now repoints the source's RELATES, MENTIONS,
+    AND CO_MENTIONS edges onto the survivor so no edge type is orphaned.
+    Idempotent: a re-run finds no duplicate group and merges nothing. No memory is
+    ever deleted.
+    """
+
+    report = asyncio.run(_run_dedup_entities(mode=mode))
     _echo_report(report)
 
 

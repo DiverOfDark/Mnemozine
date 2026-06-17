@@ -31,6 +31,130 @@ def test_fakes_satisfy_protocols() -> None:
     assert isinstance(FakeLLMProvider(), LLMProvider)
 
 
+@pytest.mark.asyncio
+async def test_persist_mentions_on_fake_is_protocol_conformant() -> None:
+    # The new StorageBackend.persist_mentions Protocol method is present on the
+    # in-memory fake and returns the count of asserted memory->entity edges.
+    from mnemozine.schema.models import Entity, MemoryUnit, Provenance
+
+    store = InMemoryStorage()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_memory(
+        MemoryUnit(
+            id="m1",
+            content="rust note",
+            scope=Scope.global_(),
+            category="fact",
+            entities=["rust"],
+            provenance=Provenance(source="claude_code", session_id="s1"),
+        )
+    )
+    assert await store.persist_mentions() == 1
+    # Idempotent: a re-run asserts the same edge, count unchanged.
+    assert await store.persist_mentions() == 1
+
+
+@pytest.mark.asyncio
+async def test_co_mention_methods_on_fake_are_protocol_conformant() -> None:
+    # The three new co-mention StorageBackend Protocol methods are present on the
+    # in-memory fake: co_mention_pairs (derived from mentions), entity_mention_counts
+    # (document frequency), and upsert_co_mention (idempotent weighted edge).
+    from mnemozine.schema.models import Entity, MemoryUnit, Provenance
+
+    store = InMemoryStorage()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-tokio", canonical_name="tokio"))
+    for mid in ("m1", "m2"):
+        await store.upsert_memory(
+            MemoryUnit(
+                id=mid,
+                content=f"{mid} body",
+                scope=Scope.global_(),
+                category="fact",
+                entities=["rust", "tokio"],
+                provenance=Provenance(source="claude_code", session_id="s1"),
+            )
+        )
+    await store.persist_mentions()
+
+    assert await store.co_mention_pairs(min_shared=2) == [("e-rust", "e-tokio", 2)]
+    assert await store.entity_mention_counts() == {"e-rust": 2, "e-tokio": 2}
+    edge = await store.upsert_co_mention("e-rust", "e-tokio", weight=1.0, shared=2)
+    assert edge.relation == "co_mentioned"
+    # Idempotent upsert: a re-assert keeps a single edge.
+    await store.upsert_co_mention("e-rust", "e-tokio", weight=1.0, shared=2)
+    assert len(store.co_mentions) == 1
+
+
+@pytest.mark.asyncio
+async def test_relation_norm_methods_on_fake_are_protocol_conformant() -> None:
+    # The two new relation-registry StorageBackend Protocol methods are present on
+    # the in-memory fake: list_relations (active-edge label counts) and
+    # merge_relations (idempotent relabel folding parallel edges).
+    from mnemozine.schema.models import Edge, Entity
+
+    store = InMemoryStorage()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-tokio", canonical_name="tokio"))
+    await store.upsert_edge(
+        Edge(from_entity="e-rust", to_entity="e-tokio", relation="used_in", weight=0.6)
+    )
+
+    assert dict(await store.list_relations()) == {"used_in": 1}
+    # Relabel 'used_in' -> 'uses'; the active edge now carries the canonical label.
+    assert await store.merge_relations("used_in", "uses") == 1
+    assert dict(await store.list_relations()) == {"uses": 1}
+    # Idempotent: nothing left labelled 'used_in', and same==same is a no-op.
+    assert await store.merge_relations("used_in", "uses") == 0
+    assert await store.merge_relations("uses", "uses") == 0
+
+
+@pytest.mark.asyncio
+async def test_entity_dedup_job_drives_merge_entities_repointing_all_layers() -> None:
+    # EntityDedupJob folds true-duplicate entities via the existing merge_entities
+    # path, which repoints the RELATES + MENTIONS + CO_MENTIONS layers onto the
+    # survivor on the in-memory fake (the contract's correctness invariant).
+    from mnemozine.maintenance.entity_dedup import EntityDedupJob
+    from mnemozine.schema.models import Edge, Entity, MemoryUnit, Provenance
+
+    store = InMemoryStorage()
+    await store.upsert_entity(
+        Entity(id="e-rust", canonical_name="rust", aliases=["rustc"])
+    )
+    await store.upsert_entity(Entity(id="e-rust2", canonical_name="Rust"))
+    await store.upsert_entity(Entity(id="e-tokio", canonical_name="tokio"))
+    await store.upsert_edge(
+        Edge(from_entity="e-rust2", to_entity="e-tokio", relation="uses", weight=0.7)
+    )
+    await store.upsert_memory(
+        MemoryUnit(
+            id="m1",
+            content="Rust note",
+            scope=Scope.global_(),
+            category="fact",
+            entities=["Rust"],
+            provenance=Provenance(source="claude_code", session_id="s1"),
+        )
+    )
+    await store.persist_mentions()
+    await store.upsert_co_mention("e-rust2", "e-tokio", weight=2.0, shared=3)
+
+    settings = Settings()
+    settings.graph.entity_dedup_mode = "exact"
+    report = await EntityDedupJob(store, settings=settings).run()
+
+    assert report.entities_merged == 1
+    # Mentions + co-mention repointed onto the survivor (no orphan edge).
+    assert ("m1", "e-rust") in store.mentions
+    assert ("e-rust", "e-tokio") in store.co_mentions
+    assert "e-rust2" not in store.entities
+    # No memory deleted.
+    assert "m1" in store.memories
+    # Idempotent: a second pass finds no duplicate group and merges 0.
+    second = await EntityDedupJob(store, settings=settings).run()
+    assert second.entities_merged == 0
+
+
 def test_settings_has_tuning_params() -> None:
     s = Settings()
     # §6.6 initial values that the PRD pins explicitly.

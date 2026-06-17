@@ -64,11 +64,16 @@ def _snapshot_node(node: GraphSnapshotNode) -> GraphNode:
 def _snapshot_edge(edge: GraphSnapshotEdge) -> GraphEdge:
     """Project a :class:`GraphSnapshotEdge` onto the Cytoscape wire edge.
 
-    Structural ``relates`` edges connect two entities (``ent:`` prefix on both);
-    ``mentions`` edges run from an idea-seed memory node (``mem:``) to an entity
-    (``ent:``). Neither is a cross-reference — the FR-RET-6 overlay is added on top.
+    Structural ``relates`` edges and weighted ``co_mention`` edges both connect two
+    entities (``ent:`` prefix on BOTH endpoints); only ``mentions`` edges run from
+    an idea-seed memory node (``mem:`` source) to an entity (``ent:`` target). The
+    co-mention layer surfaces with ``relation='co_mentioned'`` so the UI can style
+    it distinctly from the LLM-extracted ``relates`` edges. None of these is a
+    cross-reference — the FR-RET-6 overlay is added on top.
     """
 
+    # Only 'mentions' uses the memory-node source prefix; 'relates' and
+    # 'co_mention' are entity->entity, so both endpoints take the ent: prefix.
     if edge.kind == "mentions":
         source = f"{_MEM_PREFIX}{edge.source}"
     else:

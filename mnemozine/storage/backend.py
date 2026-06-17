@@ -68,9 +68,12 @@ from mnemozine.schema.models import (
 )
 from mnemozine.storage.cosine import cosine_similarity
 from mnemozine.storage.graphiti_client import (
+    CO_MENTION_RELATION,
+    CO_MENTION_TYPE,
     ENTITY_LABEL,
     MEMORY_LABEL,
     MEMORY_VECTOR_INDEX,
+    MENTIONS_TYPE,
     RAW_CHUNK_LABEL,
     RELATES_TYPE,
     SESSION_LABEL,
@@ -1181,9 +1184,42 @@ class GraphitiStorageBackend:
                     )
                 )
 
+        # --- co-mention edges among kept entities (SECOND aggregate query) ---
+        # The weighted entity-entity co-mention layer (kind='co_mention'), derived
+        # from MNEMOZINE_MENTIONS by the CoMentionJob. A single aggregate over the
+        # kept ids (no N+1), mirroring the RELATES aggregate above but on the
+        # distinct CO_MENTION_TYPE so the two layers stay physically separable.
+        co_mention_edges: list[GraphSnapshotEdge] = []
+        if kept_ids:
+            co_rows = await self._query(
+                f"MATCH (a:{ENTITY_LABEL})-[r:{CO_MENTION_TYPE}]->(b:{ENTITY_LABEL}) "
+                "WHERE a.id IN $ids AND b.id IN $ids "
+                "RETURN a.id AS source, b.id AS target, r",
+                ids=kept_ids,
+            )
+            co_seen: set[str] = set()
+            for row in co_rows:
+                source, target = row[0], row[1]
+                props = self._props(row[2])
+                edge_id = props.get("id") or f"comention:{source}:{target}"
+                if edge_id in co_seen:
+                    continue
+                co_seen.add(edge_id)
+                co_mention_edges.append(
+                    GraphSnapshotEdge(
+                        id=edge_id,
+                        source=source,
+                        target=target,
+                        relation=props.get("relation", CO_MENTION_RELATION),
+                        weight=float(props.get("weight", 1.0)),
+                        active=props.get("valid_to") is None,
+                        kind="co_mention",
+                    )
+                )
+
         return GraphSnapshot(
             nodes=entity_nodes + idea_nodes,
-            edges=struct_edges + mentions_edges,
+            edges=struct_edges + co_mention_edges + mentions_edges,
             truncated=truncated,
         )
 
@@ -1303,9 +1339,16 @@ class GraphitiStorageBackend:
     async def merge_entities(self, source_id: str, target_id: str) -> Entity:
         """Merge ``source_id`` into ``target_id`` (entity resolution, FR-MNT-4).
 
-        Repoints the source's edges onto the target, folds the source's canonical
-        name + aliases into the target's aliases, and deletes the now-redundant
-        source node so the graph does not fragment across duplicate entities.
+        Repoints the source's edges onto the target across ALL three edge types —
+        the LLM-extracted ``MNEMOZINE_RELATES`` relations (both directions), the
+        ``MNEMOZINE_MENTIONS`` memory->entity edges (incoming), and the weighted
+        ``MNEMOZINE_CO_MENTIONS`` entity-entity layer (both directions, self-loops
+        dropped) — so no edge type is orphaned when a duplicate entity is folded
+        away. Then folds the source's canonical name + aliases into the target's
+        aliases, and deletes the now-redundant source node so the graph does not
+        fragment across duplicate entities. Every repoint is MERGE-onto-target +
+        DELETE-source, so re-running (with the source already gone) is a no-op and
+        never creates a duplicate parallel edge. Memories are never deleted.
         """
 
         source = await self.get_entity(source_id)
@@ -1335,6 +1378,57 @@ class GraphitiStorageBackend:
             tgt=target_id,
         )
 
+        # Repoint the MENTIONS layer (memory -> entity, only INCOMING to the source
+        # entity): every memory that mentioned the duplicate now mentions the
+        # survivor. MERGE collapses a memory that mentioned BOTH onto one edge, so
+        # no duplicate is created (idempotent — a re-run with the source already
+        # gone matches nothing).
+        await self._query(
+            f"MATCH (m:{MEMORY_LABEL})-[r:{MENTIONS_TYPE}]->(s:{ENTITY_LABEL} {{id: $src}}) "
+            f"MATCH (t:{ENTITY_LABEL} {{id: $tgt}}) "
+            f"MERGE (m)-[:{MENTIONS_TYPE}]->(t) "
+            "DELETE r",
+            src=source_id,
+            tgt=target_id,
+        )
+
+        # Repoint the CO_MENTION layer (weighted entity-entity) onto the survivor in
+        # CANONICAL direction (lo.id < hi.id). Co-mention is an UNORDERED relation, so
+        # every stored edge keeps from.id < to.id; the repoint MUST re-canonicalize or
+        # a survivor.id > neighbor.id edge would survive and the next CoMentionJob run
+        # would MERGE the canonical reverse, creating a duplicate parallel edge. The
+        # undirected ``(s)-[r]-(o)`` match folds an incident edge from EITHER direction;
+        # ``o.id <> $tgt`` drops the would-be self-loop; MERGE onto the canonical pair
+        # folds onto the survivor's existing edge (highest weight kept) so no duplicate
+        # co-mention edge remains, matching upsert_co_mention's canonical re-assert.
+        await self._query(
+            f"MATCH (s:{ENTITY_LABEL} {{id: $src}})-[r:{CO_MENTION_TYPE}]-(o:{ENTITY_LABEL}) "
+            "WHERE o.id <> $tgt "
+            "WITH r, o, "
+            "CASE WHEN $tgt < o.id THEN $tgt ELSE o.id END AS lo, "
+            "CASE WHEN $tgt < o.id THEN o.id ELSE $tgt END AS hi "
+            f"MATCH (lon:{ENTITY_LABEL} {{id: lo}}) "
+            f"MATCH (hin:{ENTITY_LABEL} {{id: hi}}) "
+            f"MERGE (lon)-[nr:{CO_MENTION_TYPE} {{relation: r.relation}}]->(hin) "
+            "SET nr.weight = CASE WHEN nr.weight IS NULL OR r.weight > nr.weight "
+            "THEN r.weight ELSE nr.weight END, "
+            "nr.shared = coalesce(nr.shared, r.shared), "
+            "nr.from_entity = lo, nr.to_entity = hi, "
+            "nr.id = coalesce(nr.id, r.id), "
+            "nr.valid_from = coalesce(nr.valid_from, r.valid_from), nr.valid_to = NULL "
+            "DELETE r",
+            src=source_id,
+            tgt=target_id,
+        )
+        # Drop any co-mention edge that became a self-loop (the survivor and the
+        # duplicate were directly co-mentioned): a node never co-mentions itself.
+        await self._query(
+            f"MATCH (s:{ENTITY_LABEL} {{id: $src}})-[r:{CO_MENTION_TYPE}]-"
+            f"(t:{ENTITY_LABEL} {{id: $tgt}}) DELETE r",
+            src=source_id,
+            tgt=target_id,
+        )
+
         merged_aliases = sorted({*target.aliases, source.canonical_name, *source.aliases})
         target.aliases = merged_aliases
         await self._query(
@@ -1346,6 +1440,164 @@ class GraphitiStorageBackend:
             f"MATCH (s:{ENTITY_LABEL} {{id: $src}}) DELETE s", src=source_id
         )
         return target
+
+    async def persist_mentions(self) -> int:
+        """Persist (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges from ``m.entities``.
+
+        The resolution is computed **deterministically in Python** (mirroring the
+        ``entity_id_by_name`` map the graph-snapshot path already builds): load
+        every entity once into a lowered ``{canonical_name|alias -> id}`` map, then
+        stream the memories and resolve each memory's ``m.entities`` names against
+        that map into exact ``(memory_id, entity_id)`` pairs. The pairs are then
+        asserted by a single ``UNWIND``-of-pairs ``MERGE`` **keyed on the exact node
+        ids** — MERGE (never CREATE) on the id-bound endpoint pair, so a re-run
+        asserts the same edges and creates nothing new (FR-MNT-5). Returns the
+        number of distinct mention edges asserted (created-or-matched).
+
+        Why not a pure Cypher cross-product: an all-entities × all-memories
+        ``MATCH ... WHERE any(...)`` over the unindexed ``canonical_name`` is
+        non-deterministic at this store's scale on FalkorDB — each run committed a
+        drifting subset of the true pairs, so the stored mention count crept upward
+        and never reached a stable fixpoint. Resolving in Python over a single
+        deterministic entity scan and MERGEing by exact id removes that drift: the
+        matched pair set is the complete fixpoint and a re-run is a true no-op.
+        """
+
+        # 1) Deterministic lowered name/alias -> entity-id map (one entity scan).
+        entity_id_by_key: dict[str, str] = {}
+        async for entity in self.iter_entities():
+            entity_id_by_key.setdefault(entity.canonical_name.lower(), entity.id)
+            for alias in entity.aliases:
+                entity_id_by_key.setdefault(alias.lower(), entity.id)
+
+        if not entity_id_by_key:
+            return 0
+
+        # 2) Resolve each memory's entity-names to exact (memory_id, entity_id)
+        #    pairs, deduped as a set so the same pair is asserted once.
+        pairs: set[tuple[str, str]] = set()
+        async for memory in self.iter_memories():
+            for name in memory.entities:
+                eid = entity_id_by_key.get(name.lower())
+                if eid is not None:
+                    pairs.add((memory.id, eid))
+
+        if not pairs:
+            return 0
+
+        # 3) Idempotent id-keyed MERGE of the resolved pairs (single set-based
+        #    statement). Endpoints matched by exact id, so re-running creates none.
+        rows = await self._query(
+            "UNWIND $pairs AS pair "
+            f"MATCH (m:{MEMORY_LABEL} {{id: pair[0]}}) "
+            f"MATCH (e:{ENTITY_LABEL} {{id: pair[1]}}) "
+            f"MERGE (m)-[r:{MENTIONS_TYPE}]->(e) "
+            "RETURN count(r) AS n",
+            pairs=[[mid, eid] for mid, eid in sorted(pairs)],
+        )
+        if not rows or rows[0][0] is None:
+            return 0
+        return int(rows[0][0])
+
+    async def co_mention_pairs(
+        self, *, min_shared: int = 2
+    ) -> list[tuple[str, str, int]]:
+        """Entity id pairs co-occurring in >= ``min_shared`` shared memories.
+
+        Read-only: derived from the ``MNEMOZINE_MENTIONS`` layer. A single
+        set-based aggregate matches every memory that mentions BOTH endpoints —
+        ``(a)<-[:MNEMOZINE_MENTIONS]-(m)-[:MNEMOZINE_MENTIONS]->(b)`` with
+        ``a.id < b.id`` so each unordered pair appears once — counts the distinct
+        shared memories, and keeps only pairs at or above ``min_shared``. The
+        a<b ordering makes the output stable for the :class:`CoMentionJob`'s
+        deterministic ranking/cap (FR-MNT-5). No weighting happens here.
+        """
+
+        rows = await self._query(
+            f"MATCH (a:{ENTITY_LABEL})<-[:{MENTIONS_TYPE}]-(m:{MEMORY_LABEL})"
+            f"-[:{MENTIONS_TYPE}]->(b:{ENTITY_LABEL}) "
+            "WHERE a.id < b.id "
+            "WITH a.id AS aid, b.id AS bid, count(DISTINCT m) AS shared "
+            "WHERE shared >= $min_shared "
+            "RETURN aid, bid, shared",
+            min_shared=int(min_shared),
+        )
+        out: list[tuple[str, str, int]] = []
+        for row in rows:
+            if row[0] is None or row[1] is None:
+                continue
+            out.append((str(row[0]), str(row[1]), int(row[2])))
+        return out
+
+    async def entity_mention_counts(self) -> dict[str, int]:
+        """``{entity_id: distinct-memory mention count}`` over ``MNEMOZINE_MENTIONS``.
+
+        The document-frequency the :class:`CoMentionJob` needs for the TF-IDF-style
+        hub down-weight: a cheap grouped count of the distinct memories mentioning
+        each entity.
+        """
+
+        rows = await self._query(
+            f"MATCH (m:{MEMORY_LABEL})-[:{MENTIONS_TYPE}]->(e:{ENTITY_LABEL}) "
+            "RETURN e.id AS eid, count(DISTINCT m) AS df"
+        )
+        counts: dict[str, int] = {}
+        for row in rows:
+            if row[0] is None:
+                continue
+            counts[str(row[0])] = int(row[1])
+        return counts
+
+    async def upsert_co_mention(
+        self, from_entity: str, to_entity: str, *, weight: float, shared: int
+    ) -> Edge:
+        """Idempotently MERGE a weighted entity-entity co-mention edge (FR-MNT-5).
+
+        MERGEs on ``(from, to)`` over the distinct ``MNEMOZINE_CO_MENTIONS`` type
+        with ``relation = CO_MENTION_RELATION`` and re-asserts ``weight`` + a
+        ``shared`` count (SET, not sum) so a re-run is idempotent. Mirrors
+        :meth:`upsert_edge` but on the co-mention type so the edges stay separable
+        from LLM-extracted ``MNEMOZINE_RELATES``. Returns the stored edge.
+        """
+
+        now = datetime.now(UTC)
+        # Co-mention is an UNORDERED relation; store it canonically (lo.id < hi.id) so
+        # the directed MERGE is direction-stable and a re-run (even after a merge that
+        # reversed an endpoint) matches the same edge instead of creating a parallel
+        # reversed one. ``co_mention_pairs`` already yields a < b, so this is
+        # belt-and-suspenders that also lets the MERGE match a survivor edge that a
+        # prior merge_entities repoint produced.
+        lo, hi = (
+            (from_entity, to_entity)
+            if from_entity <= to_entity
+            else (to_entity, from_entity)
+        )
+        edge_id = f"comention:{lo}:{hi}"
+        await self._query(
+            f"MATCH (a:{ENTITY_LABEL} {{id: $lo}}) "
+            f"MATCH (b:{ENTITY_LABEL} {{id: $hi}}) "
+            f"MERGE (a)-[r:{CO_MENTION_TYPE} {{relation: $relation}}]->(b) "
+            "SET r.weight = $weight, r.shared = $shared, r.from_entity = $lo, "
+            "r.to_entity = $hi, r.id = coalesce(r.id, $id), "
+            "r.valid_from = coalesce(r.valid_from, $valid_from), r.valid_to = NULL "
+            "RETURN r",
+            lo=lo,
+            hi=hi,
+            relation=CO_MENTION_RELATION,
+            weight=float(weight),
+            shared=int(shared),
+            id=edge_id,
+            valid_from=_to_iso(now),
+        )
+        return Edge(
+            id=edge_id,
+            from_entity=lo,
+            to_entity=hi,
+            relation=CO_MENTION_RELATION,
+            weight=float(weight),
+            valid_from=now,
+            valid_to=None,
+        )
 
     async def neighbors(
         self, entity: str, *, max_degree: int | None = None, active_only: bool = True
@@ -1792,6 +2044,75 @@ class GraphitiStorageBackend:
         if not rows:
             return 0
         return int(rows[0][0])
+
+    # -- relation registry (relation-label list/merge, FR-MNT-2/4) ------------
+
+    async def list_relations(self) -> list[tuple[str, int]]:
+        """List the in-use ``MNEMOZINE_RELATES`` relation labels with their counts.
+
+        The relation analogue of :meth:`list_categories`: a grouped count over
+        active (open-window) ``MNEMOZINE_RELATES`` edges so the relation
+        normalization job can enumerate the fragmented label vocabulary. A label
+        missing the ``relation`` prop coalesces to the default ``"relates"``.
+        """
+
+        rows = await self._query(
+            f"MATCH ()-[r:{RELATES_TYPE}]->() WHERE r.valid_to IS NULL "
+            "RETURN coalesce(r.relation, 'relates') AS relation, count(r) AS n"
+        )
+        out: list[tuple[str, int]] = []
+        for row in rows:
+            relation = row[0] if row[0] is not None else "relates"
+            out.append((str(relation), int(row[1])))
+        return out
+
+    async def merge_relations(self, source_relation: str, target_relation: str) -> int:
+        """Relabel every ``source``-relation edge to ``target`` (relation merge).
+
+        The relation analogue of :meth:`merge_categories` / :meth:`merge_entities`:
+        for every active ``(a)-[:MNEMOZINE_RELATES {relation: source}]->(b)`` edge,
+        MERGE it onto the ``(a, b, target)`` edge — combining ``weight`` via
+        ``max`` (matching :meth:`upsert_edge`'s re-assert) and DELETING the now
+        redundant parallel source edge so no duplicate parallel edges remain
+        between the same pair + canonical relation. Idempotent: ``source ==
+        target`` -> 0, and a re-run over already-canonical labels finds no source
+        edges (FR-MNT-5). Returns the number of edges relabelled/merged.
+        """
+
+        if source_relation == target_relation:
+            return 0
+        # Count the source edges first (the relabelled total we report) — the
+        # MERGE+DELETE below collapses them onto the target edge per (a, b) pair.
+        count_rows = await self._query(
+            f"MATCH ()-[r:{RELATES_TYPE} {{relation: $source}}]->() "
+            "WHERE r.valid_to IS NULL RETURN count(r) AS n",
+            source=source_relation,
+        )
+        n = int(count_rows[0][0]) if count_rows and count_rows[0][0] is not None else 0
+        if n == 0:
+            return 0
+        # Fold each source-relation edge onto the (a, b, target) edge, taking the
+        # max weight (re-assert semantics), then delete the redundant source edge.
+        # The target edge keeps the source's id/window when it did not already
+        # exist (coalesce) so the canonical edge is never left without provenance.
+        await self._query(
+            f"MATCH (a:{ENTITY_LABEL})-[r:{RELATES_TYPE} {{relation: $source}}]->"
+            f"(b:{ENTITY_LABEL}) "
+            "WHERE r.valid_to IS NULL "
+            f"MERGE (a)-[nr:{RELATES_TYPE} {{relation: $target}}]->(b) "
+            "SET nr.weight = "
+            "CASE WHEN nr.weight IS NULL THEN r.weight "
+            "ELSE (CASE WHEN nr.weight > r.weight THEN nr.weight ELSE r.weight END) END, "
+            "nr.from_entity = coalesce(nr.from_entity, r.from_entity), "
+            "nr.to_entity = coalesce(nr.to_entity, r.to_entity), "
+            "nr.id = coalesce(nr.id, r.id), "
+            "nr.valid_from = coalesce(nr.valid_from, r.valid_from), "
+            "nr.valid_to = NULL "
+            "DELETE r",
+            source=source_relation,
+            target=target_relation,
+        )
+        return n
 
     # -- data-versioning / in-place migration (mnemozine.migrations) ----------
 

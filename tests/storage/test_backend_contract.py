@@ -667,6 +667,296 @@ async def test_merge_entities_folds_aliases() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mentions — (memory)-[:MNEMOZINE_MENTIONS]->(entity) from m.entities
+# ---------------------------------------------------------------------------
+
+
+async def test_persist_mentions_asserts_edges_from_m_entities() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-eh", canonical_name="error-handling"))
+    # _memory() defaults entities to ["rust", "error-handling"], both resolvable.
+    await store.upsert_memory(_memory(content="uses thiserror", mid="m1"))
+
+    asserted = await store.persist_mentions()
+
+    assert asserted == 2
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == {("m1", "e-rust"), ("m1", "e-eh")}
+
+
+async def test_persist_mentions_resolves_alias_and_case_folds() -> None:
+    store = _backend()
+    await store.upsert_entity(
+        Entity(id="e-rust", canonical_name="rust", aliases=["rustc"])
+    )
+    # Mention names: 'Rust' (cased canonical) and 'rustc' (alias) -> one entity.
+    await store.upsert_memory(
+        _memory(content="Rust compiler", entities=["Rust"], mid="m1")
+    )
+    await store.upsert_memory(
+        _memory(content="rustc note", entities=["rustc"], mid="m2")
+    )
+
+    asserted = await store.persist_mentions()
+
+    assert asserted == 2
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == {("m1", "e-rust"), ("m2", "e-rust")}
+
+
+async def test_persist_mentions_is_idempotent() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-eh", canonical_name="error-handling"))
+    await store.upsert_memory(_memory(content="uses thiserror", mid="m1"))
+
+    first = await store.persist_mentions()
+    driver = store._client.driver  # type: ignore[attr-defined]
+    after_first = set(driver.mentions)
+    second = await store.persist_mentions()
+
+    # MERGE (not CREATE): the second pass re-asserts the same edges, adds none.
+    assert first == 2
+    assert second == 2
+    assert driver.mentions == after_first
+
+
+async def test_persist_mentions_skips_unresolvable_names() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_memory(
+        _memory(content="rust only", entities=["rust", "no-such-entity"], mid="m1")
+    )
+
+    asserted = await store.persist_mentions()
+
+    assert asserted == 1
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == {("m1", "e-rust")}
+
+
+# ---------------------------------------------------------------------------
+# Co-mention — weighted entity-entity (entity)-[:MNEMOZINE_CO_MENTIONS]->(entity)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_co_mention(store: GraphitiStorageBackend) -> None:
+    """Seed two memories that each mention rust+tokio, then persist mentions."""
+
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-tokio", canonical_name="tokio"))
+    await store.upsert_memory(
+        _memory(content="m1", entities=["rust", "tokio"], mid="m1")
+    )
+    await store.upsert_memory(
+        _memory(content="m2", entities=["rust", "tokio"], mid="m2")
+    )
+    await store.persist_mentions()
+
+
+async def test_co_mention_pairs_derives_from_mentions_layer() -> None:
+    store = _backend()
+    await _seed_co_mention(store)
+
+    pairs = await store.co_mention_pairs(min_shared=2)
+
+    # rust+tokio share 2 memories; a<b ordered pair, count 2.
+    assert pairs == [("e-rust", "e-tokio", 2)]
+    # min_shared filters it out at threshold 3.
+    assert await store.co_mention_pairs(min_shared=3) == []
+
+
+async def test_entity_mention_counts_is_document_frequency() -> None:
+    store = _backend()
+    await _seed_co_mention(store)
+
+    df = await store.entity_mention_counts()
+
+    # Each entity is mentioned by both memories (df 2).
+    assert df == {"e-rust": 2, "e-tokio": 2}
+
+
+async def test_upsert_co_mention_merges_and_is_idempotent() -> None:
+    store = _backend()
+    await _seed_co_mention(store)
+
+    e1 = await store.upsert_co_mention("e-rust", "e-tokio", weight=1.0, shared=2)
+    assert e1.relation == "co_mentioned"
+    assert e1.weight == 1.0
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.co_mentions[("e-rust", "e-tokio")]["weight"] == 1.0
+    assert driver.co_mentions[("e-rust", "e-tokio")]["shared"] == 2
+
+    # Re-assert (weight SET, not summed): a single edge with the new weight.
+    await store.upsert_co_mention("e-rust", "e-tokio", weight=1.5, shared=2)
+    assert len(driver.co_mentions) == 1
+    assert driver.co_mentions[("e-rust", "e-tokio")]["weight"] == 1.5
+
+
+async def test_graph_snapshot_surfaces_co_mention_edges() -> None:
+    store = _backend()
+    await _seed_co_mention(store)
+    await store.upsert_co_mention("e-rust", "e-tokio", weight=1.0, shared=2)
+
+    snap = await store.graph_snapshot()
+
+    co = [e for e in snap.edges if e.kind == "co_mention"]
+    assert len(co) == 1
+    assert co[0].source == "e-rust"
+    assert co[0].target == "e-tokio"
+    assert co[0].relation == "co_mentioned"
+    assert co[0].weight == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Entity dedup — merge_entities repoints ALL THREE edge types onto the survivor
+# ---------------------------------------------------------------------------
+
+
+async def test_merge_entities_repoints_mentions_and_co_mention() -> None:
+    """The extended ``merge_entities`` repoints RELATES + MENTIONS + CO_MENTIONS.
+
+    Drives the real backend Cypher through the FakeFalkorDriver: a duplicate
+    ``rust-lang`` carries a RELATES edge, a memory mention, and a co-mention edge;
+    merging it into ``rust`` must move every edge type onto the survivor with no
+    orphan and no duplicate (entity_dedup's correctness invariant).
+    """
+
+    store = _backend()
+    survivor = Entity(id="e-rust", canonical_name="rust")
+    dup = Entity(id="e-rustlang", canonical_name="rust-lang")
+    tokio = Entity(id="e-tokio", canonical_name="tokio")
+    await store.upsert_entity(survivor)
+    await store.upsert_entity(dup)
+    await store.upsert_entity(tokio)
+
+    # RELATES edge off the duplicate.
+    await store.upsert_edge(
+        Edge(from_entity="e-rustlang", to_entity="e-tokio", relation="uses", weight=0.7)
+    )
+    # MENTIONS: a memory mentions the duplicate by name.
+    await store.upsert_memory(
+        _memory(content="rust-lang note", entities=["rust-lang"], mid="m1")
+    )
+    await store.persist_mentions()
+    # CO_MENTIONS: a co-mention edge off the duplicate.
+    await store.upsert_co_mention("e-rustlang", "e-tokio", weight=2.0, shared=3)
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert ("m1", "e-rustlang") in driver.mentions
+    assert ("e-rustlang", "e-tokio") in driver.co_mentions
+
+    await store.merge_entities(dup.id, survivor.id)
+
+    # MENTIONS repointed onto the survivor (no orphan to the dead node).
+    assert ("m1", "e-rust") in driver.mentions
+    assert ("m1", "e-rustlang") not in driver.mentions
+    # CO_MENTIONS repointed onto the survivor.
+    assert ("e-rust", "e-tokio") in driver.co_mentions
+    assert ("e-rustlang", "e-tokio") not in driver.co_mentions
+    assert driver.co_mentions[("e-rust", "e-tokio")]["weight"] == 2.0
+    # RELATES repointed too (the survivor now links tokio).
+    neighbors = await store.neighbors("rust")
+    assert {n.entity.id for n in neighbors} == {"e-tokio"}
+    # The duplicate node is gone; no memory was deleted.
+    assert await store.get_entity(dup.id) is None
+    assert "m1" in driver.memories
+
+
+async def test_merge_entities_drops_co_mention_self_loop() -> None:
+    """Merging two DIRECTLY co-mentioned entities never leaves a self-loop edge.
+
+    If the duplicate and the survivor were themselves co-mentioned, repointing
+    that edge would create a ``survivor->survivor`` self-loop; the merge must drop
+    it (a node never co-mentions itself).
+    """
+
+    store = _backend()
+    survivor = Entity(id="e-rust", canonical_name="rust")
+    dup = Entity(id="e-rustlang", canonical_name="rust-lang")
+    await store.upsert_entity(survivor)
+    await store.upsert_entity(dup)
+    await store.upsert_co_mention("e-rust", "e-rustlang", weight=1.0, shared=2)
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert len(driver.co_mentions) == 1
+
+    await store.merge_entities(dup.id, survivor.id)
+
+    # No self-loop, no duplicate — the layer is empty after the only edge folds away.
+    assert all(a != b for (a, b) in driver.co_mentions)
+    assert ("e-rust", "e-rust") not in driver.co_mentions
+    assert len(driver.co_mentions) == 0
+
+
+async def test_merge_then_rerun_co_mention_no_reversed_duplicate() -> None:
+    """A merge whose survivor.id > neighbor.id must not spawn a duplicate edge on re-run.
+
+    Regression for the direction bug: co-mention is UNORDERED (stored lo.id <
+    hi.id). ``merge_entities`` used to repoint co-mention edges PRESERVING raw
+    direction, so a ``survivor.id > neighbor.id`` edge survived non-canonically;
+    the next ``CoMentionJob`` run then MERGEd the canonical reverse and created a
+    parallel reversed duplicate (breaking idempotency, doubling the edge in
+    ``/api/graph``). Both the repoint and the upsert now canonicalize, so the pair
+    keeps exactly one edge. Picks survivor ``e-zzz`` > neighbor ``e-mmm`` so the
+    invariant is genuinely exercised (not surviving by lexical luck).
+    """
+
+    store = _backend()
+    survivor = Entity(id="e-zzz", canonical_name="survivor")
+    dup = Entity(id="e-aaa", canonical_name="dup")
+    neighbor = Entity(id="e-mmm", canonical_name="neighbor")
+    for e in (survivor, dup, neighbor):
+        await store.upsert_entity(e)
+    # Both the duplicate and the survivor are co-mentioned with the shared neighbor.
+    await store.upsert_co_mention("e-aaa", "e-mmm", weight=1.0, shared=2)
+    await store.upsert_co_mention("e-mmm", "e-zzz", weight=1.0, shared=2)
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+
+    await store.merge_entities(dup.id, survivor.id)
+    # Simulate the next CoMentionJob run re-asserting the canonical pair.
+    await store.upsert_co_mention("e-mmm", "e-zzz", weight=1.0, shared=4)
+
+    pair_edges = [k for k in driver.co_mentions if set(k) == {"e-mmm", "e-zzz"}]
+    assert pair_edges == [("e-mmm", "e-zzz")], pair_edges
+    # Global invariant: every stored co-mention edge is canonical (lo.id < hi.id).
+    assert all(a < b for (a, b) in driver.co_mentions)
+
+
+async def test_merge_folds_reversed_co_mention_with_max_weight() -> None:
+    """Within a SINGLE merge, a reversed repoint folds onto the survivor (max weight).
+
+    The survivor already links the neighbor ``e-o`` (weight 1.0); the duplicate
+    links ``e-o`` more strongly (weight 3.0). Merging the duplicate into a survivor
+    whose id is lexically greater than ``e-o`` previously produced BOTH
+    ``(e-o,e-surv)`` and ``(e-surv,e-o)`` with the higher weight NOT folded. The
+    canonical repoint must leave exactly one ``(e-o,e-surv)`` edge carrying the max
+    weight 3.0.
+    """
+
+    store = _backend()
+    surv = Entity(id="e-surv", canonical_name="surv")
+    o = Entity(id="e-o", canonical_name="o")
+    dup = Entity(id="e-dup", canonical_name="dup")
+    for e in (surv, o, dup):
+        await store.upsert_entity(e)
+    await store.upsert_co_mention("e-o", "e-surv", weight=1.0, shared=2)
+    await store.upsert_co_mention("e-dup", "e-o", weight=3.0, shared=5)
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+
+    await store.merge_entities(dup.id, surv.id)
+
+    pair_edges = [k for k in driver.co_mentions if set(k) == {"e-o", "e-surv"}]
+    assert pair_edges == [("e-o", "e-surv")], pair_edges
+    assert driver.co_mentions[("e-o", "e-surv")]["weight"] == 3.0
+    assert all(a < b for (a, b) in driver.co_mentions)
+
+
+# ---------------------------------------------------------------------------
 # Suppression (FR-RET-6 / R2) + session (§7)
 # ---------------------------------------------------------------------------
 
@@ -911,6 +1201,94 @@ async def test_merge_categories_relabels_and_is_idempotent() -> None:
     assert "gotchas" not in counts
     # Idempotent: re-running relabels nothing.
     assert await store.merge_categories("gotchas", "gotcha") == 0
+
+
+# ---------------------------------------------------------------------------
+# Relation registry — list_relations / merge_relations (FR-MNT-2/4)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_relations(store: GraphitiStorageBackend) -> tuple[str, str, str]:
+    a = Entity(canonical_name="rust")
+    b = Entity(canonical_name="tokio")
+    c = Entity(canonical_name="serde")
+    for ent in (a, b, c):
+        await store.upsert_entity(ent)
+    # Two fragmented variants of the same relation between distinct pairs, plus a
+    # distinct relation, so the registry has labels to collapse.
+    await store.upsert_edge(
+        Edge(from_entity=a.id, to_entity=b.id, relation="used_in", weight=0.6)
+    )
+    await store.upsert_edge(
+        Edge(from_entity=a.id, to_entity=c.id, relation="used_in", weight=0.4)
+    )
+    await store.upsert_edge(
+        Edge(from_entity=b.id, to_entity=c.id, relation="depends_on", weight=0.5)
+    )
+    return a.id, b.id, c.id
+
+
+async def test_list_relations_counts_active_labels() -> None:
+    store = _backend()
+    await _seed_relations(store)
+
+    counts = dict(await store.list_relations())
+
+    assert counts["used_in"] == 2
+    assert counts["depends_on"] == 1
+
+
+async def test_merge_relations_relabels_and_is_idempotent() -> None:
+    store = _backend()
+    await _seed_relations(store)
+
+    # Fold the fragmented 'used_in' into the canonical 'uses' (no parallel target
+    # edges exist yet, so each source edge is relabelled in place).
+    n = await store.merge_relations("used_in", "uses")
+    assert n == 2
+    counts = dict(await store.list_relations())
+    assert counts.get("uses") == 2
+    assert "used_in" not in counts
+    # Idempotent: re-running finds no 'used_in' edges, relabels nothing.
+    assert await store.merge_relations("used_in", "uses") == 0
+
+
+async def test_merge_relations_combines_parallel_edge_weight_no_duplicate() -> None:
+    store = _backend()
+    a = Entity(canonical_name="rust")
+    b = Entity(canonical_name="tokio")
+    await store.upsert_entity(a)
+    await store.upsert_entity(b)
+    # A canonical target edge AND a fragmented source edge between the SAME pair:
+    # the merge must combine onto the single target edge (max weight), never leave
+    # a duplicate parallel edge.
+    await store.upsert_edge(
+        Edge(from_entity=a.id, to_entity=b.id, relation="uses", weight=0.4)
+    )
+    await store.upsert_edge(
+        Edge(from_entity=a.id, to_entity=b.id, relation="used_in", weight=0.9)
+    )
+
+    n = await store.merge_relations("used_in", "uses")
+    assert n == 1
+    # Only the single canonical 'uses' edge remains between the pair, weight=max.
+    driver = store._client.driver  # type: ignore[attr-defined]
+    uses = [
+        e
+        for e in driver.edges.values()
+        if e["from_entity"] == a.id
+        and e["to_entity"] == b.id
+        and e.get("relation") == "uses"
+    ]
+    assert len(uses) == 1
+    assert uses[0]["weight"] == pytest.approx(0.9)
+    assert "used_in" not in dict(await store.list_relations())
+
+
+async def test_merge_relations_same_label_is_noop() -> None:
+    store = _backend()
+    await _seed_relations(store)
+    assert await store.merge_relations("used_in", "used_in") == 0
 
 
 # ---------------------------------------------------------------------------

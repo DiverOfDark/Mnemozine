@@ -15,6 +15,27 @@ module's concrete code):
   by recency + access frequency; sink + archive, **never hard-delete**.
 * :class:`~mnemozine.maintenance.entity_resolution.EntityResolutionJob` —
   FR-MNT-4 duplicate-entity merge + low-weight edge pruning + node-degree cap.
+* :class:`~mnemozine.maintenance.mentions.MentionsJob` — persists
+  (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges from each memory's ``m.entities``
+  name list (the graph-connectivity substrate the co-mention layer derives from).
+* :class:`~mnemozine.maintenance.co_mention.CoMentionJob` — derives the weighted
+  entity-entity (entity)-[:MNEMOZINE_CO_MENTIONS]->(entity) co-mention layer from
+  the mention edges, TF-IDF-style down-weighting ultra-frequent hub entities and
+  capping the edges added per node so the layer does not become a hairball.
+* :class:`~mnemozine.maintenance.relation_norm.RelationNormJob` — the relation
+  analogue of category merge: collapses the fragmented ``MNEMOZINE_RELATES``
+  relation-label vocabulary (``uses`` / ``used-in`` / ``used_in`` …) into a
+  controlled vocabulary (:func:`~mnemozine.maintenance.relation_norm.normalize_relation`
+  + :data:`~mnemozine.maintenance.relation_norm.RELATION_SYNONYMS`) via
+  :meth:`~mnemozine.interfaces.StorageBackend.merge_relations` (the
+  ``normalize-relations`` subcommand).
+* :class:`~mnemozine.maintenance.entity_dedup.EntityDedupJob` — merges
+  true-duplicate ENTITY nodes (case/spacing drift, alias, or — behind the flag —
+  embedding near-dups) by driving the existing
+  :meth:`~mnemozine.interfaces.StorageBackend.merge_entities` path, which repoints
+  ALL three edge types (RELATES / MENTIONS / CO_MENTIONS) onto the survivor so no
+  edge is orphaned (the ``dedup-entities`` subcommand; runs AFTER mentions +
+  co-mention so all three layers exist to repoint). No memory is ever deleted.
 * :class:`~mnemozine.maintenance.category_merge.CategoryMergeJob` — the category
   analogue of entity resolution: clusters near-duplicate emergent
   ``MemoryUnit.category`` strings (by name/embedding similarity) and folds each
@@ -46,12 +67,20 @@ from mnemozine.maintenance.category_merge import (
     name_similarity,
     normalize_category,
 )
+from mnemozine.maintenance.co_mention import CoMentionJob, co_mention_weight
 from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob, decay_score, rank_by_decay
 from mnemozine.maintenance.decision import WriteDecider, WriteDecisionConfig
+from mnemozine.maintenance.entity_dedup import DEDUP_MODES, EntityDedupJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.mentions import MentionsJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob, needs_migration
 from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
+from mnemozine.maintenance.relation_norm import (
+    RELATION_SYNONYMS,
+    RelationNormJob,
+    normalize_relation,
+)
 from mnemozine.maintenance.runner import (
     MaintenanceRunner,
     build_default_jobs,
@@ -60,23 +89,31 @@ from mnemozine.maintenance.runner import (
 )
 
 __all__ = [
+    "DEDUP_MODES",
+    "RELATION_SYNONYMS",
     "AuditJob",
     "CategoryMergeJob",
+    "CoMentionJob",
     "ConsolidationJob",
     "DecayJob",
+    "EntityDedupJob",
     "EntityResolutionJob",
     "MaintenanceRunner",
+    "MentionsJob",
     "MigrateIndexJob",
     "ReExtractJob",
     "ReclassifyJob",
+    "RelationNormJob",
     "WriteDecider",
     "WriteDecisionConfig",
     "build_default_jobs",
+    "co_mention_weight",
     "decay_score",
     "maintenance_cli",
     "name_similarity",
     "needs_migration",
     "normalize_category",
+    "normalize_relation",
     "rank_by_decay",
     "run_maintenance",
 ]

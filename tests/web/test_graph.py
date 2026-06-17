@@ -55,6 +55,22 @@ def test_graph_center_on_entity(client: TestClient) -> None:
     assert entity_labels <= {"rust", "error-handling", "tokio"}
 
 
+def test_graph_surfaces_co_mention_edges_as_entity_to_entity(
+    client: TestClient,
+) -> None:
+    # The weighted entity-entity co-mention layer surfaces as relation
+    # 'co_mentioned' with BOTH endpoints on the ent: node-id namespace (not the
+    # mem: prefix that only 'mentions' edges use).
+    body = client.get("/api/graph", params={"include_crossrefs": "false"}).json()
+    co = [e for e in body["edges"] if e["relation"] == "co_mentioned"]
+    assert co, "the co-mention layer should surface as a 'co_mentioned' edge"
+    edge = co[0]
+    assert edge["source"].startswith("ent:")
+    assert edge["target"].startswith("ent:")
+    assert edge["weight"] == 0.71
+    assert edge["is_crossref"] is False
+
+
 def test_graph_crossref_overlay_edges_carry_reason(client: TestClient) -> None:
     # The overlay is best-effort; when crossref edges are present they must carry a
     # non-empty reason and be flagged is_crossref (FR-RET-6).

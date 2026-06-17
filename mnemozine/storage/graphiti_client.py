@@ -69,6 +69,24 @@ SUPPRESSION_LABEL = "MnemozineSuppression"
 RAW_CHUNK_LABEL = "MnemozineRawChunk"
 # Relationship type for the weighted, temporal entity-entity edges (§7 Edge).
 RELATES_TYPE = "MNEMOZINE_RELATES"
+# Relationship type for (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges, derived
+# from each memory's ``m.entities`` name list (the mentions persist job). A
+# DISTINCT relationship TYPE (not a relation-label property on MNEMOZINE_RELATES)
+# so mention edges are cleanly separable from LLM-extracted relations in
+# queries/merge/prune — exactly as RELATES_TYPE / MEMORY_LABEL are kept distinct.
+MENTIONS_TYPE = "MNEMOZINE_MENTIONS"
+# Relationship type for the weighted entity-entity co-mention edges, derived from
+# the MNEMOZINE_MENTIONS layer (two entities mentioned by the same memory). A
+# DISTINCT relationship TYPE (not a relation-label property on MNEMOZINE_RELATES)
+# so co-mention edges are physically separable from the LLM-extracted relations in
+# queries/merge/prune and are never confused with extracted relations — exactly as
+# MENTIONS_TYPE / RELATES_TYPE are kept distinct.
+CO_MENTION_TYPE = "MNEMOZINE_CO_MENTIONS"
+# The relation-label property value stored on each MNEMOZINE_CO_MENTIONS edge (and
+# surfaced as GraphSnapshotEdge.relation). Mirrors how Edge.relation labels
+# MNEMOZINE_RELATES edges; lets the viz/UI display 'co_mentioned' and lets the
+# upsert key on (from, to, relation).
+CO_MENTION_RELATION = "co_mentioned"
 
 # Name of the FalkorDB vector index over MemoryUnit embeddings (FR-STO-2).
 MEMORY_VECTOR_INDEX = "mnemozine_memory_vec"

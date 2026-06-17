@@ -321,12 +321,15 @@ class GraphSnapshotNode:
 class GraphSnapshotEdge:
     """One bounded edge in a :class:`GraphSnapshot`.
 
-    A structural entity-entity relationship (``kind='relates'``) or an idea-seed
-    ``mentions`` link from a memory node to an entity it mentions
-    (``kind='mentions'``). ``source``/``target`` are the bare node ids
-    (entity id or memory id) — the route prefixes them to the Cytoscape node-id
-    namespace and overlays explainable cross-reference edges separately (the
-    FR-RET-6 overlay is a CrossReferencer concern, not part of this snapshot).
+    A structural entity-entity relationship (``kind='relates'``), a weighted
+    entity-entity co-mention link (``kind='co_mention'``, ``relation='co_mentioned'``,
+    both endpoints entity ids), or an idea-seed ``mentions`` link from a memory node
+    to an entity it mentions (``kind='mentions'``). ``source``/``target`` are the
+    bare node ids (entity id or memory id) — the route prefixes them to the
+    Cytoscape node-id namespace (``ent:`` for both endpoints of ``relates`` /
+    ``co_mention``; ``mem:`` only for the ``mentions`` source) and overlays
+    explainable cross-reference edges separately (the FR-RET-6 overlay is a
+    CrossReferencer concern, not part of this snapshot).
     """
 
     id: str
@@ -812,6 +815,61 @@ class StorageBackend(Protocol):
         """
         ...
 
+    async def persist_mentions(self) -> int:
+        """Persist (memory)-[:MNEMOZINE_MENTIONS]->(entity) edges from ``m.entities``.
+
+        Idempotently MERGE a ``MNEMOZINE_MENTIONS`` edge for every memory whose
+        ``entities`` name list resolves to an entity by ``lower(canonical_name)``
+        match or alias membership. The mention-name list (``m.entities``) is a
+        string property today, *not* graph edges; this is what first turns those
+        into traversable edges so the graph becomes memory<->entity<->memory.
+
+        Whole-store and set-based: a single MERGE pass (never blind CREATE), so
+        re-running asserts the same edges without duplicating them (FR-MNT-5).
+        Returns the number of mention edges asserted (created-or-matched).
+        """
+        ...
+
+    async def co_mention_pairs(
+        self, *, min_shared: int = 2
+    ) -> list[tuple[str, str, int]]:
+        """Entity id pairs co-occurring in >= ``min_shared`` shared memories.
+
+        Read-only enumeration derived from the ``MNEMOZINE_MENTIONS`` edges: for
+        every pair of entities a memory mentions BOTH of, count the distinct
+        memories that mention both. Returns ``(entity_id_a, entity_id_b,
+        shared_memory_count)`` for pairs whose shared count is at least
+        ``min_shared``, with ``a < b`` ordered for stable dedup. This is the pure
+        enumeration seam the :class:`CoMentionJob` ranks / down-weights / caps in
+        Python (keeping the hub-downweight + degree-cap logic unit-testable
+        offline); the backend method does no weighting.
+        """
+        ...
+
+    async def entity_mention_counts(self) -> dict[str, int]:
+        """``{entity_id: distinct-memory mention count}`` over ``MNEMOZINE_MENTIONS``.
+
+        The document-frequency the :class:`CoMentionJob` needs for the TF-IDF-style
+        hub down-weight: how many distinct memories mention each entity. A cheap
+        grouped count over the mention edges.
+        """
+        ...
+
+    async def upsert_co_mention(
+        self, from_entity: str, to_entity: str, *, weight: float, shared: int
+    ) -> Edge:
+        """Idempotently MERGE a weighted entity-entity co-mention edge.
+
+        MERGEs the ``(from_entity)-[:MNEMOZINE_CO_MENTIONS {relation:
+        'co_mentioned'}]->(to_entity)`` edge keyed on ``(from, to)`` with
+        ``relation = CO_MENTION_RELATION`` and SETs ``weight`` + a shared-count
+        property on create/update (recompute, do NOT blindly sum, so a re-run is
+        idempotent). Mirrors :meth:`upsert_edge` but on the distinct
+        ``MNEMOZINE_CO_MENTIONS`` type so co-mention edges stay separable from
+        LLM-extracted ``MNEMOZINE_RELATES``. Returns the stored edge.
+        """
+        ...
+
     async def neighbors(
         self, entity: str, *, max_degree: int | None = None, active_only: bool = True
     ) -> list[Neighbor]:
@@ -1008,6 +1066,34 @@ class StorageBackend(Protocol):
         :class:`~mnemozine.schema.models.MemoryUnit` category normalization.
         Idempotent. Returns the number of memories re-labeled. Driven by the
         :class:`CategoryMerger` maintenance job.
+        """
+        ...
+
+    # --- relation registry (relation-label list/merge, FR-MNT-2/4) -----------
+
+    async def list_relations(self) -> list[tuple[str, int]]:
+        """List the in-use ``MNEMOZINE_RELATES`` relation labels with their counts.
+
+        The relation analogue of :meth:`list_categories`: returns
+        ``(relation_label, active_edge_count)`` over active (open-window)
+        ``MNEMOZINE_RELATES`` edges so the relation-normalization job can
+        enumerate the fragmented label vocabulary (``uses`` / ``used-in`` /
+        ``used_in`` …) to collapse. Ordering is unspecified; callers sort as
+        needed.
+        """
+        ...
+
+    async def merge_relations(self, source_relation: str, target_relation: str) -> int:
+        """Re-label every ``source``-relation ``MNEMOZINE_RELATES`` edge to ``target``.
+
+        The relation analogue of :meth:`merge_categories` / :meth:`merge_entities`:
+        for each ``(a, b)`` entity pair carrying a ``source``-relation edge, MERGE
+        it into the ``(a, b, target)`` edge — combining ``weight`` via ``max``
+        (matching :meth:`upsert_edge`'s re-assert semantics) and DELETING the now
+        redundant parallel source edge so no duplicate parallel edges remain
+        between the same pair + normalized relation. Idempotent (``source ==
+        target`` -> 0; a re-run over already-canonical labels merges nothing,
+        FR-MNT-5). Returns the number of edges relabelled/merged.
         """
         ...
 
@@ -1229,6 +1315,11 @@ class MaintenanceReport:
     archived: int = 0
     edges_pruned: int = 0
     re_extracted: int = 0
+    # Graph-connectivity counters: mention/co-mention edges asserted (MentionsJob /
+    # CoMentionJob) and relation labels collapsed into the controlled vocabulary
+    # (RelationNormJob). Distinct from edges_pruned (closing low-weight edges).
+    edges_added: int = 0
+    relations_merged: int = 0
     notes: list[str] = field(default_factory=list)
 
 

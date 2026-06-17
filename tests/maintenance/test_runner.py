@@ -97,10 +97,23 @@ async def test_default_job_set_runs_end_to_end_offline() -> None:
     jobs = build_default_jobs(storage, llm, embeddings, settings=Settings())
     names = [j.name for j in jobs]
     # Category merge (the category analogue of entity resolution) joins the
-    # default scheduled set between resolution and decay.
+    # default scheduled set between resolution and decay; the mentions pass
+    # (graph connectivity) runs after entity resolution and before category
+    # merge so the merged-entity graph is the substrate for the mention edges,
+    # the co-mention pass runs immediately after mentions (it derives the
+    # weighted entity-entity layer from the mention edges), relation
+    # normalization (independent of the mention/co-mention layers — it collapses
+    # the LLM-extracted RELATES label vocabulary) runs after co-mention, and the
+    # entity-dedup pass runs LAST among the graph-connectivity jobs (AFTER
+    # mentions + co-mention so its merge_entities repoint covers all three edge
+    # types) and before category merge.
     assert names == [
         "consolidation",
         "entity_resolution",
+        "mentions",
+        "co_mention",
+        "relation_norm",
+        "entity_dedup",
         "category_merge",
         "decay",
         "audit",
@@ -108,5 +121,5 @@ async def test_default_job_set_runs_end_to_end_offline() -> None:
     runner = MaintenanceRunner(jobs, settings=Settings())
     # No data: every job runs cleanly and returns a report.
     reports = await runner.run_once()
-    assert len(reports) == 5
+    assert len(reports) == 9
     assert {r.job_name for r in reports} == set(names)

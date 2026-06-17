@@ -88,6 +88,11 @@ def seed_storage(storage: InMemoryStorage) -> None:
         weight=0.5,
     )
 
+    # --- a weighted entity-entity co-mention edge (graph-connectivity layer) ---
+    # The CoMentionJob derives these from the mention layer; seed one directly so
+    # the graph route can be asserted to surface kind='co_mention' as ent:->ent:.
+    storage.co_mentions[("ent-rust", "ent-tokio")] = (0.71, 3)
+
     # --- memories -------------------------------------------------------
     # 1) active global 'preference' (current value of a superseded pair).
     storage.memories["mem-pref-current"] = MemoryUnit(
