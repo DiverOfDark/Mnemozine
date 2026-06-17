@@ -1157,20 +1157,23 @@ class GraphitiStorageBackend:
             edge_rows = await self._query(
                 f"MATCH (a:{ENTITY_LABEL})-[r:{RELATES_TYPE}]->(b:{ENTITY_LABEL}) "
                 "WHERE a.id IN $ids AND b.id IN $ids "
-                "RETURN r",
+                "RETURN a.id AS source, b.id AS target, r",
                 ids=kept_ids,
             )
             seen: set[str] = set()
             for row in edge_rows:
-                edge = self._row_to_edge(row[0])
+                # Endpoints come from the matched topology (a.id/b.id), which is the
+                # source of truth even for edges missing the from/to props.
+                source, target = row[0], row[1]
+                edge = self._row_to_edge(row[2], from_entity=source, to_entity=target)
                 if edge.id in seen:
                     continue
                 seen.add(edge.id)
                 struct_edges.append(
                     GraphSnapshotEdge(
                         id=edge.id,
-                        source=edge.from_entity,
-                        target=edge.to_entity,
+                        source=source,
+                        target=target,
                         relation=edge.relation,
                         weight=edge.weight,
                         active=edge.is_active,
@@ -1363,14 +1366,17 @@ class GraphitiStorageBackend:
         rows = await self._query(
             f"MATCH (e:{ENTITY_LABEL} {{id: $id}})-[r:{RELATES_TYPE}]-(o:{ENTITY_LABEL}) "
             f"WHERE true{active_clause} "
-            "RETURN o, r ORDER BY r.weight DESC LIMIT $cap",
+            "RETURN o, r, startNode(r).id AS src, endNode(r).id AS dst "
+            "ORDER BY r.weight DESC LIMIT $cap",
             id=resolved.id,
             cap=cap,
         )
         out: list[Neighbor] = []
         for row in rows:
             other = self._row_to_entity(row[0])
-            edge = self._row_to_edge(row[1])
+            # Endpoints from the relationship's start/end nodes (topology), so an
+            # edge missing the from/to props still resolves correctly.
+            edge = self._row_to_edge(row[1], from_entity=row[2], to_entity=row[3])
             out.append(Neighbor(entity=other, edge=edge))
         return out
 
@@ -1389,13 +1395,37 @@ class GraphitiStorageBackend:
         }
 
     @staticmethod
-    def _row_to_edge(rel: Any) -> Edge:
+    def _row_to_edge(
+        rel: Any, *, from_entity: str | None = None, to_entity: str | None = None
+    ) -> Edge:
+        """Rebuild an :class:`Edge` from a stored relationship, endpoint-tolerant.
+
+        The from/to entity ids are REDUNDANT with the graph topology (they are the
+        relationship's start/end node ids), so older edges may not carry the
+        ``from_entity``/``to_entity`` *properties* (the 2026-06-14 backfill and the
+        merge-rewired edges store only ``{id, relation, weight, valid_from}``). To
+        avoid a ``KeyError`` on those edges, the caller passes the real endpoints
+        from the matched topology (``a.id``/``b.id`` or ``startNode(r).id`` /
+        ``endNode(r).id``) and we prefer them over the stored props. This is a
+        read-side fix only: no existing edge is mutated.
+
+        ``id`` is likewise tolerant — it is only used for dedup, so when absent we
+        synthesize a stable one from the available endpoints + relation.
+        """
+
         props = GraphitiStorageBackend._props(rel)
+        frm = from_entity if from_entity is not None else props.get("from_entity", "")
+        to = to_entity if to_entity is not None else props.get("to_entity", "")
+        relation = props.get("relation", "relates")
+        edge_id = props.get("id")
+        if not edge_id:
+            # Synthesize a stable dedup key from whatever endpoints we have.
+            edge_id = f"{frm}:{to}:{relation}"
         return Edge(
-            id=props["id"],
-            from_entity=props["from_entity"],
-            to_entity=props["to_entity"],
-            relation=props["relation"],
+            id=edge_id,
+            from_entity=frm,
+            to_entity=to,
+            relation=relation,
             weight=float(props.get("weight", 1.0)),
             valid_from=_from_iso(props.get("valid_from")) or datetime.now(UTC),
             valid_to=_from_iso(props.get("valid_to")),
@@ -1416,7 +1446,13 @@ class GraphitiStorageBackend:
             **{"from": edge.from_entity, "to": edge.to_entity, "relation": edge.relation},
         )
         if existing:
-            current = self._row_to_edge(existing[0][0])
+            # We already know the endpoints from the incoming edge param; pass them
+            # so the re-assert read never depends on the stored from/to props.
+            current = self._row_to_edge(
+                existing[0][0],
+                from_entity=edge.from_entity,
+                to_entity=edge.to_entity,
+            )
             new_weight = max(current.weight, edge.weight)
             await self._query(
                 f"MATCH (a:{ENTITY_LABEL} {{id: $from}})-[r:{RELATES_TYPE} {{id: $id}}]->(b) "
@@ -1447,23 +1483,33 @@ class GraphitiStorageBackend:
         active_clause = " WHERE r.valid_to IS NULL" if active_only else ""
         rows = await self._query(
             f"MATCH (e:{ENTITY_LABEL} {{id: $id}})-[r:{RELATES_TYPE}]-(){active_clause} "
-            "RETURN r",
+            "RETURN r, startNode(r).id AS src, endNode(r).id AS dst",
             id=resolved.id,
         )
-        return [self._row_to_edge(row[0]) for row in rows]
+        # Endpoints from the relationship's start/end nodes (topology) so an edge
+        # missing the from/to props still resolves correctly.
+        return [
+            self._row_to_edge(row[0], from_entity=row[1], to_entity=row[2])
+            for row in rows
+        ]
 
     async def prune_edge(self, edge_id: str, *, at: datetime | None = None) -> Edge:
         """Close a low-weight edge's validity window (FR-MNT-4; retained, not deleted)."""
 
         ts = at or datetime.now(UTC)
         rows = await self._query(
-            f"MATCH ()-[r:{RELATES_TYPE} {{id: $id}}]-() SET r.valid_to = $valid_to RETURN r",
+            f"MATCH ()-[r:{RELATES_TYPE} {{id: $id}}]-() SET r.valid_to = $valid_to "
+            "RETURN r, startNode(r).id AS src, endNode(r).id AS dst",
             id=edge_id,
             valid_to=_to_iso(ts),
         )
         if not rows:
             raise KeyError(edge_id)
-        return self._row_to_edge(rows[0][0])
+        # Endpoints from the relationship's start/end nodes (topology) so an edge
+        # missing the from/to props still resolves correctly.
+        return self._row_to_edge(
+            rows[0][0], from_entity=rows[0][1], to_entity=rows[0][2]
+        )
 
     # -- suppression persistence (FR-RET-6 / R2) ------------------------------
 

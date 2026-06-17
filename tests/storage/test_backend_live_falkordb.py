@@ -36,7 +36,12 @@ from mnemozine.schema.models import (
     Scope,
 )
 from mnemozine.storage.backend import GraphitiStorageBackend
-from mnemozine.storage.graphiti_client import MEMORY_VECTOR_INDEX, GraphitiClient
+from mnemozine.storage.graphiti_client import (
+    ENTITY_LABEL,
+    MEMORY_VECTOR_INDEX,
+    RELATES_TYPE,
+    GraphitiClient,
+)
 
 pytestmark = pytest.mark.live_falkordb
 
@@ -295,6 +300,67 @@ async def test_upsert_edge_create_and_reassert_against_real_falkordb(
     assert reassert.weight == pytest.approx(2.5)
     incident2 = await live_backend.edges_for_entity(a.id)
     assert sum(1 for e in incident2 if e.relation == "formats") == 1, incident2
+
+
+async def test_legacy_edge_without_from_to_props_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """A LEGACY edge (no from/to PROPS) resolves from REAL FalkorDB topology.
+
+    Reproduces the live /api/graph 500 against the real engine: the 2026-06-14
+    backfill + merge-rewired edges store ONLY ``{id, relation, weight, valid_from}``
+    — no ``from_entity``/``to_entity`` props. We create exactly that shape with raw
+    Cypher (the backend's own ``upsert_edge`` always writes the props, so the legacy
+    shape has to be created directly), then assert all four read paths resolve the
+    endpoints from the relationship topology (``a.id``/``b.id`` and
+    ``startNode(r).id``/``endNode(r).id``) WITHOUT mutating the stored edge. Before
+    the read-side fix these raised ``KeyError: 'from_entity'``.
+    """
+
+    a = Entity(id="ent-legacy-a", canonical_name="legacy-alpha")
+    b = Entity(id="ent-legacy-b", canonical_name="legacy-beta")
+    await live_backend.upsert_entity(a)
+    await live_backend.upsert_entity(b)
+
+    # Create the legacy edge directly: only id/relation/weight/valid_from props.
+    await live_backend._client.execute_query(
+        f"MATCH (a:{ENTITY_LABEL} {{id: $from}}) "
+        f"MATCH (b:{ENTITY_LABEL} {{id: $to}}) "
+        f"CREATE (a)-[r:{RELATES_TYPE} {{id: $id, relation: $relation, "
+        "weight: $weight, valid_from: $valid_from}]->(b) RETURN r",
+        **{
+            "from": a.id,
+            "to": b.id,
+            "id": "legacy-live-1",
+            "relation": "relates",
+            "weight": 0.4,
+            "valid_from": "2026-06-14T00:00:00+00:00",
+        },
+    )
+
+    # edges_for_entity resolves the endpoints from topology (no KeyError).
+    incident = await live_backend.edges_for_entity(a.id)
+    legacy = [e for e in incident if e.id == "legacy-live-1"]
+    assert legacy, incident
+    assert legacy[0].from_entity == a.id and legacy[0].to_entity == b.id
+
+    # neighbors traversal returns the neighbor + a correctly-endpointed edge.
+    neighbors = await live_backend.neighbors(a.id)
+    nbr = [n for n in neighbors if n.entity.id == b.id]
+    assert nbr, neighbors
+    assert {nbr[0].edge.from_entity, nbr[0].edge.to_entity} == {a.id, b.id}
+
+    # graph_snapshot's single aggregate edge query resolves it from a.id/b.id.
+    snap = await live_backend.graph_snapshot()
+    relates = [e for e in snap.edges if e.kind == "relates"]
+    assert any(
+        {e.source, e.target} == {a.id, b.id} for e in relates
+    ), relates
+
+    # prune_edge closes the window and returns it endpointed (no KeyError).
+    pruned = await live_backend.prune_edge("legacy-live-1")
+    assert pruned.valid_to is not None
+    assert {pruned.from_entity, pruned.to_entity} == {a.id, b.id}
 
 
 async def test_activity_log_append_and_query_against_real_falkordb(

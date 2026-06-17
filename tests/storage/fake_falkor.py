@@ -48,6 +48,60 @@ class FakeFalkorDriver:
     async def close(self) -> None:
         self.closed = True
 
+    # -- edge topology helpers (legacy-edge reproduction) ---------------------
+
+    @staticmethod
+    def _edge_view(e: dict[str, Any]) -> dict[str, Any]:
+        """Project an internal edge record to the relation-props dict the backend reads.
+
+        The fake ALWAYS keeps ``from_entity``/``to_entity`` on the internal record
+        so it can answer the topology columns (``a.id``/``startNode(r).id`` …). But
+        a *legacy* edge (the 2026-06-14 backfill / merge-rewired shape) stored only
+        ``{id, relation, weight, valid_from}`` in FalkorDB — so for such an edge the
+        relation-props object handed to ``_row_to_edge`` must OMIT from/to to
+        reproduce the exact ``KeyError`` condition the read-side fix removes. The
+        internal ``_legacy`` marker is itself never part of the FalkorDB shape, so
+        it is always dropped from the view.
+        """
+
+        view = {k: v for k, v in e.items() if k != "_legacy"}
+        if e.get("_legacy"):
+            view.pop("from_entity", None)
+            view.pop("to_entity", None)
+        return view
+
+    def add_legacy_edge(
+        self,
+        *,
+        edge_id: str,
+        from_entity: str,
+        to_entity: str,
+        relation: str = "relates",
+        weight: float = 1.0,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert a LEGACY-style edge (no from/to PROPS, only known via topology).
+
+        Mirrors the 593-vs-2316 live split: the fake keeps the real endpoints
+        internally (so it answers the topology columns), but marks the edge so the
+        relation-props object the backend reads back omits ``from_entity`` /
+        ``to_entity`` — exactly the shape that ``KeyError``'d before the fix.
+        """
+
+        e: dict[str, Any] = {
+            "id": edge_id,
+            "from_entity": from_entity,
+            "to_entity": to_entity,
+            "relation": relation,
+            "weight": weight,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
+            "_legacy": True,
+        }
+        self.edges[edge_id] = e
+        return e
+
     # The single seam the backend uses.
     async def execute_query(self, cypher: str, **params: Any) -> _Result:
         self.queries.append(cypher)
@@ -488,10 +542,15 @@ class FakeFalkorDriver:
             return _Result([[e] for e in ents[: p["cap"]]])
 
         # --- graph_snapshot: structural edges among kept entities (1 query) --
-        if "a.id IN $ids AND b.id IN $ids" in c and "RETURN r" in c:
+        # The backend now RETURNs the endpoint ids from the matched topology
+        # (``a.id AS source, b.id AS target, r``) so it never depends on the stored
+        # from/to props. We answer ``source``/``target`` from the fake's internal
+        # edge topology (which it always knows), and hand ``_edge_view(e)`` — which
+        # omits from/to for a legacy edge — as the relation value.
+        if "a.id IN $ids AND b.id IN $ids" in c and "RETURN a.id AS source" in c:
             ids = set(p.get("ids") or [])
             rows = [
-                [e]
+                [e["from_entity"], e["to_entity"], self._edge_view(e)]
                 for e in self.edges.values()
                 if e["from_entity"] in ids and e["to_entity"] in ids
             ]
@@ -532,8 +591,8 @@ class FakeFalkorDriver:
             self._repoint_edges(c, p)
             return _Result([])
 
-        # neighbors traversal
-        if "RETURN o, r ORDER BY r.weight DESC" in c:
+        # neighbors traversal (RETURNs o, r + the topology endpoint ids src/dst)
+        if "RETURN o, r" in c and "ORDER BY r.weight DESC" in c:
             return self._neighbors(p)
 
         # upsert_edge / edges_for_entity / create edge
@@ -564,7 +623,9 @@ class FakeFalkorDriver:
         self.edges[new["id"]] = new
 
     def _edge_only(self, c: str, p: dict[str, Any]) -> _Result:
-        # find active edge by (from,to,relation)
+        # find active edge by (from,to,relation). The backend re-assert path knows
+        # the endpoints from the incoming edge param (so it does NOT read them back
+        # from props), hence we return the legacy-aware edge view here too.
         if "RETURN r LIMIT 1" in c and "{relation: $relation}" in c:
             for e in self.edges.values():
                 if (
@@ -573,7 +634,7 @@ class FakeFalkorDriver:
                     and e["relation"] == p["relation"]
                     and e.get("valid_to") is None
                 ):
-                    return _Result([[e]])
+                    return _Result([[self._edge_view(e)]])
             return _Result([])
 
         if "SET r.weight = $weight" in c and "{id: $id}" in c:
@@ -594,19 +655,22 @@ class FakeFalkorDriver:
             self.edges[e["id"]] = e
             return _Result([[e]])
 
+        # prune_edge: SET r.valid_to ... RETURN r, startNode(r).id AS src,
+        # endNode(r).id AS dst. The endpoint ids come from the fake's internal
+        # topology; the relation value omits from/to for a legacy edge.
         if "SET r.valid_to = $valid_to RETURN r" in c:
             e = self.edges.get(p["id"])
             if e is None:
                 return _Result([])
             e["valid_to"] = p["valid_to"]
-            return _Result([[e]])
+            return _Result([[self._edge_view(e), e["from_entity"], e["to_entity"]]])
 
-        # edges_for_entity
+        # edges_for_entity: RETURN r, startNode(r).id AS src, endNode(r).id AS dst.
         if "RETURN r" in c and "{id: $id}" in c:
             eid = p["id"]
             active_only = "r.valid_to IS NULL" in c
             rows = [
-                [e]
+                [self._edge_view(e), e["from_entity"], e["to_entity"]]
                 for e in self.edges.values()
                 if (e["from_entity"] == eid or e["to_entity"] == eid)
                 and (not active_only or e.get("valid_to") is None)
@@ -631,7 +695,10 @@ class FakeFalkorDriver:
             other = self.entities.get(other_id)
             if other is None:
                 continue
-            rows.append([other, e])
+            # RETURN o, r, startNode(r).id AS src, endNode(r).id AS dst — the
+            # endpoint ids come from the fake's internal topology; the relation
+            # value omits from/to for a legacy edge (see _edge_view).
+            rows.append([other, self._edge_view(e), e["from_entity"], e["to_entity"]])
         rows.sort(key=lambda r: r[1].get("weight", 0.0), reverse=True)
         return _Result(rows[: p["cap"]])
 

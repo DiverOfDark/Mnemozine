@@ -558,6 +558,99 @@ async def test_prune_edge_closes_window_and_edges_for_entity() -> None:
     assert len(await store.edges_for_entity("rust", active_only=False)) == 1
 
 
+async def test_legacy_edge_without_from_to_props_resolves_from_topology() -> None:
+    """A LEGACY edge (no from/to PROPS) reads back via graph topology, not KeyError.
+
+    Reproduces the live /api/graph 500: the 2026-06-14 backfill + merge-rewired
+    edges store only ``{id, relation, weight, valid_from}`` — no ``from_entity`` /
+    ``to_entity`` properties. The old hard subscript ``props['from_entity']``
+    KeyError'd on every such edge. The read-side fix takes the endpoints from the
+    matched topology (``a.id``/``b.id`` and ``startNode(r).id``/``endNode(r).id``),
+    so all four edge-reading paths resolve the edge with the correct endpoints
+    WITHOUT mutating any stored data. This test would raise KeyError before the fix.
+    """
+
+    store = _backend()
+    a = Entity(id="ent-rust", canonical_name="rust", type="language")
+    b = Entity(id="ent-tokio", canonical_name="tokio", type="library")
+    await store.upsert_entity(a)
+    await store.upsert_entity(b)
+    # The fake keeps the real endpoints internally (so it can answer the topology
+    # columns) but omits them from the relation-props dict handed to _row_to_edge —
+    # exactly the live legacy shape.
+    store._client.driver.add_legacy_edge(  # type: ignore[attr-defined]
+        edge_id="legacy-1",
+        from_entity="ent-rust",
+        to_entity="ent-tokio",
+        relation="relates",
+        weight=0.4,
+    )
+
+    # graph_snapshot: the structural edge is returned with topology-derived endpoints.
+    snap = await store.graph_snapshot()
+    relates = [e for e in snap.edges if e.kind == "relates"]
+    assert any(
+        e.source == "ent-rust" and e.target == "ent-tokio" and e.relation == "relates"
+        for e in relates
+    ), relates
+
+    # edges_for_entity: incident legacy edge resolves with correct from/to.
+    incident = await store.edges_for_entity("rust", active_only=True)
+    assert len(incident) == 1
+    assert incident[0].from_entity == "ent-rust"
+    assert incident[0].to_entity == "ent-tokio"
+    assert incident[0].relation == "relates"
+
+    # neighbors: the neighbor + a correctly-endpointed edge come back.
+    neighbors = await store.neighbors("rust")
+    assert {n.entity.id for n in neighbors} == {"ent-tokio"}
+    assert neighbors[0].edge.from_entity == "ent-rust"
+    assert neighbors[0].edge.to_entity == "ent-tokio"
+
+    # prune_edge: closing the legacy edge's window works (returns it endpointed).
+    pruned = await store.prune_edge("legacy-1")
+    assert pruned.valid_to is not None
+    assert pruned.from_entity == "ent-rust"
+    assert pruned.to_entity == "ent-tokio"
+    assert await store.edges_for_entity("rust", active_only=True) == []
+
+
+async def test_normal_prop_bearing_edge_still_resolves_no_regression() -> None:
+    """The 593 self-describing edges (from/to PROPS present) still resolve correctly.
+
+    Guards against the fix regressing the prop-bearing path: a normally-upserted
+    edge carries ``from_entity``/``to_entity`` props, and all four read paths must
+    keep returning the same endpoints (now sourced from topology, which agrees).
+    """
+
+    store = _backend()
+    a = Entity(id="ent-a", canonical_name="alpha")
+    b = Entity(id="ent-b", canonical_name="beta")
+    await store.upsert_entity(a)
+    await store.upsert_entity(b)
+    await store.upsert_edge(
+        Edge(id="e-normal", from_entity="ent-a", to_entity="ent-b", relation="uses", weight=0.6)
+    )
+    # the stored edge DOES carry the from/to props (the self-describing shape).
+    stored = store._client.driver.edges["e-normal"]  # type: ignore[attr-defined]
+    assert stored["from_entity"] == "ent-a" and stored["to_entity"] == "ent-b"
+
+    incident = await store.edges_for_entity("alpha", active_only=True)
+    assert len(incident) == 1
+    assert incident[0].from_entity == "ent-a" and incident[0].to_entity == "ent-b"
+
+    neighbors = await store.neighbors("alpha")
+    assert neighbors[0].edge.from_entity == "ent-a"
+    assert neighbors[0].edge.to_entity == "ent-b"
+
+    snap = await store.graph_snapshot()
+    relates = [e for e in snap.edges if e.kind == "relates"]
+    assert any(e.source == "ent-a" and e.target == "ent-b" for e in relates)
+
+    pruned = await store.prune_edge("e-normal")
+    assert pruned.from_entity == "ent-a" and pruned.to_entity == "ent-b"
+
+
 async def test_merge_entities_folds_aliases() -> None:
     store = _backend()
     canonical = Entity(canonical_name="rust", aliases=["rustc"])
