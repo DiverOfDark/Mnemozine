@@ -77,7 +77,7 @@ if TYPE_CHECKING:  # import-cycle-safe: these are only needed for type hints.
 #: (their ``data_version`` field defaults to this). Bump this by 1 whenever a
 #: data-model / extraction / scope-derivation change needs an in-place migration,
 #: and append a :class:`Migration` producing the new version to :data:`MIGRATIONS`.
-CURRENT_DATA_VERSION: int = 1
+CURRENT_DATA_VERSION: int = 2
 
 #: The version assigned to records written before this feature (no ``data_version``
 #: field) or that were explicitly never stamped. Migrations select on

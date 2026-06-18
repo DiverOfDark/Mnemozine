@@ -58,6 +58,7 @@ from mnemozine.migrations import (
 # than in migrations/__init__ to preserve the schema -> migrations import-light
 # one-way (no cycle through schema.models).
 from mnemozine.migrations import baseline as _baseline  # noqa: F401
+from mnemozine.migrations import entity_name_key as _entity_name_key  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

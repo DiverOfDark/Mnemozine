@@ -116,6 +116,58 @@ async def test_exact_leaves_distinct_names_untouched() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exact_collapses_two_dups_with_disjoint_edge_sets() -> None:
+    """Two same-normalized-name entities with DIFFERENT edges fold to one survivor.
+
+    The ``exact_name_dedup`` invariant: a group of normalized-name duplicates, each
+    carrying its OWN edges, collapses to a single survivor that carries the UNION of
+    both edge sets — no edge orphaned, no memory deleted. Drives the exact-mode
+    EntityDedupJob over the InMemoryStorage merge path (mentions + co-mention
+    repoint in lock-step with the real backend).
+    """
+
+    storage = InMemoryStorage()
+    # GitHub / github: a true duplicate group, each with a disjoint edge set.
+    await storage.upsert_entity(Entity(id="e-gh1", canonical_name="GitHub"))
+    await storage.upsert_entity(Entity(id="e-gh2", canonical_name="github"))
+    await storage.upsert_entity(Entity(id="e-git", canonical_name="git"))
+    await storage.upsert_entity(Entity(id="e-ci", canonical_name="ci"))
+    # gh1's edge: co-mention with git. gh2's edge: a memory mention + co-mention ci.
+    await storage.upsert_co_mention("e-gh1", "e-git", weight=1.0, shared=2)
+    await storage.upsert_co_mention("e-gh2", "e-ci", weight=1.0, shared=2)
+    await storage.upsert_memory(_mem("gh note", entities=["github"], mid="m1"))
+    await storage.persist_mentions()
+    assert ("m1", "e-gh2") in storage.mentions
+
+    report = await job_run(storage, "exact")
+
+    assert report.entities_merged == 1
+    # Exactly one GitHub-group node survives.
+    gh_survivors = [
+        eid
+        for eid, e in storage.entities.items()
+        if e.canonical_name.lower() == "github"
+    ]
+    assert len(gh_survivors) == 1
+    survivor_id = gh_survivors[0]
+    dead_id = "e-gh1" if survivor_id == "e-gh2" else "e-gh2"
+    assert dead_id not in storage.entities
+
+    # The UNION of both disjoint edge sets lands on the one survivor.
+    co_neighbors = {
+        b if a == survivor_id else a
+        for (a, b) in storage.co_mentions
+        if survivor_id in (a, b)
+    }
+    assert {"e-git", "e-ci"} <= co_neighbors
+    assert not any(dead_id in (a, b) for (a, b) in storage.co_mentions)
+    assert ("m1", survivor_id) in storage.mentions
+    assert not any(eid == dead_id for (_mid, eid) in storage.mentions)
+    # No memory was deleted.
+    assert "m1" in storage.memories
+
+
+@pytest.mark.asyncio
 async def test_exact_repoints_mentions_and_co_mention_onto_survivor() -> None:
     storage = InMemoryStorage()
     await storage.upsert_entity(

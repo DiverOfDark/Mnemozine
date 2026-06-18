@@ -17,8 +17,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from mnemozine.config import MaintenanceSettings, RetrievalSettings
+from mnemozine.config import MaintenanceSettings, RetrievalSettings, Settings
 from mnemozine.interfaces import StorageBackend, WriteDecision
+from mnemozine.maintenance.entity_dedup import EntityDedupJob
 from mnemozine.migrations import CURRENT_DATA_VERSION, UNSTAMPED_DATA_VERSION
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
@@ -666,6 +667,156 @@ async def test_merge_entities_folds_aliases() -> None:
     assert await store.get_entity(dup.id) is None
 
 
+def _entity_count(store: GraphitiStorageBackend) -> int:
+    return len(store._client.driver.entities)  # type: ignore[attr-defined]
+
+
+async def test_resolve_or_create_entity_reuses_node_for_normalized_name() -> None:
+    """Two Entity objects with the same normalized name resolve to ONE node.
+
+    The identity-by-normalized-name fix: resolving ``Rust`` after ``rust`` returns
+    the SAME stored id, folds the differing-cased spelling into aliases, and never
+    mints a second node (the duplicate-entity leak regression).
+    """
+
+    store = _backend()
+    first = await store.resolve_or_create_entity(Entity(canonical_name="rust"))
+    assert _entity_count(store) == 1
+
+    # Same name, different case + a fresh alias -> same id, no new node.
+    second = await store.resolve_or_create_entity(
+        Entity(canonical_name="Rust", aliases=["rust-lang"])
+    )
+    assert second.id == first.id
+    assert _entity_count(store) == 1
+    # The differing-cased spelling and the new alias fold into the survivor.
+    assert "Rust" in second.aliases
+    assert "rust-lang" in second.aliases
+
+    # Both spellings now resolve to the one node.
+    assert (await store.get_entity("rust")).id == first.id  # type: ignore[union-attr]
+    assert (await store.get_entity("Rust")).id == first.id  # type: ignore[union-attr]
+
+    # Idempotent: resolving the exact same name a third time adds nothing.
+    third = await store.resolve_or_create_entity(Entity(canonical_name="rust"))
+    assert third.id == first.id
+    assert _entity_count(store) == 1
+
+
+async def test_resolve_or_create_entity_creates_when_absent() -> None:
+    """A genuinely new normalized name mints exactly one node."""
+
+    store = _backend()
+    a = await store.resolve_or_create_entity(Entity(canonical_name="rust"))
+    b = await store.resolve_or_create_entity(Entity(canonical_name="async"))
+    assert a.id != b.id
+    assert _entity_count(store) == 2
+
+
+async def test_upsert_entity_maintains_name_key_for_resolution() -> None:
+    """upsert_entity sets name_key so a later resolve folds onto that node."""
+
+    store = _backend()
+    base = Entity(canonical_name="rust")
+    await store.upsert_entity(base)
+    # name_key was stamped on the id-keyed write, so resolving the same normalized
+    # name (different case) finds the existing node rather than creating one.
+    resolved = await store.resolve_or_create_entity(Entity(canonical_name="RUST"))
+    assert resolved.id == base.id
+    assert _entity_count(store) == 1
+
+
+async def test_merge_entities_sets_name_key_on_survivor() -> None:
+    """The survivor of a merge carries name_key so the invariant holds post-merge."""
+
+    store = _backend()
+    canonical = Entity(canonical_name="rust")
+    dup = Entity(canonical_name="rust-lang")
+    await store.upsert_entity(canonical)
+    await store.upsert_entity(dup)
+    await store.merge_entities(dup.id, canonical.id)
+
+    survivor = store._client.driver.entities[canonical.id]  # type: ignore[attr-defined]
+    assert survivor["name_key"] == "rust"
+
+
+async def test_exact_dedup_collapses_same_name_carrying_both_edge_sets() -> None:
+    """End-to-end exact-mode EntityDedupJob over the real backend (FakeFalkor).
+
+    The ``exact_name_dedup`` feature is the existing :class:`EntityDedupJob` in
+    ``mode='exact'`` driving the real ``merge_entities`` write path. Two entities
+    with the SAME normalized name (``GitHub`` / ``github``) but DIFFERENT edge sets
+    must collapse to a single survivor that carries BOTH edge sets — no edge
+    orphaned, no memory deleted — and the survivor must hold ``name_key`` so the
+    unique-normalized-name invariant holds post-merge. A re-run merges 0 (FR-MNT-5).
+    """
+
+    store = _backend()
+    # Two true duplicates (case drift), each with its OWN co-mention neighbor + the
+    # second also mentioned by a memory — distinct edge sets that must both survive.
+    gh1 = Entity(id="e-gh1", canonical_name="GitHub", aliases=["gh"])
+    gh2 = Entity(id="e-gh2", canonical_name="github")
+    rust = Entity(id="e-rust", canonical_name="rust")
+    tokio = Entity(id="e-tokio", canonical_name="tokio")
+    for e in (gh1, gh2, rust, tokio):
+        await store.upsert_entity(e)
+    # gh1's edge set: co-mention with rust.
+    await store.upsert_co_mention("e-gh1", "e-rust", weight=1.0, shared=2)
+    # gh2's edge set: a RELATES edge to tokio + a memory mention.
+    await store.upsert_edge(
+        Edge(from_entity="e-gh2", to_entity="e-tokio", relation="uses", weight=0.6)
+    )
+    await store.upsert_memory(
+        _memory(content="github note", entities=["github"], mid="m-gh")
+    )
+    await store.persist_mentions()
+
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert ("m-gh", "e-gh2") in driver.mentions
+
+    settings = Settings()
+    settings.graph.entity_dedup_mode = "exact"
+    job = EntityDedupJob(store, settings=settings)
+
+    report = await job.run()
+
+    # Exactly one duplicate folded; one survivor for the GitHub/github group.
+    assert report.entities_merged == 1
+    survivors = [
+        e
+        for e in driver.entities.values()
+        if str(e.get("name_key")) == "github"
+    ]
+    assert len(survivors) == 1
+    survivor_id = survivors[0]["id"]
+    # The survivor carries name_key (unique-normalized-name invariant post-merge).
+    assert survivors[0]["name_key"] == "github"
+
+    # The folded-away duplicate id (whichever of the pair was not the survivor).
+    dead_id = "e-gh1" if survivor_id == "e-gh2" else "e-gh2"
+    assert dead_id not in driver.entities
+
+    # BOTH edge sets survived on the one survivor: the co-mention with rust AND the
+    # RELATES->tokio AND the memory mention — none orphaned onto the dead node.
+    assert ("m-gh", survivor_id) in driver.mentions
+    assert not any(eid == dead_id for (_mid, eid) in driver.mentions)
+    co_neighbors = {
+        b if a == survivor_id else a
+        for (a, b) in driver.co_mentions
+        if survivor_id in (a, b)
+    }
+    assert "e-rust" in co_neighbors
+    assert not any(dead_id in (a, b) for (a, b) in driver.co_mentions)
+    relates_neighbors = {n.entity.id for n in await store.neighbors(survivor_id)}
+    assert "e-tokio" in relates_neighbors
+    # No memory was deleted.
+    assert "m-gh" in driver.memories
+
+    # Idempotent: a second pass finds no collision and merges 0 (FR-MNT-5).
+    second = await job.run()
+    assert second.entities_merged == 0
+
+
 # ---------------------------------------------------------------------------
 # Mentions — (memory)-[:MNEMOZINE_MENTIONS]->(entity) from m.entities
 # ---------------------------------------------------------------------------
@@ -734,6 +885,66 @@ async def test_persist_mentions_skips_unresolvable_names() -> None:
     assert asserted == 1
     driver = store._client.driver  # type: ignore[attr-defined]
     assert driver.mentions == {("m1", "e-rust")}
+
+
+# ---------------------------------------------------------------------------
+# Inline mentions — add_memory_mentions (per-memory id-keyed MERGE at ingest)
+# ---------------------------------------------------------------------------
+
+
+async def test_add_memory_mentions_merges_edges_keyed_on_ids() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_entity(Entity(id="e-eh", canonical_name="error-handling"))
+    await store.upsert_memory(_memory(content="uses thiserror", mid="m1"))
+
+    n = await store.add_memory_mentions("m1", ["e-rust", "e-eh"])
+
+    assert n == 2
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == {("m1", "e-rust"), ("m1", "e-eh")}
+
+
+async def test_add_memory_mentions_is_idempotent() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_memory(_memory(content="uses thiserror", mid="m1"))
+
+    first = await store.add_memory_mentions("m1", ["e-rust"])
+    driver = store._client.driver  # type: ignore[attr-defined]
+    after_first = set(driver.mentions)
+    second = await store.add_memory_mentions("m1", ["e-rust"])
+
+    # MERGE (not CREATE): a re-call re-asserts the same edge, adds none.
+    assert first == 1
+    assert driver.mentions == after_first
+    assert driver.mentions == {("m1", "e-rust")}
+    # idempotent: the edge set never grew on the second call.
+    assert second == 1
+
+
+async def test_add_memory_mentions_dedups_repeated_ids() -> None:
+    store = _backend()
+    await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+    await store.upsert_memory(_memory(content="rust", mid="m1"))
+
+    # The same id passed twice asserts a single edge (set-keyed MERGE).
+    n = await store.add_memory_mentions("m1", ["e-rust", "e-rust"])
+
+    assert n == 1
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == {("m1", "e-rust")}
+
+
+async def test_add_memory_mentions_empty_ids_is_noop() -> None:
+    store = _backend()
+    await store.upsert_memory(_memory(content="no entities", mid="m1"))
+
+    n = await store.add_memory_mentions("m1", [])
+
+    assert n == 0
+    driver = store._client.driver  # type: ignore[attr-defined]
+    assert driver.mentions == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1649,6 +1860,51 @@ async def test_graph_snapshot_truncated_not_false_positive_at_exact_limit() -> N
     snap = await store.graph_snapshot(node_limit=2)
     assert len([n for n in snap.nodes if n.kind == "entity"]) == 2
     assert snap.truncated is False
+
+
+async def test_graph_snapshot_default_is_degree_ranked_connected_subgraph() -> None:
+    """The default (no-center) snapshot returns a CONNECTED subgraph, not a slice.
+
+    Seed one dense RELATES cluster (a hub wired to several spokes) plus many
+    isolated, edge-less entities. The degree-ranked default selection must keep
+    the high-degree hub + its edge-sharing neighbors (so real structure renders)
+    rather than an arbitrary ``LIMIT`` slice of mostly-isolated nodes. With
+    ``node_limit`` set just above the cluster size, the kept set is the cluster
+    (degree>0) and the snapshot's RELATES edges actually connect the kept nodes.
+    """
+
+    store = _backend()
+    # Dense cluster: hub -> 4 spokes (hub degree 4, each spoke degree 1).
+    hub = Entity(id="e-hub", canonical_name="hub")
+    await store.upsert_entity(hub)
+    spokes = [Entity(id=f"e-spoke{i}", canonical_name=f"spoke{i}") for i in range(4)]
+    for sp in spokes:
+        await store.upsert_entity(sp)
+        await store.upsert_edge(
+            Edge(from_entity="e-hub", to_entity=sp.id, relation="uses", weight=1.0)
+        )
+    # Many isolated, edge-less entities (degree 0) that an arbitrary slice could pick.
+    for i in range(20):
+        await store.upsert_entity(
+            Entity(id=f"e-iso{i}", canonical_name=f"iso{i}")
+        )
+
+    # node_limit = cluster size (hub + 4 spokes); the degree-ranked top slice must
+    # be exactly the connected cluster, never the degree-0 isolates.
+    snap = await store.graph_snapshot(node_limit=5)
+
+    kept = [n.id for n in snap.nodes if n.kind == "entity"]
+    assert set(kept) == {"e-hub", *(sp.id for sp in spokes)}
+    assert not any(eid.startswith("e-iso") for eid in kept)
+    # Highest-degree entity (the hub) is ranked first.
+    assert kept[0] == "e-hub"
+    # The kept set is genuinely connected: every spoke shares a RELATES edge with
+    # the hub (a connected subgraph, not isolated nodes).
+    relates = {(e.source, e.target) for e in snap.edges if e.kind == "relates"}
+    for sp in spokes:
+        assert ("e-hub", sp.id) in relates
+    # More entities exist than the cap -> truncated reported.
+    assert snap.truncated is True
 
 
 def test_provenance_source_serialization_is_compact_for_filter() -> None:

@@ -118,6 +118,12 @@ class FakeFalkorDriver:
         if "CREATE VECTOR INDEX" in c:
             return _Result([])
 
+        # --- entity name_key range index creation (no-op in the fake) --------
+        # ``ensure_entity_name_index`` emits CREATE INDEX FOR (e:MnemozineEntity)
+        # ON (e.name_key); the fake resolves by scanning, so the index is a no-op.
+        if "CREATE INDEX FOR (e:MnemozineEntity) ON (e.name_key)" in c:
+            return _Result([])
+
         # --- index-backed vector KNN (the FR-RET-2 scoped_query path) --------
         # Mirror the real FalkorDB ``db.idx.vector.queryNodes`` contract: rank the
         # scope/tier/entity-filtered candidates by cosine *distance* (1 - cosine,
@@ -129,6 +135,16 @@ class FakeFalkorDriver:
         # --- MnemozineRawChunk (the retained raw tier) -----------------------
         if ":MnemozineRawChunk" in c:
             return self._raw_chunk(c, params)
+        # --- graph_snapshot default selection (degree-ranked) ----------------
+        # The no-center default selection now degree-ranks entities over BOTH
+        # structural layers (``OPTIONAL MATCH (e)-[r:MNEMOZINE_RELATES|
+        # MNEMOZINE_CO_MENTIONS]-(...) WITH e, count(r) AS deg ORDER BY deg DESC,
+        # e.id RETURN e LIMIT $cap``). Because it names MNEMOZINE_CO_MENTIONS it
+        # would otherwise be routed to the co-mention handler; route it to the
+        # entity handler explicitly (recognized by ``count(r) AS deg``) so the
+        # degree-ranked selection is answered there.
+        if "count(r) AS deg" in c and "RETURN e LIMIT $cap" in c:
+            return self._entity_or_edge(c, params)
         # --- MNEMOZINE_CO_MENTIONS (weighted entity-entity co-mention edges) -
         # Checked BEFORE the bare :MnemozineEntity branch (the upsert + the
         # graph_snapshot aggregate both MATCH entity nodes) and BEFORE the
@@ -561,6 +577,21 @@ class FakeFalkorDriver:
             }
             return _Result([])
 
+        # add_memory_mentions (inline per-memory seam): UNWIND $entity_ids AS eid
+        # MATCH (m {id: $memory_id}) MATCH (e {id: eid}) MERGE
+        # (m)-[r:MNEMOZINE_MENTIONS]->(e) RETURN count(r) AS n. Idempotent set
+        # MERGE keyed on exact node ids; only edges whose endpoints both exist are
+        # asserted, mirroring the backend's id-bound MATCH.
+        if "UNWIND $entity_ids AS eid" in c and "RETURN count(r) AS n" in c:
+            mid = p["memory_id"]
+            if mid not in self.memories:
+                return _Result([[0]])
+            asserted = {
+                (mid, eid) for eid in p.get("entity_ids", []) if eid in self.entities
+            }
+            self.mentions |= asserted
+            return _Result([[len(asserted)]])
+
         # persist_mentions: MATCH (e)/(m) ... MERGE (m)-[r:MNEMOZINE_MENTIONS]->(e)
         # RETURN count(r) AS n
         if "MERGE (m)" in c and "RETURN count(r) AS n" in c:
@@ -783,6 +814,32 @@ class FakeFalkorDriver:
                     keep[o["id"]] = o
             rows = [[e] for e in list(keep.values())[: p["cap"]]]
             return _Result(rows)
+        # --- graph_snapshot default selection: DEGREE-RANKED bounded slice ----
+        # The no-center default now ranks entities by incident structural degree
+        # (RELATES edges + CO_MENTIONS) descending, tie-break on id, then takes the
+        # top $cap — so the snapshot surfaces the connected structure, not an
+        # arbitrary slice. Recognized by ``count(r) AS deg``; honors the optional
+        # ``e.type = $entity_type`` filter, exactly like the plain branch below.
+        if "count(r) AS deg" in c and "RETURN e LIMIT $cap" in c:
+            ents = [
+                e
+                for e in self.entities.values()
+                if "e.type = $entity_type" not in c
+                or e.get("type") == p.get("entity_type")
+            ]
+            degree: dict[str, int] = {e["id"]: 0 for e in ents}
+            for edge in self.edges.values():
+                if edge["from_entity"] in degree:
+                    degree[edge["from_entity"]] += 1
+                if edge["to_entity"] in degree:
+                    degree[edge["to_entity"]] += 1
+            for rec in self.co_mentions.values():
+                if rec["from_entity"] in degree:
+                    degree[rec["from_entity"]] += 1
+                if rec["to_entity"] in degree:
+                    degree[rec["to_entity"]] += 1
+            ents.sort(key=lambda e: (-degree[e["id"]], e["id"]))
+            return _Result([[e] for e in ents[: p["cap"]]])
         # Plain bounded entity list (optional type filter), capped at $cap.
         if c.startswith("MATCH (e:MnemozineEntity)") and "RETURN e LIMIT $cap" in c:
             ents = [
@@ -808,11 +865,40 @@ class FakeFalkorDriver:
             ]
             return _Result(rows)
 
+        # --- resolve_or_create_entity: name-keyed lookup ---------------------
+        # MATCH (e) WHERE e.name_key = toLower($canonical_name) RETURN e LIMIT 1 —
+        # the identity-by-normalized-name probe. Resolve by case-folded
+        # canonical_name (the fake stores name_key on write, but matching on the
+        # lowered canonical_name is equivalent and robust to legacy rows).
+        if "e.name_key = toLower($canonical_name)" in c and "RETURN e LIMIT 1" in c:
+            key = str(p["canonical_name"]).lower()
+            for e in self.entities.values():
+                stored_key = e.get("name_key") or str(
+                    e.get("canonical_name") or ""
+                ).lower()
+                if stored_key == key:
+                    return _Result([[e]])
+            return _Result([])
+
+        # --- backfill_entity_name_keys: stamp unset name_key in place --------
+        # MATCH (e) WHERE e.name_key IS NULL SET e.name_key = toLower(...) RETURN
+        # count(e). Touch only entities missing name_key (idempotent).
+        if "e.name_key IS NULL" in c and "SET e.name_key = toLower(e.canonical_name)" in c:
+            stamped = 0
+            for e in self.entities.values():
+                if e.get("name_key") is None:
+                    e["name_key"] = str(e.get("canonical_name") or "").lower()
+                    stamped += 1
+            return _Result([[stamped]])
+
         if c.startswith("MERGE (e:MnemozineEntity {id: $id})"):
             e = self.entities.setdefault(p["id"], {"id": p["id"]})
             e["canonical_name"] = p["canonical_name"]
             e["aliases"] = list(p["aliases"])
             e["type"] = p["type"]
+            # Maintain the storage-only name_key index invariant on every write
+            # (the backend's SET e.name_key = toLower($canonical_name)).
+            e["name_key"] = str(p["canonical_name"]).lower()
             return _Result([[e]])
 
         if c.startswith("MATCH (e:MnemozineEntity)") and "RETURN e LIMIT 1" in c:
@@ -832,6 +918,10 @@ class FakeFalkorDriver:
         if "SET t.aliases = $aliases" in c:
             t = self.entities[p["tgt"]]
             t["aliases"] = list(p["aliases"])
+            # The alias-update write (merge_entities + resolve_or_create_entity)
+            # now ALSO re-asserts the name_key invariant on the survivor.
+            if "t.name_key = toLower(t.canonical_name)" in c:
+                t["name_key"] = str(t.get("canonical_name") or "").lower()
             return _Result([[t]])
 
         if c.startswith("MATCH (s:MnemozineEntity {id: $src}) DELETE s"):
@@ -997,6 +1087,19 @@ class FakeGraphitiClient:
 
     async def execute_query(self, cypher: str, **params: Any) -> _Result:
         return await self.driver.execute_query(cypher, **params)
+
+    async def ensure_entity_name_index(self) -> None:
+        """Mirror :meth:`GraphitiClient.ensure_entity_name_index` (no-op create).
+
+        The backend's ``backfill_entity_name_keys`` ensures the entity name_key
+        range index before its SET pass; the fake routes the CREATE INDEX through
+        ``execute_query`` (a no-op branch) so the real backend code path is
+        exercised unchanged.
+        """
+
+        await self.execute_query(
+            "CREATE INDEX FOR (e:MnemozineEntity) ON (e.name_key)"
+        )
 
     async def close(self) -> None:
         await self.driver.close()

@@ -290,6 +290,23 @@ class OfflineStorage:
             for nb in await self.neighbors(center.canonical_name, active_only=False):
                 keep.add(nb.entity.id)
             entities = [e for e in entities if e.id in keep]
+        else:
+            # Default (no-center) selection: degree-rank by incident structural
+            # degree (RELATES edges + CO_MENTIONS) descending, tie-break on id,
+            # mirroring the backend's degree-ranked top slice so the snapshot
+            # surfaces the connected structure, not an arbitrary slice.
+            degree: dict[str, int] = dict.fromkeys((e.id for e in entities), 0)
+            for edge in self.edges.values():
+                if edge.from_entity in degree:
+                    degree[edge.from_entity] += 1
+                if edge.to_entity in degree:
+                    degree[edge.to_entity] += 1
+            for a, b in self.co_mentions:
+                if a in degree:
+                    degree[a] += 1
+                if b in degree:
+                    degree[b] += 1
+            entities.sort(key=lambda e: (-degree[e.id], e.id))
         # Over-fetch sentinel: truncated iff the selected set exceeds node_limit
         # (mirrors the backend's LIMIT $cap+1 over-fetch), so exactly node_limit
         # entities is NOT a false-positive truncation.
@@ -417,6 +434,34 @@ class OfflineStorage:
         self.entities[entity.id] = entity
         return entity
 
+    async def resolve_or_create_entity(self, entity: Entity) -> Entity:
+        """Identity-by-normalized-name: reuse the node for ``toLower(name)``.
+
+        Offline mirror of the backend seam — return the stored entity whose
+        ``canonical_name.lower()`` matches the incoming one (folding the incoming
+        canonical_name/aliases into its aliases when they add something new) instead
+        of minting a duplicate; create only when absent. Idempotent.
+        """
+
+        key = entity.canonical_name.lower()
+        for stored in self.entities.values():
+            if stored.canonical_name.lower() == key:
+                incoming = {entity.canonical_name, *entity.aliases}
+                merged = sorted({*stored.aliases, *incoming} - {stored.canonical_name})
+                if merged != sorted(stored.aliases):
+                    stored.aliases = merged
+                return stored
+        return await self.upsert_entity(entity)
+
+    async def backfill_entity_name_keys(self) -> int:
+        """No-op: this dict-backed offline store resolves by ``canonical_name.lower()``.
+
+        No stored ``name_key`` to backfill, so the v2 migration's structural pass is
+        a no-op here. Returns 0.
+        """
+
+        return 0
+
     async def get_entity(self, name_or_id: str) -> Entity | None:
         if name_or_id in self.entities:
             return self.entities[name_or_id]
@@ -470,6 +515,25 @@ class OfflineStorage:
                 eid = name_to_id.get(name.lower())
                 if eid is not None:
                     asserted.add((m.id, eid))
+        self.mentions |= asserted
+        return len(asserted)
+
+    async def add_memory_mentions(
+        self, memory_id: str, entity_ids: Sequence[str]
+    ) -> int:
+        """Inline per-memory MNEMOZINE_MENTIONS seam (assert at ingest time).
+
+        Thin offline mirror of the backend's id-keyed MERGE: add
+        ``(memory_id, eid)`` to the mentions set for each resolved entity id (set
+        semantics, idempotent), restricted to ids of stored entities to match the
+        backend's id-bound MATCH. Returns the number of edges asserted.
+        """
+
+        if memory_id not in self.memories:
+            return 0
+        asserted = {
+            (memory_id, eid) for eid in entity_ids if eid in self.entities
+        }
         self.mentions |= asserted
         return len(asserted)
 

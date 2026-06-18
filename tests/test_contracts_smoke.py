@@ -55,6 +55,88 @@ async def test_persist_mentions_on_fake_is_protocol_conformant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_or_create_entity_protocol_conformant_on_all_fakes() -> None:
+    # The new StorageBackend.resolve_or_create_entity Protocol method is present on
+    # all three in-memory fakes (the conftest InMemoryStorage, the contract test's
+    # FakeFalkor-backed real backend, and the evals OfflineStorage) and is
+    # identity-by-normalized-name: resolving the same name twice returns ONE node.
+    from mnemozine.evals._offline_store import OfflineStorage
+    from mnemozine.schema.models import Entity
+    from mnemozine.storage.backend import GraphitiStorageBackend
+    from tests.storage.fake_falkor import FakeGraphitiClient
+
+    falkor_backend = GraphitiStorageBackend(
+        client=FakeGraphitiClient(),  # type: ignore[arg-type]
+        embeddings=FakeEmbeddingProvider(),
+    )
+    fakes: list[StorageBackend] = [
+        InMemoryStorage(),
+        OfflineStorage(),
+        falkor_backend,
+    ]
+    for store in fakes:
+        assert isinstance(store, StorageBackend)
+        first = await store.resolve_or_create_entity(Entity(canonical_name="rust"))
+        # Same normalized name, different case + new alias -> same id, folded alias.
+        second = await store.resolve_or_create_entity(
+            Entity(canonical_name="Rust", aliases=["rust-lang"])
+        )
+        assert second.id == first.id
+        assert "rust-lang" in second.aliases
+        # A different name mints a distinct node.
+        other = await store.resolve_or_create_entity(Entity(canonical_name="async"))
+        assert other.id != first.id
+
+
+@pytest.mark.asyncio
+async def test_add_memory_mentions_protocol_conformant_on_all_fakes() -> None:
+    # The new StorageBackend.add_memory_mentions Protocol method (the inline
+    # per-memory mention seam) is present on all three in-memory fakes (the conftest
+    # InMemoryStorage, the contract test's FakeFalkor-backed real backend, and the
+    # evals OfflineStorage): it id-keyed MERGEs the memory's mention edges and is
+    # idempotent (a re-call asserts the same edges, adds none).
+    from mnemozine.evals._offline_store import OfflineStorage
+    from mnemozine.schema.models import Entity, MemoryUnit, Provenance
+    from mnemozine.storage.backend import GraphitiStorageBackend
+    from tests.storage.fake_falkor import FakeGraphitiClient
+
+    falkor_backend = GraphitiStorageBackend(
+        client=FakeGraphitiClient(),  # type: ignore[arg-type]
+        embeddings=FakeEmbeddingProvider(),
+    )
+    fakes: list[StorageBackend] = [
+        InMemoryStorage(),
+        OfflineStorage(),
+        falkor_backend,
+    ]
+    for store in fakes:
+        assert isinstance(store, StorageBackend)
+        await store.upsert_entity(Entity(id="e-rust", canonical_name="rust"))
+        await store.upsert_entity(Entity(id="e-tokio", canonical_name="tokio"))
+        await store.upsert_memory(
+            MemoryUnit(
+                id="m1",
+                content="rust + tokio",
+                scope=Scope.global_(),
+                category="fact",
+                entities=["rust", "tokio"],
+                provenance=Provenance(source="claude_code", session_id="s1"),
+            )
+        )
+        first = await store.add_memory_mentions("m1", ["e-rust", "e-tokio"])
+        assert first == 2
+        # Idempotent: a re-call re-asserts the same edges, the edge set never grows.
+        second = await store.add_memory_mentions("m1", ["e-rust", "e-tokio"])
+        assert second == 2
+        # The mention edges landed (dict-backed fakes expose .mentions directly;
+        # the FakeFalkor-backed real backend exposes them on its driver).
+        mentions = getattr(store, "mentions", None)
+        if mentions is None:
+            mentions = store._client.driver.mentions  # type: ignore[attr-defined]
+        assert mentions == {("m1", "e-rust"), ("m1", "e-tokio")}
+
+
+@pytest.mark.asyncio
 async def test_co_mention_methods_on_fake_are_protocol_conformant() -> None:
     # The three new co-mention StorageBackend Protocol methods are present on the
     # in-memory fake: co_mention_pairs (derived from mentions), entity_mention_counts

@@ -26,6 +26,7 @@ from mnemozine.storage.backend import ContradictsFn, GraphitiStorageBackend
 from mnemozine.storage.cosine import cosine_similarity
 from mnemozine.storage.embeddings import OllamaEmbeddingProvider
 from mnemozine.storage.graphiti_client import (
+    ENTITY_NAME_KEY_INDEX,
     MEMORY_VECTOR_INDEX,
     GraphitiClient,
 )
@@ -36,5 +37,6 @@ __all__ = [
     "OllamaEmbeddingProvider",
     "ContradictsFn",
     "MEMORY_VECTOR_INDEX",
+    "ENTITY_NAME_KEY_INDEX",
     "cosine_similarity",
 ]

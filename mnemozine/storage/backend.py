@@ -1079,9 +1079,23 @@ class GraphitiStorageBackend:
                 **ent_params,
             )
         else:
+            # Default (no-center) selection: a DEGREE-RANKED bounded slice over the
+            # structural layers (RELATES + CO_MENTIONS) instead of an arbitrary
+            # ``LIMIT $cap`` slice, so the snapshot surfaces the real connected
+            # structure — the highest-degree entities and the neighbors they share
+            # an edge with render as a connected subgraph, not isolated nodes. The
+            # degree is a single Cypher-side aggregate (OPTIONAL MATCH + count(r)),
+            # so no per-node N+1 and no full edge scan beyond the bounded top slice;
+            # the existing RELATES + CO_MENTIONS aggregates below then connect the
+            # kept set. Tie-break on ``e.id`` keeps the slice deterministic.
             clause = f" WHERE {' AND '.join(ent_where)}" if ent_where else ""
             ent_rows = await self._query(
-                f"MATCH (e:{ENTITY_LABEL}){clause} RETURN e LIMIT $cap",
+                f"MATCH (e:{ENTITY_LABEL}){clause} "
+                f"OPTIONAL MATCH (e)-[r:{RELATES_TYPE}|{CO_MENTION_TYPE}]-"
+                f"(:{ENTITY_LABEL}) "
+                "WITH e, count(r) AS deg "
+                "ORDER BY deg DESC, e.id "
+                "RETURN e LIMIT $cap",
                 **ent_params,
             )
 
@@ -1313,15 +1327,95 @@ class GraphitiStorageBackend:
         )
 
     async def upsert_entity(self, entity: Entity) -> Entity:
-        """Insert or update an entity node, keyed on id (FR-EXT-2)."""
+        """Insert or update an entity node, keyed on id (FR-EXT-2).
+
+        Identity-by-id: the MERGE key is the entity's ``id``, so this is the
+        low-level write used once an id is known (the resolve-by-name decision
+        lives in :meth:`resolve_or_create_entity`, which calls through here to
+        create). Every write ALSO maintains the storage-only ``name_key =
+        toLower(canonical_name)`` property so the
+        :data:`~mnemozine.storage.graphiti_client.ENTITY_NAME_KEY_INDEX` invariant
+        holds for every node — ``name_key`` is NOT a field on
+        :class:`~mnemozine.schema.models.Entity` (storage-only, like a memory's
+        ``data_version``) and :meth:`_row_to_entity` never reads it back.
+        """
 
         await self._query(
             f"MERGE (e:{ENTITY_LABEL} {{id: $id}}) "
-            "SET e.canonical_name = $canonical_name, e.aliases = $aliases, e.type = $type "
+            "SET e.canonical_name = $canonical_name, e.aliases = $aliases, e.type = $type, "
+            "e.name_key = toLower($canonical_name) "
             "RETURN e",
             **self._entity_props(entity),
         )
         return entity
+
+    async def resolve_or_create_entity(self, entity: Entity) -> Entity:
+        """Resolve an entity by normalized name, creating it only if absent.
+
+        The identity-by-normalized-name seam (the fix for the duplicate-entity
+        leak): looks up the existing entity node whose ``name_key`` equals
+        ``toLower(entity.canonical_name)`` — case-insensitive and index-backed via
+        :data:`~mnemozine.storage.graphiti_client.ENTITY_NAME_KEY_INDEX`. When a
+        node already exists for that normalized name this RETURNs the **stored**
+        entity (its id is what ``services._persist`` binds edges to) WITHOUT minting
+        a new node, folding ``entity.canonical_name`` / ``entity.aliases`` into the
+        survivor's aliases when they differ (reusing the same alias-update write as
+        :meth:`merge_entities`). When no such node exists it creates one via the
+        id-keyed :meth:`upsert_entity` (which also sets ``name_key``).
+
+        Idempotent (FR-MNT-5): resolving the same normalized name twice returns the
+        same id and never increases the node count.
+        """
+
+        rows = await self._query(
+            f"MATCH (e:{ENTITY_LABEL}) WHERE e.name_key = toLower($canonical_name) "
+            "RETURN e LIMIT 1",
+            canonical_name=entity.canonical_name,
+        )
+        if not rows:
+            # No node for this normalized name yet: create it id-keyed.
+            return await self.upsert_entity(entity)
+
+        stored = self._row_to_entity(rows[0][0])
+        # Fold the incoming canonical_name + aliases into the survivor's aliases
+        # when they add anything new (a different-cased spelling, or a fresh alias),
+        # so a later get_entity by either spelling resolves to the same node. Reuses
+        # the merge_entities alias-update write (also re-asserts name_key on the
+        # survivor for safety).
+        incoming = {entity.canonical_name, *entity.aliases}
+        merged_aliases = sorted({*stored.aliases, *incoming} - {stored.canonical_name})
+        if merged_aliases != sorted(stored.aliases):
+            stored.aliases = merged_aliases
+            await self._query(
+                f"MATCH (t:{ENTITY_LABEL} {{id: $tgt}}) "
+                "SET t.aliases = $aliases, t.name_key = toLower(t.canonical_name) "
+                "RETURN t",
+                tgt=stored.id,
+                aliases=merged_aliases,
+            )
+        return stored
+
+    async def backfill_entity_name_keys(self) -> int:
+        """Backfill ``name_key = toLower(canonical_name)`` on entities missing it.
+
+        The STRUCTURAL half of the v2 entity-identity migration
+        (:class:`mnemozine.migrations.entity_name_key.EntityNameKeyMigration`):
+        first ensures the
+        :data:`~mnemozine.storage.graphiti_client.ENTITY_NAME_KEY_INDEX` range index
+        exists (idempotent), then runs one idempotent Cypher SET pass that touches
+        ONLY entity nodes whose ``name_key`` is still unset
+        (``WHERE e.name_key IS NULL``). Re-runnable — a second pass finds nothing
+        unset and updates zero nodes. Returns the number of nodes stamped.
+        """
+
+        await self._client.ensure_entity_name_index()
+        rows = await self._query(
+            f"MATCH (e:{ENTITY_LABEL}) WHERE e.name_key IS NULL "
+            "SET e.name_key = toLower(e.canonical_name) RETURN count(e) AS n",
+        )
+        if not rows:
+            return 0
+        return int(rows[0][0])
 
     async def get_entity(self, name_or_id: str) -> Entity | None:
         """Resolve an entity by id, canonical name, or alias (FR-MNT-4)."""
@@ -1431,8 +1525,13 @@ class GraphitiStorageBackend:
 
         merged_aliases = sorted({*target.aliases, source.canonical_name, *source.aliases})
         target.aliases = merged_aliases
+        # Re-assert name_key on the survivor alongside the alias fold so the
+        # unique-normalized-name invariant (and the ENTITY_NAME_KEY_INDEX) holds
+        # post-merge — a folded-away duplicate must not leave the survivor without
+        # a name_key (e.g. if it predates the v2 backfill).
         await self._query(
-            f"MATCH (t:{ENTITY_LABEL} {{id: $tgt}}) SET t.aliases = $aliases RETURN t",
+            f"MATCH (t:{ENTITY_LABEL} {{id: $tgt}}) "
+            "SET t.aliases = $aliases, t.name_key = toLower(t.canonical_name) RETURN t",
             tgt=target_id,
             aliases=merged_aliases,
         )
@@ -1494,6 +1593,42 @@ class GraphitiStorageBackend:
             f"MERGE (m)-[r:{MENTIONS_TYPE}]->(e) "
             "RETURN count(r) AS n",
             pairs=[[mid, eid] for mid, eid in sorted(pairs)],
+        )
+        if not rows or rows[0][0] is None:
+            return 0
+        return int(rows[0][0])
+
+    async def add_memory_mentions(
+        self, memory_id: str, entity_ids: Sequence[str]
+    ) -> int:
+        """Assert ``(memory)-[:MNEMOZINE_MENTIONS]->(entity)`` edges at ingest time.
+
+        The per-memory inline-mentions seam — what connects a freshly ingested
+        memory to its entities the instant it lands instead of waiting for the 3 AM
+        batch :meth:`persist_mentions`. Reuses that method's id-keyed MERGE write
+        path: ``UNWIND`` the already-resolved ``entity_ids`` and MERGE a
+        :data:`MENTIONS_TYPE` edge from the memory to each entity **keyed on the
+        exact node ids** (never a blind CREATE), so a re-call asserts the same edges
+        and creates none (FR-MNT-5). Called by ``services._persist`` after each
+        :meth:`upsert_memory` with the ids already built from
+        :meth:`resolve_or_create_entity`, so no extra entity reads are needed. The
+        batch :meth:`persist_mentions` stays a whole-store backstop, so this is
+        purely additive. Returns the number of edges asserted (created-or-matched).
+        """
+
+        # Dedup + drop falsy ids so the same edge is asserted once and a memory with
+        # no resolved entities is a no-op (empty UNWIND).
+        ids = sorted({eid for eid in entity_ids if eid})
+        if not ids:
+            return 0
+        rows = await self._query(
+            "UNWIND $entity_ids AS eid "
+            f"MATCH (m:{MEMORY_LABEL} {{id: $memory_id}}) "
+            f"MATCH (e:{ENTITY_LABEL} {{id: eid}}) "
+            f"MERGE (m)-[r:{MENTIONS_TYPE}]->(e) "
+            "RETURN count(r) AS n",
+            memory_id=memory_id,
+            entity_ids=ids,
         )
         if not rows or rows[0][0] is None:
             return 0

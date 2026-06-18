@@ -134,15 +134,33 @@ class MnemozineIngestService:
     async def _persist(self, result: ExtractionResult) -> None:
         """Write entities, memories and relationship edges from one extraction."""
 
-        # Upsert entities first to get stable ids for edge resolution (FR-EXT-2).
+        # Resolve entities first to get stable ids for edge resolution (FR-EXT-2).
+        # resolve_or_create_entity (NOT upsert_entity) is identity-by-normalized-name:
+        # an extracted entity REUSES the existing node for toLower(canonical_name)
+        # instead of minting a fresh node per extraction, so the graph stops
+        # fragmenting across duplicate entity nodes for the same name.
         entity_ids: dict[str, str] = {}
         for entity in result.entities:
-            stored = await self._storage.upsert_entity(entity)
+            stored = await self._storage.resolve_or_create_entity(entity)
             entity_ids[entity.canonical_name] = stored.id
             entity_ids[stored.id] = stored.id
 
         for memory in result.memories:
             await self._storage.upsert_memory(memory)
+            # Inline-mentions seam: connect the memory to its entities the instant
+            # it lands instead of waiting for the batch MentionsJob. Resolve the
+            # memory's entity-name list through the SAME identity-by-normalized-name
+            # seam (reusing the entity_ids map already built above, so no extra
+            # reads), then idempotently MERGE the MNEMOZINE_MENTIONS edges by id.
+            # The batch persist_mentions stays a whole-store backstop, so this is
+            # purely additive.
+            mention_ids = [
+                eid
+                for name in memory.entities
+                if (eid := await self._resolve_entity_id(name, entity_ids)) is not None
+            ]
+            if mention_ids:
+                await self._storage.add_memory_mentions(memory.id, mention_ids)
 
         for rel in result.relationships:
             from_id = await self._resolve_entity_id(rel.subject, entity_ids)
@@ -157,17 +175,22 @@ class MnemozineIngestService:
     async def _resolve_entity_id(
         self, name: str, entity_ids: dict[str, str]
     ) -> str | None:
-        """Resolve an entity name to a stable id, creating the node if needed."""
+        """Resolve an entity name to a stable id, creating the node if needed.
+
+        Goes through the SAME identity-by-normalized-name seam
+        (:meth:`~mnemozine.interfaces.StorageBackend.resolve_or_create_entity`) as
+        the extracted-entities loop, so a relationship subject/object folds onto the
+        existing node for ``toLower(name)`` instead of creating a parallel duplicate
+        — both resolution paths now share one seam.
+        """
 
         if name in entity_ids:
             return entity_ids[name]
-        existing = await self._storage.get_entity(name)
-        if existing is not None:
-            entity_ids[name] = existing.id
-            return existing.id
-        created = await self._storage.upsert_entity(Entity(canonical_name=name))
-        entity_ids[name] = created.id
-        return created.id
+        resolved = await self._storage.resolve_or_create_entity(
+            Entity(canonical_name=name)
+        )
+        entity_ids[name] = resolved.id
+        return resolved.id
 
     async def ingest_events(self, events: Sequence[IngestEvent]) -> int:
         """Chunk a finite event stream and ingest each chunk. Returns chunk count."""

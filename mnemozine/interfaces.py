@@ -800,7 +800,41 @@ class StorageBackend(Protocol):
     # --- entity operations (FR-EXT-2, FR-MNT-4) ---------------------------
 
     async def upsert_entity(self, entity: Entity) -> Entity:
-        """Insert or update an entity node (FR-EXT-2)."""
+        """Insert or update an entity node, keyed on id (FR-EXT-2).
+
+        The low-level id-keyed write. Implementations ALSO maintain the
+        storage-only ``name_key = toLower(canonical_name)`` index invariant so the
+        normalized-name index stays current on every write, but identity-by-name
+        (reuse the existing node for a normalized name instead of minting a
+        duplicate) lives in :meth:`resolve_or_create_entity` — call THAT on the
+        ingest path, not this.
+        """
+        ...
+
+    async def resolve_or_create_entity(self, entity: Entity) -> Entity:
+        """Resolve an entity by normalized name, creating it only if absent.
+
+        The identity-by-normalized-name seam used on the ingest path (both the
+        extracted-entities loop and relationship subject/object resolution in
+        ``services._persist``) so an extracted entity REUSES the existing node for
+        ``toLower(canonical_name)`` instead of minting a duplicate. When a node
+        already exists for that normalized name, returns the **stored** entity (its
+        id is what edges bind to), folding the incoming ``canonical_name`` /
+        ``aliases`` into the survivor's aliases when they differ; otherwise creates
+        the node. Idempotent (FR-MNT-5): resolving the same name twice returns the
+        same id and never increases the node count.
+        """
+        ...
+
+    async def backfill_entity_name_keys(self) -> int:
+        """Backfill the storage-only ``name_key = toLower(canonical_name)`` property.
+
+        The STRUCTURAL half of the v2 entity-identity migration: ensure the
+        normalized-name index exists, then idempotently stamp ``name_key`` onto any
+        entity node still missing it (touching ONLY unset nodes). Re-runnable — a
+        second pass stamps zero. Returns the number of nodes stamped. Stores with no
+        normalized-name concept may treat this as a no-op returning 0.
+        """
         ...
 
     async def get_entity(self, name_or_id: str) -> Entity | None:
@@ -827,6 +861,25 @@ class StorageBackend(Protocol):
         Whole-store and set-based: a single MERGE pass (never blind CREATE), so
         re-running asserts the same edges without duplicating them (FR-MNT-5).
         Returns the number of mention edges asserted (created-or-matched).
+        """
+        ...
+
+    async def add_memory_mentions(
+        self, memory_id: str, entity_ids: Sequence[str]
+    ) -> int:
+        """Assert ``(memory)-[:MNEMOZINE_MENTIONS]->(entity)`` edges at ingest time.
+
+        The per-memory inline-mentions seam: idempotently MERGE a
+        ``MNEMOZINE_MENTIONS`` edge from the memory ``memory_id`` to each of the
+        already-resolved ``entity_ids`` — keyed on the **exact node ids** (mirroring
+        :meth:`persist_mentions`' id-keyed MERGE write), so a freshly ingested memory
+        is connected to its entities the instant it lands instead of waiting for the
+        batch :meth:`persist_mentions` reconcile. Called by ``services._persist``
+        after each :meth:`upsert_memory` with the ids already built from
+        :meth:`resolve_or_create_entity` (no extra reads). Idempotent (FR-MNT-5):
+        re-asserting the same edges creates none. Returns the number of edges
+        asserted (created-or-matched); the batch :meth:`persist_mentions` stays as a
+        whole-store backstop so behavior is purely additive.
         """
         ...
 

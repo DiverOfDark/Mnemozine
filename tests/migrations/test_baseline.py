@@ -67,7 +67,9 @@ def test_baseline_is_registered_at_version_1() -> None:
     versions = [m.version for m in migrations_pkg.MIGRATIONS]
     assert 1 in versions
     assert BASELINE_MIGRATION.version == 1
-    assert BASELINE_MIGRATION.version == CURRENT_DATA_VERSION
+    # Baseline is the FIRST migration; later migrations (v2 entity name_key, ...)
+    # carry CURRENT_DATA_VERSION forward, so baseline.version <= CURRENT.
+    assert BASELINE_MIGRATION.version <= CURRENT_DATA_VERSION
     # Cheap reclassify -> safe to auto-run at startup.
     assert BASELINE_MIGRATION.requires_reextract is False
 
@@ -182,9 +184,11 @@ async def test_run_stamps_already_correct_memory_in_place() -> None:
     await BaselineReclassifyMigration().run(storage)
 
     after = storage.memories[m.id]
-    # Scope unchanged (re-derivation matches) but version stamped up in place.
+    # Scope unchanged (re-derivation matches) but version stamped up in place. The
+    # explicit-stamp path advances to the BASELINE migration's own target (v1), not
+    # CURRENT_DATA_VERSION — later migrations carry it the rest of the way.
     assert after.scope.as_str() == correct_scope.as_str()
-    assert after.data_version == CURRENT_DATA_VERSION
+    assert after.data_version == BASELINE_MIGRATION.version
 
 
 async def test_run_advances_raw_chunk_tier() -> None:
@@ -205,9 +209,12 @@ async def test_run_advances_raw_chunk_tier() -> None:
 
     await BaselineReclassifyMigration().run(storage)
 
-    # Both tiers advanced: the stale chunk is stamped without re-extracting.
-    assert storage.raw_chunks["abc123"].data_version == CURRENT_DATA_VERSION
-    assert await storage.min_data_version() == CURRENT_DATA_VERSION
+    # Both tiers advanced: the stale chunk is stamped without re-extracting, to the
+    # BASELINE migration's own target (v1). A later migration (v2) carries it on;
+    # min_data_version reaches v1 after the baseline run (the chunk tier is the
+    # floor — the rescoped memory was reclassify-stamped to CURRENT, the chunk to v1).
+    assert storage.raw_chunks["abc123"].data_version == BASELINE_MIGRATION.version
+    assert await storage.min_data_version() == BASELINE_MIGRATION.version
 
 
 async def test_run_extractor_arg_is_ignored() -> None:

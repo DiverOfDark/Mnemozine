@@ -26,7 +26,8 @@ from collections.abc import Sequence
 
 import pytest
 
-from mnemozine.config import FalkorDBSettings, MaintenanceSettings
+from mnemozine.config import FalkorDBSettings, MaintenanceSettings, Settings
+from mnemozine.maintenance.entity_dedup import EntityDedupJob
 from mnemozine.schema.events import Source
 from mnemozine.schema.models import (
     Edge,
@@ -37,8 +38,12 @@ from mnemozine.schema.models import (
 )
 from mnemozine.storage.backend import GraphitiStorageBackend
 from mnemozine.storage.graphiti_client import (
+    CO_MENTION_TYPE,
     ENTITY_LABEL,
+    ENTITY_NAME_KEY_INDEX,
+    MEMORY_LABEL,
     MEMORY_VECTOR_INDEX,
+    MENTIONS_TYPE,
     RELATES_TYPE,
     GraphitiClient,
 )
@@ -592,3 +597,220 @@ async def test_graph_snapshot_bounded_against_real_falkordb(
     cut = await live_backend.graph_snapshot(node_limit=1)
     assert len([n for n in cut.nodes if n.kind == "entity"]) == 1
     assert cut.truncated is True
+
+    # --- degree-ordered default selection from real Cypher -------------------
+    # Add an ISOLATED (edge-less, degree-0) entity; the two connected entities
+    # (rust/tokio, each degree 1 via the RELATES edge) must out-rank it in the
+    # degree-ranked default selection, so node_limit=2 keeps the connected pair,
+    # never the isolate. Proves the OPTIONAL MATCH/count(r)/ORDER BY deg Cypher.
+    await live_backend.upsert_entity(
+        Entity(id="ent-isolated", canonical_name="isolated", type="language")
+    )
+    ranked = await live_backend.graph_snapshot(node_limit=2)
+    ranked_ids = {n.id for n in ranked.nodes if n.kind == "entity"}
+    assert ranked_ids == {"ent-rust", "ent-tokio"}
+    assert "ent-isolated" not in ranked_ids
+    # 3 entities now exist but only 2 kept -> truncated reported.
+    assert ranked.truncated is True
+    # The kept set is connected: the RELATES edge between them is surfaced.
+    ranked_relates = [e for e in ranked.edges if e.kind == "relates"]
+    assert any(
+        {e.source, e.target} == {"ent-rust", "ent-tokio"} for e in ranked_relates
+    ), ranked_relates
+
+
+async def test_resolve_or_create_entity_index_backed_and_case_insensitive(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """resolve_or_create_entity reuses the node for a normalized name, case-insensitive.
+
+    Against real FalkorDB: the name_key range index backs the lookup, resolving
+    ``Rust`` folds onto the existing ``rust`` node (no duplicate), and the spelling
+    + a new alias fold into the survivor's aliases. Idempotent.
+    """
+
+    assert ENTITY_NAME_KEY_INDEX  # name is exported for ops reference
+
+    first = await live_backend.resolve_or_create_entity(Entity(canonical_name="rust"))
+    second = await live_backend.resolve_or_create_entity(
+        Entity(canonical_name="Rust", aliases=["rust-lang"])
+    )
+    assert second.id == first.id
+    assert "Rust" in second.aliases
+    assert "rust-lang" in second.aliases
+
+    # Exactly one entity node for the normalized name (index-backed dedup-on-write).
+    rows = await live_backend._query(
+        f"MATCH (e:{ENTITY_LABEL}) WHERE e.name_key = $k RETURN count(e) AS n",
+        k="rust",
+    )
+    assert int(rows[0][0]) == 1
+
+    # Idempotent: a third resolve of the same name adds no node.
+    third = await live_backend.resolve_or_create_entity(Entity(canonical_name="RUST"))
+    assert third.id == first.id
+    rows2 = await live_backend._query(
+        f"MATCH (e:{ENTITY_LABEL}) WHERE e.name_key = $k RETURN count(e) AS n",
+        k="rust",
+    )
+    assert int(rows2[0][0]) == 1
+
+
+async def test_ensure_entity_name_index_idempotent_on_reconnect(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """ensure_entity_name_index swallows the already-indexed error on re-create.
+
+    The fixture already built the index on connect; calling it again (as a second
+    connect would) must be a no-op, never raise. backfill_entity_name_keys is also
+    re-runnable: a second pass stamps zero nodes.
+    """
+
+    # Re-creating an existing index must not raise (already-indexed swallowed).
+    await live_backend._client.ensure_entity_name_index()
+    await live_backend._client.ensure_entity_name_index()
+
+    # Seed a node WITHOUT name_key (simulating a pre-v2 entity), then backfill.
+    await live_backend._query(
+        f"CREATE (e:{ENTITY_LABEL} {{id: $id, canonical_name: $cn, aliases: [], "
+        "type: null}) RETURN e",
+        id="legacy-1",
+        cn="Legacy",
+    )
+    stamped = await live_backend.backfill_entity_name_keys()
+    assert stamped >= 1
+    rows = await live_backend._query(
+        f"MATCH (e:{ENTITY_LABEL} {{id: $id}}) RETURN e.name_key AS k",
+        id="legacy-1",
+    )
+    assert rows[0][0] == "legacy"
+    # Re-running the backfill finds nothing unset and stamps zero (idempotent).
+    assert await live_backend.backfill_entity_name_keys() == 0
+
+
+async def test_add_memory_mentions_asserts_edges_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """add_memory_mentions id-keyed MERGEs the mention edges against real FalkorDB.
+
+    The inline-mentions seam: a freshly upserted memory's MNEMOZINE_MENTIONS edges
+    are asserted by exact node id and are idempotent — a re-call re-asserts the same
+    edges (the same count) and creates no parallel duplicate, exactly mirroring
+    persist_mentions' write semantics, but driven per-memory at ingest time.
+    """
+
+    rust = await live_backend.resolve_or_create_entity(Entity(canonical_name="rust"))
+    tokio = await live_backend.resolve_or_create_entity(Entity(canonical_name="tokio"))
+    result = await live_backend.upsert_memory(
+        _memory("north", entities=["rust", "tokio"])
+    )
+    memory_id = result.memory.id
+
+    n = await live_backend.add_memory_mentions(memory_id, [rust.id, tokio.id])
+    assert n == 2
+
+    async def _edge_count() -> int:
+        rows = await live_backend._query(
+            f"MATCH (m:{MEMORY_LABEL} {{id: $mid}})"
+            f"-[r:{MENTIONS_TYPE}]->(:{ENTITY_LABEL}) RETURN count(r) AS n",
+            mid=memory_id,
+        )
+        return int(rows[0][0])
+
+    assert await _edge_count() == 2
+    # Both endpoints are the resolved entity ids (no dangling / wrong-id edge).
+    rows = await live_backend._query(
+        f"MATCH (m:{MEMORY_LABEL} {{id: $mid}})"
+        f"-[:{MENTIONS_TYPE}]->(e:{ENTITY_LABEL}) RETURN e.id AS eid ORDER BY eid",
+        mid=memory_id,
+    )
+    assert sorted(row[0] for row in rows) == sorted([rust.id, tokio.id])
+
+    # Idempotent: re-asserting the same edges creates no parallel duplicate.
+    n2 = await live_backend.add_memory_mentions(memory_id, [rust.id, tokio.id])
+    assert n2 == 2
+    assert await _edge_count() == 2
+
+
+async def test_exact_dedup_collapses_duplicate_name_nodes_against_real_falkordb(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """exact_name_dedup over real FalkorDB: normalized-name dups collapse to one node.
+
+    The one-time catch-up the ``dedup-entities`` CLI runs after the v2 migration,
+    proven against a live store: two ``GitHub`` / ``github`` nodes (case drift) with
+    DIFFERENT edge sets fold via the real ``merge_entities`` Cypher to a single
+    survivor that carries BOTH edge sets (the co-mention to ``rust`` AND the memory
+    mention AND the RELATES->``tokio``), no memory is deleted, and the survivor holds
+    ``name_key`` so the unique-normalized-name invariant holds. A re-run merges 0
+    (FR-MNT-5).
+    """
+
+    gh1 = Entity(id="e-gh1", canonical_name="GitHub", aliases=["gh"])
+    gh2 = Entity(id="e-gh2", canonical_name="github")
+    rust = Entity(id="e-rust", canonical_name="rust")
+    tokio = Entity(id="e-tokio", canonical_name="tokio")
+    for e in (gh1, gh2, rust, tokio):
+        await live_backend.upsert_entity(e)
+    # gh1's edge set: co-mention with rust.
+    await live_backend.upsert_co_mention("e-gh1", "e-rust", weight=1.0, shared=2)
+    # gh2's edge set: a RELATES edge to tokio + a memory mention.
+    await live_backend.upsert_edge(
+        Edge(from_entity="e-gh2", to_entity="e-tokio", relation="uses", weight=0.6)
+    )
+    result = await live_backend.upsert_memory(
+        _memory("north", entities=["github"])
+    )
+    memory_id = result.memory.id
+    await live_backend.persist_mentions()
+
+    settings = Settings()
+    settings.graph.entity_dedup_mode = "exact"
+    report = await EntityDedupJob(live_backend, settings=settings).run()
+    assert report.entities_merged == 1
+
+    # Exactly one node remains for the normalized name, and it carries name_key.
+    rows = await live_backend._query(
+        f"MATCH (e:{ENTITY_LABEL}) WHERE e.name_key = $k RETURN e.id AS id",
+        k="github",
+    )
+    assert len(rows) == 1
+    survivor_id = rows[0][0]
+    dead_id = "e-gh1" if survivor_id == "e-gh2" else "e-gh2"
+
+    # The duplicate node is gone (graph does not fragment).
+    gone = await live_backend._query(
+        f"MATCH (e:{ENTITY_LABEL} {{id: $id}}) RETURN count(e) AS n", id=dead_id
+    )
+    assert int(gone[0][0]) == 0
+
+    # BOTH edge sets landed on the survivor — co-mention to rust, RELATES to tokio,
+    # and the memory mention — none orphaned onto the dead node.
+    co = await live_backend._query(
+        f"MATCH (s:{ENTITY_LABEL} {{id: $id}})-[:{CO_MENTION_TYPE}]-(o:{ENTITY_LABEL}) "
+        "RETURN o.id AS oid ORDER BY oid",
+        id=survivor_id,
+    )
+    assert "e-rust" in {row[0] for row in co}
+    rel = await live_backend._query(
+        f"MATCH (s:{ENTITY_LABEL} {{id: $id}})-[:{RELATES_TYPE}]->(o:{ENTITY_LABEL}) "
+        "RETURN o.id AS oid",
+        id=survivor_id,
+    )
+    assert "e-tokio" in {row[0] for row in rel}
+    men = await live_backend._query(
+        f"MATCH (m:{MEMORY_LABEL})-[:{MENTIONS_TYPE}]->(e:{ENTITY_LABEL} {{id: $id}}) "
+        "RETURN m.id AS mid",
+        id=survivor_id,
+    )
+    assert memory_id in {row[0] for row in men}
+
+    # No memory was deleted.
+    mem_alive = await live_backend._query(
+        f"MATCH (m:{MEMORY_LABEL} {{id: $id}}) RETURN count(m) AS n", id=memory_id
+    )
+    assert int(mem_alive[0][0]) == 1
+
+    # Idempotent: a second pass finds no collision and merges 0 (FR-MNT-5).
+    second = await EntityDedupJob(live_backend, settings=settings).run()
+    assert second.entities_merged == 0

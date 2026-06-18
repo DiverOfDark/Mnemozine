@@ -91,6 +91,15 @@ CO_MENTION_RELATION = "co_mentioned"
 # Name of the FalkorDB vector index over MemoryUnit embeddings (FR-STO-2).
 MEMORY_VECTOR_INDEX = "mnemozine_memory_vec"
 
+# Name of the FalkorDB range index over the entity ``name_key`` property
+# (``name_key = toLower(canonical_name)``). Backs the identity-by-normalized-name
+# resolve seam (:meth:`GraphitiStorageBackend.resolve_or_create_entity`) so an
+# extracted entity reuses the existing node for that normalized name instead of
+# minting a duplicate. ``name_key`` is a storage-layer-only property (NOT a field
+# on :class:`mnemozine.schema.models.Entity`, mirroring how ``data_version`` is
+# storage-only on memory nodes).
+ENTITY_NAME_KEY_INDEX = "mnemozine_entity_name_key"
+
 _GRAPH_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
@@ -393,6 +402,7 @@ class GraphitiClient:
         if builder is not None and hasattr(builder, "build_indices_and_constraints"):
             await builder.build_indices_and_constraints()
         await self.ensure_vector_index()
+        await self.ensure_entity_name_index()
 
     async def ensure_vector_index(self) -> None:
         """Create the FalkorDB vector index over MemoryUnit embeddings (FR-STO-2).
@@ -418,6 +428,31 @@ class GraphitiClient:
             f"OPTIONS {{dimension: {int(self._embedding_dimensions)}, "
             f"similarityFunction: 'cosine'}}"
         )
+        try:
+            await self.execute_query(cypher)
+        except Exception as exc:  # noqa: BLE001 - only the already-indexed case is benign
+            if "already indexed" not in str(exc).lower():
+                raise
+
+    async def ensure_entity_name_index(self) -> None:
+        """Create the FalkorDB range index over ``MnemozineEntity.name_key``.
+
+        ``name_key = toLower(canonical_name)`` is the case-insensitive identity key
+        the resolve-or-create-by-name seam
+        (:meth:`mnemozine.storage.backend.GraphitiStorageBackend.resolve_or_create_entity`)
+        matches on, so an extracted entity reuses the existing node for that
+        normalized name instead of minting a duplicate. A range index makes that
+        lookup index-backed at store scale.
+
+        Idempotency (FR-MNT-5: re-runnable): FalkorDB's ``CREATE INDEX`` raises when
+        the attribute is already indexed; we swallow exactly that
+        (``already indexed``) so the call is safe to run on every connect — it is
+        invoked from :meth:`_build_indices` so a *fresh* store gets the index
+        without waiting for the v2 migrate. The label is a constant, never user
+        text, so the f-string interpolation is safe.
+        """
+
+        cypher = f"CREATE INDEX FOR (e:{ENTITY_LABEL}) ON (e.name_key)"
         try:
             await self.execute_query(cypher)
         except Exception as exc:  # noqa: BLE001 - only the already-indexed case is benign
