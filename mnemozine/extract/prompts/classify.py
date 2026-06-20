@@ -105,7 +105,11 @@ def build_classify_prompt(
     lines.append(statement.strip())
     lines.append("")
     lines.append(
-        'Return the JSON object. Use scope "project" only if the statement is '
-        f'specific to project "{project_id}"; otherwise use "global".'
+        'Return the JSON object. Default to scope "project": use it whenever the '
+        f'statement is specific to this codebase/project "{project_id}" — its '
+        "code, architecture, build process, file/module layout, endpoints, pinned "
+        "versions, bugs/gotchas, or a decision made for it. Use scope \"global\" "
+        "ONLY for a genuinely cross-project operator preference, convention, rule, "
+        "style, or floated idea that would read the same in any unrelated project."
     )
     return "\n".join(lines)

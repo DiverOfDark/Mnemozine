@@ -342,6 +342,21 @@ class MaintenanceSettings(BaseModel):
         default="0 3 * * *",
         description="Cron expression for the scheduled maintenance run (APScheduler).",
     )
+    # Categories that the deterministic provenance re-scope pass
+    # (ProvenanceRescopeJob, `rescope-global`) leaves at global. These are the
+    # genuinely cross-project kinds (operator preferences/conventions/rules and
+    # floated ideas that stay true in ANY project); every OTHER active global
+    # memo whose provenance resolves to exactly one source project is re-scoped
+    # global -> project:<its own source project> (no-leak; never an unrelated
+    # project). Compared case-insensitively against the normalized category.
+    rescope_keep_global_categories: list[str] = Field(
+        default_factory=lambda: ["preference", "convention", "rule", "idea"],
+        description=(
+            "Categories kept at global by the `rescope-global` pass (the "
+            "cross-project kinds); all other provenance-resolvable global memos "
+            "are re-scoped to their own source project."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +503,23 @@ class RetrievalSettings(BaseModel):
     knn_overfetch_cap: int = Field(
         default=512,
         description="Absolute cap on the over-fetched KNN K, bounding the index scan (FR-RET-2).",
+    )
+    # FR-RET-2 starvation-fallback gate. FalkorDB's `db.idx.vector.queryNodes`
+    # filters by scope/tier/entity *after* the KNN cut, so a SMALL scope buried in
+    # a large out-of-scope corpus can be starved (every nearest neighbour is
+    # out-of-scope and post-filtered away, yielding < top_k rows). When that
+    # happens scoped_query falls back to the scope-PRE-filtered ranking (which
+    # cannot starve), but only if the in-scope active candidate count is at or
+    # below this bound — so a *huge* scope can never trigger a full embedding
+    # scan and the flat-search-space Goal-5 is preserved for large scopes.
+    scope_scan_max: int = Field(
+        default=4000,
+        description=(
+            "Max in-scope active candidate count under which scoped_query may fall "
+            "back to the scope-pre-filtered ranking when the KNN post-filter starves "
+            "(< top_k rows). Above this bound the pure-KNN result is kept so a huge "
+            "scope never full-scans embeddings (FR-RET-2)."
+        ),
     )
 
 

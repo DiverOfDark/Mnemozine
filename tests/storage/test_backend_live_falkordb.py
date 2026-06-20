@@ -244,6 +244,52 @@ async def test_scoped_query_entity_filter_via_index(
     assert "northeast" not in contents  # filtered: no shared entity
 
 
+async def test_scoped_query_small_scope_recall_via_starvation_fallback(
+    live_backend: GraphitiStorageBackend,
+) -> None:
+    """FR-RET-2 starvation fallback against the REAL vector index.
+
+    A small ``project:p1`` scope buried under a larger, NEARER out-of-scope corpus
+    is starved by FalkorDB's post-KNN scope filter (the nearest neighbours are all
+    out-of-scope and post-filtered away). With the over-fetch K bounded tight (so
+    the out-of-scope corpus crowds the KNN cut), pure KNN would return []; the
+    scope-pre-filtered fallback (gated by the cheap in-scope COUNT) must still
+    recall the in-scope memory at the default top_k.
+    """
+
+    from mnemozine.config import RetrievalSettings
+
+    # Bound the over-fetch so $k == 2: the two nearest (out-of-scope) neighbours
+    # fill the KNN cut and the in-scope match is post-filtered to nothing.
+    live_backend._retrieval = RetrievalSettings(  # type: ignore[attr-defined]
+        knn_overfetch_factor=1, knn_overfetch_cap=2, scope_scan_max=4000
+    )
+    # Distinct near vectors for the out-of-scope noise (so they aren't deduped),
+    # both strictly nearer to the query "north" ([1,0,0,0]) than the in-scope vec.
+    _VECTORS["noise_near_a"] = [1.0, 0.0, 0.0, 0.0]
+    _VECTORS["noise_near_b"] = [0.9, 0.4358899, 0.0, 0.0]
+    _VECTORS["scope_far"] = [0.0, 1.0, 0.0, 0.0]
+    try:
+        await live_backend.upsert_memory(
+            _memory("noise_near_a", scope=Scope.project("other"))
+        )
+        await live_backend.upsert_memory(
+            _memory("noise_near_b", scope=Scope.project("other"))
+        )
+        await live_backend.upsert_memory(
+            _memory("scope_far", scope=Scope.project("p1"))
+        )
+
+        hits = await live_backend.scoped_query(
+            "north", [Scope.project("p1")], top_k=5
+        )
+        # Pure KNN starves to []; the gated fallback recalls the in-scope memory.
+        assert [h.memory.content for h in hits] == ["scope_far"]
+    finally:
+        for key in ("noise_near_a", "noise_near_b", "scope_far"):
+            _VECTORS.pop(key, None)
+
+
 async def test_scoped_query_emits_index_backed_knn_cypher(
     live_backend: GraphitiStorageBackend,
 ) -> None:

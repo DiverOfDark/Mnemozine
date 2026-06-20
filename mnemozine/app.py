@@ -635,6 +635,55 @@ def _maintenance_reclassify_cmd(
     _echo_report(report)
 
 
+@maintenance_app.command("rescope-global")
+def _maintenance_rescope_global_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only list the global memos that would move to a project; apply nothing.",
+    ),
+) -> None:
+    """Deterministically re-scope mis-globalized project memos from provenance (R1).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_rescope_global`. Streams the
+    active GLOBAL memos and, for each whose category is NOT a cross-project kind
+    (preference/convention/rule/idea), parses the source project from its
+    ``provenance.raw_path`` (subagent/workflow/worktree paths roll up to the parent
+    project) and moves it global -> project:<its own source project> — no LLM,
+    deterministic. A missing/ambiguous path stays global. Idempotent (a moved memo
+    leaves the global set). Use ``--dry-run`` to preview.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_rescope_global
+
+    report = asyncio.run(_run_rescope_global(dry_run=dry_run))
+    _echo_report(report)
+
+
+@maintenance_app.command("dedup-memories")
+def _maintenance_dedup_memories_cmd(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only list the exact-duplicate groups that would collapse; apply nothing.",
+    ),
+) -> None:
+    """Collapse exact-duplicate active memos to one survivor (supersede the rest).
+
+    Mirrors :func:`mnemozine.maintenance.runner._run_dedup_memories`. Streams the
+    active hot memos, buckets them by ``(normalized content, scope)``, and for each
+    cluster of >=2 keeps one deterministic survivor and supersedes the rest via
+    ``close_validity_window`` — retained, never deleted; unique content untouched.
+    Idempotent (a superseded copy leaves the active set). Use ``--dry-run`` to
+    preview.
+    """
+
+    from mnemozine.maintenance.runner import _echo_report, _run_dedup_memories
+
+    report = asyncio.run(_run_dedup_memories(dry_run=dry_run))
+    _echo_report(report)
+
+
 @maintenance_app.command("re-extract")
 def _maintenance_re_extract_cmd(
     scope: str | None = typer.Option(

@@ -405,26 +405,36 @@ class FakeFalkorDriver:
     def _vector_knn(self, c: str, p: dict[str, Any]) -> _Result:
         """Interpret the index-backed KNN scoped_query against the dict store.
 
-        Applies the same scope/validity/tier/entity WHERE filters the backend
-        emits (reusing :meth:`_memory_matches`), ranks by cosine distance to the
-        query vector ``$qv``, and returns ``[node, distance]`` rows ascending —
-        the shape the backend converts back to a cosine-similarity score. Honors
-        the over-fetch ``LIMIT $top_k`` so behaviour matches FalkorDB's post-KNN
-        cut. (The over-fetch ``$k`` is irrelevant in the fake since it ranks the
-        full candidate set anyway — exactly the ordering the index would yield.)
+        Mirrors real FalkorDB's ``db.idx.vector.queryNodes`` ORDERING: the KNN cut
+        of the ``$k`` nearest neighbours by raw cosine distance happens FIRST, over
+        ALL indexed memories, and only THEN is the scope/validity/tier/entity WHERE
+        applied as a post-filter (reusing :meth:`_memory_matches`); the remaining
+        rows are returned ``[node, distance]`` ascending and capped by the
+        over-fetch ``LIMIT $top_k``. This KNN-then-post-filter ordering is what lets
+        a small in-scope set be *starved* by nearer out-of-scope neighbours — the
+        exact condition the backend's starvation-fallback guard repairs — so the
+        fake must honor ``$k`` BEFORE the WHERE (it previously pre-filtered, which
+        could never reproduce starvation).
         """
 
         qv = list(p.get("qv") or [])
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for m in self.memories.values():
-            if not self._memory_matches(c, m, p):
-                continue
-            distance = 1.0 - cosine_similarity(qv, list(m.get("embedding") or []))
-            scored.append((distance, m))
-        scored.sort(key=lambda t: t[0])
+        # 1) KNN cut over the FULL corpus by raw cosine distance, honoring $k.
+        ranked: list[tuple[float, dict[str, Any]]] = sorted(
+            (
+                (1.0 - cosine_similarity(qv, list(m.get("embedding") or [])), m)
+                for m in self.memories.values()
+            ),
+            key=lambda t: t[0],
+        )
+        k = p.get("k")
+        if k is not None:
+            ranked = ranked[: int(k)]
+        # 2) Scope/validity/tier/entity post-filter on the KNN-selected rows.
+        scored = [(d, m) for d, m in ranked if self._memory_matches(c, m, p)]
+        # 3) Over-fetch LIMIT $top_k.
         top_k = p.get("top_k")
         if top_k is not None:
-            scored = scored[:top_k]
+            scored = scored[: int(top_k)]
         return _Result([[m, distance] for distance, m in scored])
 
     @staticmethod

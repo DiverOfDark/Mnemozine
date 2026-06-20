@@ -600,10 +600,15 @@ class GraphitiStorageBackend:
         still yields the true ``top_k`` nearest *within* the composed scope rather
         than being starved by nearer out-of-scope neighbours.
 
-        Falls back to a scope-pre-filtered scan + in-process cosine **only** when
-        the vector index is genuinely absent (e.g. a freshly-created graph before
-        ``ensure_vector_index``), so the path degrades gracefully instead of
-        raising.
+        Falls back to a scope-pre-filtered scan + in-process cosine in two cases:
+        (1) the vector index is genuinely absent (e.g. a freshly-created graph
+        before ``ensure_vector_index``), so the path degrades gracefully instead of
+        raising; and (2) the index-backed KNN *starves* — its post-filter yields
+        fewer than ``top_k`` rows — AND the in-scope active candidate count is at or
+        below ``retrieval.scope_scan_max``, so a small scope buried in a large
+        out-of-scope corpus still recalls its matches. Case (2) is gated by a cheap
+        embedding-free ``COUNT`` so a *huge* scope never triggers a full embedding
+        scan and keeps pure-KNN behaviour.
         """
 
         scope_strs = self._composed_scope_strs(scopes, compose_ancestors=compose_ancestors)
@@ -643,7 +648,42 @@ class GraphitiStorageBackend:
             # the cosine *similarity* RetrievedMemory.score carries everywhere else.
             distance = float(row[1])
             scored.append(RetrievedMemory(memory=mem, score=1.0 - distance))
+
+        # STARVATION FALLBACK (FR-RET-2). `queryNodes` post-filters the KNN cut by
+        # scope/tier/entity, so a SMALL scope buried in a large out-of-scope corpus
+        # can be starved: every nearest neighbour is out-of-scope and filtered away,
+        # leaving < top_k rows even though matching in-scope memories exist. When
+        # that happens, re-run via the scope-PRE-filtered path (it filters BEFORE
+        # ranking and therefore cannot starve) — but only if the in-scope active
+        # candidate count is small enough that a full embedding scan is cheap, so a
+        # huge scope can never trigger one (the large/normal-scope KNN path is left
+        # untouched). The COUNT below transfers NO embeddings.
+        if len(scored) >= top_k:
+            return scored
+        in_scope = await self._count_in_scope(where, params)
+        if in_scope <= self._retrieval.scope_scan_max:
+            return await self._scoped_query_fallback(
+                query_vec, where, params, top_k=top_k
+            )
         return scored
+
+    async def _count_in_scope(
+        self, where: list[str], params: dict[str, Any]
+    ) -> int:
+        """Cheap COUNT of active in-scope candidates (NO embeddings transferred).
+
+        Reuses the same scope/validity/tier/entity ``where``/``params`` the KNN
+        path built (via :meth:`_scoped_filters`) so the gate counts EXACTLY the
+        candidate set the scope-pre-filtered fallback would rank — the gate is one
+        index-/scan-cheap aggregate, not an embedding read.
+        """
+
+        cypher = (
+            f"MATCH (m:{MEMORY_LABEL}) WHERE {' AND '.join(where)} "
+            "RETURN count(m) AS n"
+        )
+        rows = await self._query(cypher, **params)
+        return int(rows[0][0]) if rows and rows[0] and rows[0][0] is not None else 0
 
     async def _scoped_query_fallback(
         self,

@@ -46,8 +46,10 @@ from mnemozine.maintenance.consolidation import ConsolidationJob
 from mnemozine.maintenance.decay import DecayJob
 from mnemozine.maintenance.entity_dedup import EntityDedupJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.memory_dedup import MemoryDedupJob
 from mnemozine.maintenance.mentions import MentionsJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob
+from mnemozine.maintenance.provenance_rescope import ProvenanceRescopeJob
 from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
 from mnemozine.maintenance.relation_norm import RelationNormJob
 from mnemozine.schema.models import Scope
@@ -705,6 +707,156 @@ def _cmd_reclassify(
     """
 
     report = asyncio.run(_run_reclassify(scope=scope))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Provenance re-scope (mnemozine-maintenance rescope-global) — deterministic, no LLM
+# ---------------------------------------------------------------------------
+
+
+async def _run_rescope_global(*, dry_run: bool = False) -> MaintenanceReport:
+    """Build the wired :class:`ProvenanceRescopeJob` and re-scope global memos (R1).
+
+    Deterministically moves mis-globalized project memos to their own source
+    project (parsed from ``provenance.raw_path``) — NO LLM, NO embeddings, NO raw
+    transcript text — so it is safe to run over the whole global set on the
+    CPU-only Ollama. When ``dry_run`` is set, the job's resolver is reused to list
+    the would-move memos (old -> new scope) WITHOUT writing anything. Lazily
+    imports the composition root to keep tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    job = ProvenanceRescopeJob(storage, settings=settings)
+    try:
+        if dry_run:
+            report = MaintenanceReport(job_name=job.name)
+            would_move = 0
+            async for memory in storage.iter_memories(
+                scope=Scope.global_(), active_only=True
+            ):
+                if memory.category in job._keep_global:  # noqa: SLF001 - read-only preview
+                    continue
+                target = job._source_project_scope(memory)  # noqa: SLF001 - read-only preview
+                if target is None:
+                    continue
+                would_move += 1
+                prefix = memory.content[:60].replace("\n", " ")
+                report.notes.append(
+                    f"would re-scope {memory.id}: {prefix!r} "
+                    f"global -> {target.as_str()}"
+                )
+            report.notes.append(
+                f"dry-run: {would_move} global memo(s) would move to their source "
+                "project (no writes)"
+            )
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("rescope-global")
+def _cmd_rescope_global(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only list the global memos that would move to a project; apply nothing.",
+    ),
+) -> None:
+    """Deterministically re-scope mis-globalized project memos from provenance (R1).
+
+    Streams the active GLOBAL memos and, for each whose category is NOT a
+    cross-project kind (preference/convention/rule/idea), parses the source
+    project from its ``provenance.raw_path`` (subagent/workflow/worktree
+    transcripts roll up to the parent project) and moves it global ->
+    project:<its own source project> — no LLM, deterministic. A memo with a
+    missing/ambiguous/unparseable path stays global. Idempotent: a moved memo
+    leaves the global set, so a re-run is a no-op. Use ``--dry-run`` to preview.
+    """
+
+    report = asyncio.run(_run_rescope_global(dry_run=dry_run))
+    _echo_report(report)
+
+
+# ---------------------------------------------------------------------------
+# Memory dedup (mnemozine-maintenance dedup-memories) — deterministic, no LLM
+# ---------------------------------------------------------------------------
+
+
+async def _run_dedup_memories(*, dry_run: bool = False) -> MaintenanceReport:
+    """Build the wired :class:`MemoryDedupJob` and collapse exact-duplicate memos.
+
+    Deterministically collapses BYTE-FOR-BYTE duplicate active memos in the same
+    scope to ONE survivor, superseding (never deleting) the rest — NO LLM, NO
+    embeddings. When ``dry_run`` is set, the job's bucketing is reused to list the
+    would-collapse groups WITHOUT closing any validity window. Lazily imports the
+    composition root to keep tests offline.
+    """
+
+    from mnemozine.app import Container  # local import: avoid cycle / keep tests offline
+    from mnemozine.maintenance.memory_dedup import _dedup_key, _survivor_sort_key
+    from mnemozine.schema.models import MemoryUnit, Tier
+
+    container = Container.from_env()
+    settings = container.settings
+    storage = await container.build_storage()
+    job = MemoryDedupJob(storage, settings=settings)
+    try:
+        if dry_run:
+            report = MaintenanceReport(job_name=job.name)
+            buckets: dict[tuple[str, str], list[MemoryUnit]] = {}
+            async for memory in storage.iter_memories(
+                active_only=True, tier=Tier.HOT
+            ):
+                buckets.setdefault(_dedup_key(memory), []).append(memory)
+            would_collapse = 0
+            for key in sorted(buckets):
+                bucket = buckets[key]
+                if len(bucket) < 2:
+                    continue
+                survivor = min(bucket, key=_survivor_sort_key)
+                content_key, scope_str = key
+                prefix = content_key[:60].replace("\n", " ")
+                report.notes.append(
+                    f"would collapse {prefix!r} @ {scope_str}: keep {survivor.id}, "
+                    f"supersede {len(bucket) - 1} duplicate(s)"
+                )
+                would_collapse += 1
+            report.notes.append(
+                f"dry-run: {would_collapse} exact-duplicate group(s) would collapse "
+                "(no writes)"
+            )
+            return report
+        return await job.run()
+    finally:
+        await container.close()
+
+
+@maintenance_cli.command("dedup-memories")
+def _cmd_dedup_memories(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Only list the exact-duplicate groups that would collapse; apply nothing.",
+    ),
+) -> None:
+    """Collapse exact-duplicate active memos to one survivor (supersede the rest).
+
+    Streams the active hot memos, buckets them by ``(normalized content, scope)``,
+    and for each cluster of >=2 keeps one deterministic survivor (highest
+    confidence, then earliest valid_from, then smallest id) and supersedes the
+    other copies via ``close_validity_window`` — retained, never deleted; unique
+    content is untouched. Deterministic and embedding-free. Idempotent: a
+    superseded copy leaves the active set, so a re-run finds nothing. Use
+    ``--dry-run`` to preview the groups first.
+    """
+
+    report = asyncio.run(_run_dedup_memories(dry_run=dry_run))
     _echo_report(report)
 
 

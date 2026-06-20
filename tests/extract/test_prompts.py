@@ -61,6 +61,50 @@ def test_both_prompts_embed_the_shared_rubric() -> None:
     assert snippet in EXTRACT_SYSTEM_PROMPT
 
 
+def test_rubric_scopes_codebase_specific_memories_to_project() -> None:
+    # classifier_prompt fix: the "project" definition must explicitly enumerate
+    # this repo's code/architecture/build/layout/endpoints/pinned-versions/bugs/
+    # decisions so codebase-specific memories are scoped "project", not "global".
+    rubric = TAXONOMY_RUBRIC.lower()
+    for keyword in (
+        "code",
+        "architecture",
+        "build",
+        "layout",
+        "endpoints",
+        "pinned version",
+        "bug",
+        "decision",
+    ):
+        assert keyword in rubric, f"project rubric missing '{keyword}'"
+    # The rubric must signal that "project" is the default / broad scope.
+    assert "default" in rubric
+    # A concrete codebase-specific example that should classify as project.
+    assert "recall(query, scope?)" in TAXONOMY_RUBRIC
+    assert "BASELINE migration" in TAXONOMY_RUBRIC
+
+
+def test_rubric_reserves_global_for_cross_project_only() -> None:
+    # The "global" definition must be restricted to genuinely cross-project
+    # operator preferences/conventions/rules/styles and floated ideas.
+    rubric = TAXONOMY_RUBRIC.lower()
+    assert "cross-project" in rubric
+    for keyword in ("preference", "convention", "rule", "style", "idea"):
+        assert keyword in rubric, f"global rubric missing '{keyword}'"
+    # Bidirectional examples: global examples remain present.
+    assert "thiserror over anyhow" in TAXONOMY_RUBRIC
+    assert "rebased pull requests" in TAXONOMY_RUBRIC
+
+
+def test_classify_user_prompt_defaults_to_project() -> None:
+    # The trailing instruction now defaults to "project" for codebase-specific
+    # statements and reserves "global" for cross-project operator truths.
+    prompt = build_classify_prompt("anything", project="rust-cli")
+    lowered = prompt.lower()
+    assert 'default to scope "project"' in lowered
+    assert "cross-project" in lowered
+
+
 def test_system_prompts_state_the_controlled_scope_decision() -> None:
     # FR-EXT-3: scope decided at extraction time as a controlled two-value decision.
     for prompt in (CLASSIFY_SYSTEM_PROMPT, EXTRACT_SYSTEM_PROMPT):

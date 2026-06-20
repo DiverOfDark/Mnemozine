@@ -57,24 +57,48 @@ are independent, do not collapse them into one label:
 
 1. scope  (CONTROLLED — exactly one of "global" or "project")
    This is the most important call. It decides where the memory lives and whether
-   it can ever leak across projects.
-   - "global"  — a DURABLE, CROSS-PROJECT truth about how the operator works
-     (tools, libraries, styles, conventions they favor or reject), OR a candidate
-     idea/concept they floated. True regardless of which project they are in.
+   it can ever leak across projects. The DEFAULT is "project": choose "global"
+   ONLY when the memory is a genuinely cross-project truth about the operator.
+   - "global"  — RESERVED for genuinely CROSS-PROJECT operator truths that remain
+     true in ANY project: their personal preferences, conventions, rules, and
+     coding/working styles (tools, libraries, patterns they favor or reject), OR
+     a candidate idea/concept/project they floated that is not tied to one repo.
+     If you can imagine the SAME statement applying unchanged in an unrelated
+     codebase, it is "global".
        e.g. "Prefers thiserror over anyhow for Rust error handling."
             "Likes small, frequently-rebased pull requests."
+            "Always runs the formatter before committing."
             "Idea: a CLI that diffs two SQL schemas and emits a migration."
-   - "project" — a fact SPECIFIC TO ONE PROJECT that must NOT leak into other
-     projects: pinned versions, this repo's layout, this service's endpoints, a
-     decision made for this codebase only.
+   - "project" — anything SPECIFIC TO THIS CODEBASE/PROJECT that must NOT leak
+     into other projects. This is BROAD and is the DEFAULT. It covers, for THIS
+     repo only:
+       * this repo's CODE and ARCHITECTURE (modules, classes, functions, data
+         model, how components fit together);
+       * its FILE/MODULE LAYOUT and where things live;
+       * its BUILD/RUN process, commands, tooling, and CI for this project;
+       * its ENDPOINTS, ports, service names, and external interfaces;
+       * PINNED VERSIONS and dependencies chosen for this codebase;
+       * BUGS, GOTCHAS, quirks, and workarounds in this repo;
+       * DECISIONS made for this codebase (design/trade-off choices specific here).
        e.g. "This project pins tokio 1.38."
             "The auth service runs on port 8081 in this repo."
+            "The MCP server exposes recall(query, scope?) for memory lookups."
+            "A BASELINE migration moves the schema to version 1 on first run."
+            "Embeddings are stored on MnemozineMemory nodes in FalkorDB."
+            "Run `make build` before the integration tests in this repo."
 
    CRITICAL DISAMBIGUATION — global vs project (the make-or-break decision):
-     - If the statement would still be true and useful in a DIFFERENT project on
-       the same topic, scope it "global".
-     - If it is only true because of THIS specific project/repo (a pinned
-       version, a local decision, this repo's structure), scope it "project".
+     - If the statement is about THIS codebase/project — its code, architecture,
+       build, layout, endpoints, pinned versions, bugs, or a decision made for it
+       — scope it "project", even if the topic (e.g. "tokio", "migrations") is
+       generic. It is the SPECIFICITY TO THIS REPO, not the topic, that decides.
+     - Scope "global" ONLY for a cross-project operator preference, convention,
+       rule, style, or floated idea that would read the SAME in an unrelated repo.
+     - Bidirectional check:
+         "The MCP server exposes recall(query, scope?) ..."  -> project
+         "A BASELINE migration to version 1 ..."             -> project
+         "Prefers thiserror over anyhow"                     -> global
+         "Likes small rebased PRs"                           -> global
      - When genuinely torn, prefer "project" + a LOWER confidence: a wrongly-
        global memory leaks across every project (the worst failure mode), whereas
        a wrongly-scoped project memory only fails to propagate.

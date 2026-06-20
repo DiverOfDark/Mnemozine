@@ -346,6 +346,165 @@ async def test_scoped_query_compose_ancestors_false_matches_exact_only() -> None
 
 
 # ---------------------------------------------------------------------------
+# FR-RET-2 starvation fallback: when the index-backed KNN post-filter yields
+# < top_k rows (a small scope buried in a large out-of-scope corpus), scoped_query
+# re-runs the scope-PRE-filtered ranking (gated by a cheap in-scope COUNT against
+# retrieval.scope_scan_max) so the small scope still recalls its matches.
+# ---------------------------------------------------------------------------
+
+
+class _KeyedEmbeddingProvider:
+    """Content-keyed embeddings so the KNN ordering is exactly controllable.
+
+    Unlike the hash-derived FakeEmbeddingProvider, this maps known content to
+    hand-picked unit vectors so a test can make the in-scope set strictly FARTHER
+    from the query than a large out-of-scope corpus — the precise condition that
+    starves FalkorDB's post-KNN scope filter.
+    """
+
+    def __init__(self, vectors: dict[str, list[float]], dim: int = 4) -> None:
+        self._vectors = vectors
+        self._dim = dim
+        self._default = [0.0] * (dim - 1) + [1.0]
+
+    @property
+    def dimensions(self) -> int:
+        return self._dim
+
+    async def embed(self, text: str) -> list[float]:
+        return list(self._vectors.get(text, self._default))
+
+    async def embed_batch(self, texts):  # type: ignore[no-untyped-def]
+        return [await self.embed(t) for t in texts]
+
+
+def _starvation_store(
+    *, scope_scan_max: int
+) -> tuple[GraphitiStorageBackend, dict[str, list[float]]]:
+    """A backend whose KNN $k is small enough that a large out-of-scope corpus
+    crowds out the small in-scope set on the raw nearest-neighbour cut.
+
+    factor=1 / cap=2 -> $k == min(max(top_k, top_k), 2) == 2 for any top_k>=2, so
+    the two nearest neighbours (which we make out-of-scope) fill the KNN cut and
+    the in-scope match is post-filtered to nothing — starvation, by construction.
+    """
+
+    vectors: dict[str, list[float]] = {
+        "query-vec": [1.0, 0.0, 0.0, 0.0],
+        # Out-of-scope memos are the two NEAREST to the query (and DISTINCT vectors
+        # so they aren't deduped into one), crowding out the small in-scope set.
+        "noise-a": [1.0, 0.0, 0.0, 0.0],
+        "noise-b": [0.9, 0.436, 0.0, 0.0],
+        # The in-scope match is orthogonal (farthest) so it loses the KNN cut.
+        "in-scope match": [0.0, 1.0, 0.0, 0.0],
+    }
+    store = GraphitiStorageBackend(
+        client=FakeGraphitiClient(),  # type: ignore[arg-type]
+        embeddings=_KeyedEmbeddingProvider(vectors),
+        # Raise dedup threshold so the two identical-vector noise memos are stored
+        # as distinct ADDs rather than reinforced into one.
+        maintenance=MaintenanceSettings(dedup_equivalence_threshold=0.999999),
+        retrieval=RetrievalSettings(
+            knn_overfetch_factor=1,
+            knn_overfetch_cap=2,
+            scope_scan_max=scope_scan_max,
+        ),
+    )
+    return store, vectors
+
+
+async def test_scoped_query_starvation_falls_back_to_scope_prefiltered() -> None:
+    store, _ = _starvation_store(scope_scan_max=4000)
+    # Large out-of-scope corpus sitting exactly on the query vector (the nearest
+    # neighbours), all in project:other.
+    for i in range(2):
+        await store.upsert_memory(
+            _memory(
+                content=f"noise-{'ab'[i]}",
+                scope=Scope.project("other"),
+                category="project_fact",
+                entities=["e"],
+            )
+        )
+    # The lone in-scope match is FARTHER, so the raw KNN $k=2 cut never includes it.
+    await store.upsert_memory(
+        _memory(
+            content="in-scope match",
+            scope=Scope.project("aipack"),
+            category="project_fact",
+            entities=["e"],
+        )
+    )
+    hits = await store.scoped_query(
+        "query-vec", [Scope.project("aipack")], entities=["e"], top_k=5
+    )
+    # Pure KNN would starve to []; the fallback recovers the in-scope match.
+    assert [h.memory.content for h in hits] == ["in-scope match"]
+
+
+async def test_scoped_query_starvation_fallback_gated_by_scope_scan_max() -> None:
+    # scope_scan_max=0 -> the in-scope COUNT (1) exceeds the bound, so the guard
+    # must NOT full-scan: the starved (empty) KNN result is returned unchanged.
+    store, _ = _starvation_store(scope_scan_max=0)
+    for i in range(2):
+        await store.upsert_memory(
+            _memory(
+                content=f"noise-{'ab'[i]}",
+                scope=Scope.project("other"),
+                category="project_fact",
+                entities=["e"],
+            )
+        )
+    await store.upsert_memory(
+        _memory(
+            content="in-scope match",
+            scope=Scope.project("aipack"),
+            category="project_fact",
+            entities=["e"],
+        )
+    )
+    hits = await store.scoped_query(
+        "query-vec", [Scope.project("aipack")], entities=["e"], top_k=5
+    )
+    # Above the scan bound, a huge scope keeps pure-KNN behaviour (no full scan).
+    assert hits == []
+
+
+async def test_scoped_query_no_fallback_when_knn_already_satisfies_top_k() -> None:
+    # When the KNN already returns >= top_k in-scope rows, the COUNT/fallback path
+    # is never taken — spy on the driver to assert NO embedding-free COUNT fires.
+    store, _ = _starvation_store(scope_scan_max=4000)
+    # Two in-scope memos near the query vector (DISTINCT so they don't dedup)
+    # fill top_k=2 directly off the KNN cut.
+    store._embeddings._vectors["a"] = [1.0, 0.0, 0.0, 0.0]  # type: ignore[attr-defined]
+    store._embeddings._vectors["b"] = [0.9, 0.436, 0.0, 0.0]  # type: ignore[attr-defined]
+    for content in ("a", "b"):
+        await store.upsert_memory(
+            _memory(
+                content=content,
+                scope=Scope.project("aipack"),
+                category="project_fact",
+                entities=["e"],
+            )
+        )
+    driver = store._client.driver  # type: ignore[attr-defined]
+    real = driver.execute_query
+    counts: list[str] = []
+
+    async def _spy(cypher: str, **params):  # type: ignore[no-untyped-def]
+        if "RETURN count(m) AS n" in cypher and "db.idx" not in cypher:
+            counts.append(cypher)
+        return await real(cypher, **params)
+
+    driver.execute_query = _spy  # type: ignore[method-assign]
+    hits = await store.scoped_query(
+        "query-vec", [Scope.project("aipack")], entities=["e"], top_k=2
+    )
+    assert {h.memory.content for h in hits} == {"a", "b"}
+    assert counts == []  # KNN satisfied top_k; no starvation COUNT was issued.
+
+
+# ---------------------------------------------------------------------------
 # F3 — config-driven KNN over-fetch (retrieval.knn_overfetch_factor / _cap)
 # ---------------------------------------------------------------------------
 

@@ -144,6 +144,58 @@ async def test_classify_passes_project_and_context_to_prompt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classify_codebase_specific_statement_is_project() -> None:
+    """classifier_prompt: a statement about THIS codebase classifies scope='project'.
+
+    The model (fake) keys off the codebase-specific wording the tightened rubric
+    asks it to scope "project"; Python then derives project:<context.project>.
+    """
+
+    def responder(prompt: str, system: str | None) -> dict[str, Any]:
+        # The tightened rubric must reach the model as the system prompt.
+        assert system is not None and "project" in system.lower()
+        return {
+            "scope": "project",
+            "category": "fact",
+            "cross_ref": False,
+            "entities": ["mcp", "recall"],
+            "confidence": 0.85,
+        }
+
+    extractor, _ = make_extractor(json_responder=responder)
+    ctx = RetrievalContext(project="mnemozine")
+    result = await extractor.classify(
+        "The MCP server exposes recall(query, scope?) for memory lookups.", ctx
+    )
+
+    assert result.scope_decision is ScopeDecision.PROJECT
+    assert result.scope == Scope.project("mnemozine")
+
+
+@pytest.mark.asyncio
+async def test_classify_cross_project_preference_is_global() -> None:
+    """classifier_prompt: a genuinely cross-project preference classifies scope='global'."""
+
+    def responder(prompt: str, system: str | None) -> dict[str, Any]:
+        return {
+            "scope": "global",
+            "category": "preference",
+            "cross_ref": False,
+            "entities": ["rust", "error-handling"],
+            "confidence": 0.9,
+        }
+
+    extractor, _ = make_extractor(json_responder=responder)
+    ctx = RetrievalContext(project="mnemozine")
+    result = await extractor.classify(
+        "Prefers thiserror over anyhow for Rust error handling.", ctx
+    )
+
+    assert result.scope_decision is ScopeDecision.GLOBAL
+    assert result.scope.is_global
+
+
+@pytest.mark.asyncio
 async def test_classify_routing_is_deterministic_by_prompt() -> None:
     """FR-EXT-3/R1: classify is deterministic offline via per-prompt routing."""
 

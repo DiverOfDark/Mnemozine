@@ -47,6 +47,18 @@ module's concrete code):
   re-extract over the retained raw tier (``re-extract``) or re-tag stored
   memories from their content+provenance (``reclassify``). Operator-triggered, not
   in the default scheduled set.
+* :class:`~mnemozine.maintenance.provenance_rescope.ProvenanceRescopeJob` — a
+  DETERMINISTIC (no-LLM) offline pass that repairs mis-globalized project memos:
+  it streams the active global memos and, for each whose category is not a
+  cross-project kind, parses the source project from ``provenance.raw_path`` and
+  re-scopes it global -> project:<its own source project> via ``reclassify_memory``
+  (the ``rescope-global`` subcommand). Operator-triggered, not in the default set.
+* :class:`~mnemozine.maintenance.memory_dedup.MemoryDedupJob` — a DETERMINISTIC
+  (no-LLM) offline pass that collapses BYTE-FOR-BYTE duplicate active memos: it
+  streams the active hot memos, buckets them by ``(normalized content, scope)``,
+  and for each cluster of >=2 keeps one deterministic survivor and supersedes the
+  rest via ``close_validity_window`` (retained, never deleted) — the
+  ``dedup-memories`` subcommand. Operator-triggered, not in the default set.
 * :class:`~mnemozine.maintenance.migrate_index.MigrateIndexJob` — OQ3 vector
   index/re-embed migration on an embedding-dimension change (the
   ``mnemozine-maintenance migrate-index`` subcommand); not in the default
@@ -73,8 +85,10 @@ from mnemozine.maintenance.decay import DecayJob, decay_score, rank_by_decay
 from mnemozine.maintenance.decision import WriteDecider, WriteDecisionConfig
 from mnemozine.maintenance.entity_dedup import DEDUP_MODES, EntityDedupJob
 from mnemozine.maintenance.entity_resolution import EntityResolutionJob
+from mnemozine.maintenance.memory_dedup import MemoryDedupJob
 from mnemozine.maintenance.mentions import MentionsJob
 from mnemozine.maintenance.migrate_index import MigrateIndexJob, needs_migration
+from mnemozine.maintenance.provenance_rescope import ProvenanceRescopeJob
 from mnemozine.maintenance.reclassify import ReclassifyJob, ReExtractJob
 from mnemozine.maintenance.relation_norm import (
     RELATION_SYNONYMS,
@@ -99,8 +113,10 @@ __all__ = [
     "EntityDedupJob",
     "EntityResolutionJob",
     "MaintenanceRunner",
+    "MemoryDedupJob",
     "MentionsJob",
     "MigrateIndexJob",
+    "ProvenanceRescopeJob",
     "ReExtractJob",
     "ReclassifyJob",
     "RelationNormJob",
