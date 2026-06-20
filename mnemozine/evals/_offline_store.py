@@ -424,6 +424,17 @@ class OfflineStorage:
                 continue
             if active_only and not m.is_active:
                 continue
+            if valid_before is not None and m.valid_from >= valid_before:
+                continue
+            if unused_since is not None:
+                # Anchor a never-accessed (None last_accessed) memory on valid_from
+                # (ingestion time), matching the backend's coalesce + decay_score's
+                # recency anchor: a never-recalled memory is "unused since it was
+                # ingested", NOT "unused since forever". Keeps the two in-memory
+                # fakes behaviourally identical with the FalkorDB backend.
+                anchor = m.last_accessed or m.valid_from
+                if anchor >= unused_since:
+                    continue
             yield m
 
     async def iter_entities(self) -> AsyncIterator[Entity]:

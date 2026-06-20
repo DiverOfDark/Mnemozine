@@ -486,6 +486,56 @@ async def test_iter_memories_filters() -> None:
     assert scoped == {p.id}
 
 
+async def test_iter_memories_unused_since_anchors_null_last_accessed_on_valid_from() -> None:
+    """``unused_since`` anchors a null ``last_accessed`` on ``valid_from`` (FR-MNT-3).
+
+    Regression for the decay-sweep starvation bug: a freshly-ingested, never-recalled
+    memory (``last_accessed`` null, ``valid_from=now``) must NOT be selected by
+    ``iter_memories(tier=HOT, unused_since=cutoff)``, while a genuinely old never-
+    recalled memory still is and a recently-recalled (old-ingested) memory is not.
+    The old ``m.last_accessed IS NULL OR ...`` clause selected the fresh unit (null
+    last_accessed treated as infinitely unused); the coalesce anchor does not. Run
+    against the REAL backend over the FakeFalkorDriver so the emitted Cypher is pinned.
+    """
+
+    # Raise the dedup threshold + give each memory DISTINCT entities so the three
+    # writes are pure ADDs (no reinforce/no-op collapse, which would otherwise
+    # rewrite last_accessed and merge nodes — see _backend's threshold note).
+    store = _backend(dedup_threshold=0.999)
+    now = datetime(2026, 6, 13, 12, 0, 0, tzinfo=UTC)
+    cutoff = datetime(2026, 3, 15, 12, 0, 0, tzinfo=UTC)  # ~90d before now
+
+    fresh = _memory(
+        content="fresh never-recalled", entities=["alpha"], mid="fresh"
+    ).model_copy(update={"valid_from": now, "last_accessed": None})
+    old = _memory(
+        content="old never-recalled", entities=["beta"], mid="old"
+    ).model_copy(
+        update={"valid_from": datetime(2025, 1, 1, tzinfo=UTC), "last_accessed": None}
+    )
+    recalled = _memory(
+        content="old but recalled", entities=["gamma"], mid="recalled"
+    ).model_copy(
+        update={
+            "valid_from": datetime(2025, 1, 1, tzinfo=UTC),
+            "last_accessed": now,
+        }
+    )
+    for m in (fresh, old, recalled):
+        result = await store.upsert_memory(m)
+        assert result.decision is WriteDecision.ADD
+
+    selected = {
+        m.id async for m in store.iter_memories(tier=Tier.HOT, unused_since=cutoff)
+    }
+    # Fresh never-recalled: anchored on valid_from=now (>= cutoff) -> NOT selected.
+    assert "fresh" not in selected
+    # Genuinely old never-recalled: anchored on old valid_from (< cutoff) -> selected.
+    assert "old" in selected
+    # Recently recalled (old ingest): anchored on last_accessed=now -> NOT selected.
+    assert "recalled" not in selected
+
+
 # ---------------------------------------------------------------------------
 # Entity + edge ops (FR-EXT-2, FR-MNT-4, FR-RET-6)
 # ---------------------------------------------------------------------------

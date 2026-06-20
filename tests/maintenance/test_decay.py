@@ -110,6 +110,109 @@ async def test_sweep_archives_old_unused_hot_units() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fresh_never_recalled_hot_unit_not_selected_or_archived() -> None:
+    """A freshly-ingested, NEVER-recalled HOT unit must NOT be swept (regression).
+
+    The decay sweep selects via ``iter_memories(tier=HOT, unused_since=cutoff)``.
+    BEFORE the fix, ``unused_since`` treated a null ``last_accessed`` as infinitely
+    unused, so a fresh memory (``valid_from=now``, never recalled) was archived on
+    the first maintenance run after a big ingest — starving hot-only recall. The
+    fix anchors a null ``last_accessed`` on ``valid_from`` (ingestion time), matching
+    ``decay_score``'s recency anchor, so a fresh unit is kept until its creation time
+    itself ages past the cutoff. This test fails on the OLD clause, passes on the new.
+    """
+
+    settings = Settings()
+    settings.maintenance.decay_archive_after_days = 90
+    storage = InMemoryStorage()
+
+    # Fresh: valid_from = now, never recalled (last_accessed is None).
+    fresh = _mem(content="fresh", last_accessed=None, valid_from=NOW)
+    await storage.upsert_memory(fresh)
+
+    cutoff = NOW - timedelta(days=settings.maintenance.decay_archive_after_days)
+    # iter_memories must NOT select the fresh, never-recalled unit.
+    selected = [
+        m.id
+        async for m in storage.iter_memories(tier=Tier.HOT, unused_since=cutoff)
+    ]
+    assert fresh.id not in selected
+
+    job = DecayJob(storage, settings=settings, now_fn=lambda: NOW)
+    report = await job.run()
+
+    # The fresh unit stays hot; nothing is archived (never hard-deleted either).
+    assert fresh.tier is Tier.HOT
+    assert report.archived == 0
+    assert fresh.id in storage.memories
+
+
+@pytest.mark.asyncio
+async def test_old_never_recalled_hot_unit_still_archived() -> None:
+    """A genuinely old, never-recalled HOT unit IS still swept (real-stale path).
+
+    The fix anchors a null ``last_accessed`` on ``valid_from``; a unit ingested
+    long before the cutoff (and never recalled) still ages past it, so the decay
+    sweep keeps working for genuinely stale memories.
+    """
+
+    settings = Settings()
+    settings.maintenance.decay_archive_after_days = 90
+    storage = InMemoryStorage()
+
+    old = _mem(
+        content="old", last_accessed=None, valid_from=NOW - timedelta(days=200)
+    )
+    await storage.upsert_memory(old)
+
+    cutoff = NOW - timedelta(days=settings.maintenance.decay_archive_after_days)
+    selected = [
+        m.id
+        async for m in storage.iter_memories(tier=Tier.HOT, unused_since=cutoff)
+    ]
+    assert old.id in selected
+
+    job = DecayJob(storage, settings=settings, now_fn=lambda: NOW)
+    report = await job.run()
+
+    assert old.tier is Tier.ARCHIVE
+    assert report.archived == 1
+
+
+@pytest.mark.asyncio
+async def test_recently_recalled_old_unit_not_archived() -> None:
+    """A recently-recalled unit is NOT archived even if ``valid_from`` is old.
+
+    The anchor prefers ``last_accessed`` when present, so a recent recall protects
+    an old-ingested unit from the sweep (existing behaviour, pinned here).
+    """
+
+    settings = Settings()
+    settings.maintenance.decay_archive_after_days = 90
+    storage = InMemoryStorage()
+
+    recalled = _mem(
+        content="recalled",
+        last_accessed=NOW - timedelta(days=2),
+        valid_from=NOW - timedelta(days=300),
+    )
+    await storage.upsert_memory(recalled)
+
+    cutoff = NOW - timedelta(days=settings.maintenance.decay_archive_after_days)
+    selected = [
+        m.id
+        async for m in storage.iter_memories(tier=Tier.HOT, unused_since=cutoff)
+    ]
+    assert recalled.id not in selected
+
+    job = DecayJob(storage, settings=settings, now_fn=lambda: NOW)
+    report = await job.run()
+
+    assert recalled.tier is Tier.HOT
+    assert report.archived == 0
+
+
+@pytest.mark.asyncio
 async def test_sweep_is_idempotent() -> None:
     settings = Settings()
     settings.maintenance.decay_archive_after_days = 90

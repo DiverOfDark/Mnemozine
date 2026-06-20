@@ -1271,9 +1271,14 @@ class GraphitiStorageBackend:
         """Stream stored memory units for whole-store maintenance passes (FR-MNT-*).
 
         AND-combines the optional filters in Cypher so the maintenance layer never
-        pulls more than it asked for. ``unused_since`` keeps units whose
-        ``last_accessed`` is null (never used) or older than the cutoff, matching
-        the FR-MNT-3 decay sweep semantics.
+        pulls more than it asked for. ``unused_since`` keeps units last *used*
+        before the cutoff, anchored on ``valid_from`` (ingestion time) when
+        ``last_accessed`` is null — i.e. a never-recalled memory is "unused since
+        it was ingested", NOT "unused since the beginning of time". This mirrors
+        :func:`mnemozine.maintenance.decay.decay_score`'s recency anchor
+        (``last_accessed or valid_from``) so the FR-MNT-3 decay sweep's SELECTION
+        filter is consistent with its SCORE: a freshly-ingested, never-recalled
+        memory is NOT swept until its creation time itself ages past the cutoff.
         """
 
         where: list[str] = []
@@ -1291,7 +1296,11 @@ class GraphitiStorageBackend:
             where.append("m.valid_from < $valid_before")
             params["valid_before"] = _to_iso(valid_before)
         if unused_since is not None:
-            where.append("(m.last_accessed IS NULL OR m.last_accessed < $unused_since)")
+            # Anchor a null last_accessed on valid_from (ingestion time), matching
+            # decay_score's recency anchor. valid_from and last_accessed are both
+            # stored as ISO-8601 strings, so the lexical < against $unused_since
+            # (also _to_iso) is ordering-preserving (same pattern as memory_growth).
+            where.append("coalesce(m.last_accessed, m.valid_from) < $unused_since")
             params["unused_since"] = _to_iso(unused_since)
         clause = f" WHERE {' AND '.join(where)}" if where else ""
         rows = await self._query(f"MATCH (m:{MEMORY_LABEL}){clause} RETURN m", **params)

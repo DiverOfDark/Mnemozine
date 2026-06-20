@@ -618,8 +618,14 @@ class InMemoryStorage:
             if valid_before is not None and m.valid_from >= valid_before:
                 continue
             if unused_since is not None:
-                # Never-accessed (None) counts as "unused since forever".
-                if m.last_accessed is not None and m.last_accessed >= unused_since:
+                # Anchor a never-accessed (None last_accessed) memory on valid_from
+                # (ingestion time), matching the backend's coalesce + decay_score's
+                # recency anchor: a never-recalled memory is "unused since it was
+                # ingested", NOT "unused since forever". A freshly-ingested,
+                # never-recalled memory is therefore NOT selected until its creation
+                # time itself ages past the cutoff.
+                anchor = m.last_accessed or m.valid_from
+                if anchor >= unused_since:
                     continue
             yield m
 

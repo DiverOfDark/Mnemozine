@@ -466,9 +466,13 @@ class FakeFalkorDriver:
             vf = m.get("valid_from")
             if vf is None or not (str(vf) < str(p.get("valid_before"))):
                 return False
-        if "m.last_accessed IS NULL OR m.last_accessed < $unused_since" in c:
-            la = m.get("last_accessed")
-            if la is not None and not (str(la) < str(p.get("unused_since"))):
+        if "coalesce(m.last_accessed, m.valid_from) < $unused_since" in c:
+            # Anchor a null last_accessed on valid_from (ingestion time), matching
+            # the backend's coalesce + decay_score's recency anchor: a never-recalled
+            # memory is "unused since it was ingested", not since the beginning of
+            # time. ISO-8601 strings compare lexically.
+            anchor = m.get("last_accessed") or m.get("valid_from")
+            if anchor is None or not (str(anchor) < str(p.get("unused_since"))):
                 return False
         # Data-versioning selection (iter_memories_below_version): legacy nodes
         # with no ``data_version`` prop coalesce to 0, so they are always below a
